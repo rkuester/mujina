@@ -6,7 +6,6 @@
 //! where it belongs.
 
 use futures::sink::SinkExt;
-use tokio::io::AsyncWriteExt;
 use tokio::time::{self, Duration};
 use tokio_serial::{self, SerialPortBuilderExt};
 use tokio_util::codec::FramedWrite;
@@ -25,12 +24,7 @@ pub async fn task(running: CancellationToken) {
 
     let mut framed = FramedWrite::new(data_port, bm13xx::FrameCodec);
 
-    let mut control_port = tokio_serial::new(bitaxe::CONTROL_SERIAL, 115200)
-        .open_native_async()
-        .expect("failed to open control serial port");
-    const RSTN_HI: &[u8] = &[0x07, 0x00, 0x00, 0x00, 0x06, 0x00, 0x01];
-    control_port.write_all(&RSTN_HI).await.unwrap();
-    control_port.flush().await.unwrap();
+    bitaxe::deassert_reset().await;
 
     while !running.is_cancelled() {
         let read_address = bm13xx::Command::ReadRegister {
