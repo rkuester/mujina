@@ -22,7 +22,7 @@ pub async fn task(running: CancellationToken) {
         .open_native_async()
         .expect("failed to open data serial port");
 
-    let mut framed = FramedWrite::new(data_port, bm13xx::FrameCodec);
+    let mut framed = FramedWrite::new(data_port, bm13xx::FrameCodec::default());
 
     bitaxe::deassert_reset().await;
 

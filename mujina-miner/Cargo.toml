@@ -19,3 +19,4 @@ bitvec = { workspace = true }
 crc_all = { workspace = true }
 tokio-serial = { workspace = true }
 futures = { workspace = true }
+test-case = { workspace = true }
