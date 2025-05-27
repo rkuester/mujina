@@ -12,6 +12,7 @@ time = { workspace = true, features = ["macros"] }
 
 # Async runtime
 tokio = { workspace = true }
+tokio-stream = { workspace = true }
 tokio-util = { workspace = true, features = ["rt"] }
 
 bytes = { workspace = true }

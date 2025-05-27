@@ -1,24 +1,25 @@
-mod crc;
+//! This module implements an interface to the BM13xx chips.
 
 use bitvec::prelude::*;
-use bytes::{Buf, BytesMut, BufMut};
+use bytes::{Buf, BufMut, BytesMut};
 use std::io;
 use strum::FromRepr;
-use tokio_util::codec::{Encoder, Decoder};
+use tokio_util::codec::{Decoder, Encoder};
 
 use crate::tracing::prelude::*;
 use crc::*;
 
+mod crc;
 
-#[derive(Debug, PartialEq, FromRepr)]
+#[derive(FromRepr)]
 #[repr(u8)]
 pub enum RegisterAddress {
     ChipAddress = 0x00,
-    MiscControl = 0x18,
-    FastUartConfiguration = 0x28,
-    Pll1Parameter = 0x60,
-    VersionRolling = 0xa4,
-    RegA8 = 0xa8,
+    // MiscControl = 0x18,
+    // FastUartConfiguration = 0x28,
+    // Pll1Parameter = 0x60,
+    // VersionRolling = 0xa4,
+    // RegA8 = 0xa8,
 }
 
 pub enum Register {
@@ -27,28 +28,26 @@ pub enum Register {
         core_count: u8,
         address: u8,
     },
-    Foo,
 }
 
 impl Register {
     fn decode(address: RegisterAddress, bytes: &[u8; 4]) -> Register {
         match address {
-            RegisterAddress::ChipAddress => {
-                Register::ChipAddress {
-                    chip_id: u16::from_be_bytes(bytes[0..2].try_into().unwrap()),
-                    core_count: u8::from_be(bytes[2]),
-                    address: u8::from_be(bytes[3]),
-                }
-            },
-            _ => {
-                panic!("unimplemented")
+            RegisterAddress::ChipAddress => Register::ChipAddress {
+                chip_id: u16::from_be_bytes(bytes[0..2].try_into().unwrap()),
+                core_count: u8::from_be(bytes[2]),
+                address: u8::from_be(bytes[3]),
             },
         }
     }
 }
 
 pub enum Command {
-    ReadRegister { all: bool, chip_address: u8, register_address: RegisterAddress },
+    ReadRegister {
+        all: bool,
+        chip_address: u8,
+        register_address: RegisterAddress,
+    },
 }
 
 struct CommandFieldBuilder {
@@ -81,11 +80,9 @@ impl CommandFieldBuilder {
     }
 
     fn with_type_for_command(self, command: &Command) -> Self {
-        self.with_type(
-            match command {
-                Command::ReadRegister {..} => CommandFieldType::Command,
-            }
-        )
+        self.with_type(match command {
+            Command::ReadRegister { .. } => CommandFieldType::Command,
+        })
     }
 
     fn with_all(mut self, all: &bool) -> Self {
@@ -95,11 +92,9 @@ impl CommandFieldBuilder {
     }
 
     fn with_all_for_command(self, command: &Command) -> Self {
-        self.with_all(
-            match command {
-                Command::ReadRegister {all, ..} => all,
-            }
-        )
+        self.with_all(match command {
+            Command::ReadRegister { all, .. } => all,
+        })
     }
 
     fn with_cmd(mut self, cmd: CommandFieldCmd) -> Self {
@@ -109,11 +104,9 @@ impl CommandFieldBuilder {
     }
 
     fn with_cmd_for_command(self, command: &Command) -> Self {
-        self.with_cmd(
-            match command {
-                Command::ReadRegister {..} => CommandFieldCmd::ReadRegister,
-            }
-        )
+        self.with_cmd(match command {
+            Command::ReadRegister { .. } => CommandFieldCmd::ReadRegister,
+        })
     }
 
     fn for_command(self, command: &Command) -> Self {
@@ -127,9 +120,56 @@ impl CommandFieldBuilder {
     }
 }
 
+#[derive(FromRepr)]
+#[repr(u8)]
+enum ResponseType {
+    ReadRegister = 0,
+    Nonce = 4,
+}
+
+pub enum Response {
+    ReadRegister {
+        chip_address: u8,
+        register: Register,
+    },
+    Nonce,
+}
+
+impl Response {
+    fn decode(bytes: &mut BytesMut, is_version_rolling: bool) -> Result<Response, String> {
+        let type_and_crc = bytes[bytes.len() - 1].view_bits::<Lsb0>();
+        let type_repr = type_and_crc[5..].load::<u8>();
+
+        match ResponseType::from_repr(type_repr) {
+            Some(ResponseType::ReadRegister) => {
+                let value: &[u8; 4] = &bytes.split_to(4)[..].try_into().unwrap();
+                let chip_address = bytes.get_u8();
+                let register_address_repr = bytes.get_u8();
+
+                if let Some(register_address) = RegisterAddress::from_repr(register_address_repr) {
+                    let register = Register::decode(register_address, value);
+                    Ok(Response::ReadRegister {
+                        chip_address,
+                        register,
+                    })
+                } else {
+                    Err(format!(
+                        "unknown register address 0x{:x}.",
+                        register_address_repr
+                    ))
+                }
+            }
+            Some(ResponseType::Nonce) => {
+                panic!("not implemented")
+            }
+            None => Err(format!("unknown response type 0x{:x}.", type_repr)),
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct FrameCodec {
-    // Controls whether to use the alternative frame format required when version rolling 
+    // Controls whether to use the alternative frame format required when version rolling
     // is enabled. When true, uses version rolling compatible format. (default: false)
     version_rolling: bool,
 }
@@ -145,7 +185,11 @@ impl Encoder<Command> for FrameCodec {
         dst.put_u8(command_field);
 
         match command {
-            Command::ReadRegister { all: _, chip_address: address, register_address: register } => {
+            Command::ReadRegister {
+                all: _,
+                chip_address: address,
+                register_address: register,
+            } => {
                 const LENGTH: u8 = 5;
                 dst.put_u8(LENGTH);
                 dst.put_u8(address);
@@ -157,46 +201,6 @@ impl Encoder<Command> for FrameCodec {
         dst.put_u8(crc);
 
         Ok(())
-    }
-}
-
-pub enum Response {
-    ReadRegister { chip_address: u8, register: Register },
-    Nonce,
-}
-
-#[derive(FromRepr)]
-#[repr(u8)]
-enum ResponseType {
-    ReadRegister = 0,
-    Nonce = 4,
-}
-
-impl Response {
-    fn decode(bytes: &mut BytesMut, is_version_rolling: bool) -> Result<Response, String> {
-        let type_and_crc = bytes[bytes.len() - 1].view_bits::<Lsb0>();
-        let type_repr = type_and_crc[5..].load::<u8>();
-
-        match ResponseType::from_repr(type_repr) {
-            Some(ResponseType::ReadRegister) => {
-                let value: &[u8;4] = &bytes.split_to(4)[..].try_into().unwrap();
-                let chip_address = bytes.get_u8();
-                let register_address_repr = bytes.get_u8();
-
-                if let Some(register_address) = RegisterAddress::from_repr(register_address_repr) {
-                    let register = Register::decode(register_address, value);
-                    Ok(Response::ReadRegister { chip_address, register })
-                } else {
-                    Err(format!("unknown register address 0x{:x}.", register_address_repr))
-                }
-            },
-            Some(ResponseType::Nonce) => {
-                panic!("not implemented")
-            },
-            None => {
-                Err(format!("unknown response type 0x{:x}.", type_repr))
-            }
-        }
     }
 }
 
@@ -232,7 +236,7 @@ impl Decoder for FrameCodec {
             return CALL_AGAIN;
         }
 
-        let mut prospect = src.clone();  // avoid consuming real buffer as we provisionally parse
+        let mut prospect = src.clone(); // avoid consuming real buffer as we provisionally parse
 
         if prospect.get_u8() != PREAMBLE[0] {
             src.advance(1);
@@ -244,7 +248,7 @@ impl Decoder for FrameCodec {
             return CALL_AGAIN;
         }
 
-        if ! crc5_is_valid(&prospect[..]) {
+        if !crc5_is_valid(&prospect[..]) {
             src.advance(1);
             return CALL_AGAIN;
         } else {
@@ -252,9 +256,7 @@ impl Decoder for FrameCodec {
         }
 
         match Response::decode(&mut prospect, self.version_rolling) {
-            Ok(response) => {
-                Ok(Some(response))
-            },
+            Ok(response) => Ok(Some(response)),
             Err(msg) => {
                 warn!(msg);
                 CALL_AGAIN

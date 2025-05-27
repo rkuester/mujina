@@ -13,6 +13,7 @@ time = { version = "0.3", features = ["macros"] }
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 tokio-serial = "5.4"
+tokio-stream = "0.1"
 tokio-util = { version = "0.7", features = ["codec"] }
 
 bytes = "1"
