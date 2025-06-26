@@ -11,7 +11,7 @@ use tokio_serial::{self, SerialPortBuilderExt};
 use tokio_util::sync::CancellationToken;
 
 use crate::board::{bitaxe::BitaxeBoard, Board, BoardEvent, BoardError};
-use crate::chip::bm13xx::protocol::{BM13xxProtocol, ChipType, Frequency};
+use crate::chip::bm13xx::protocol::{BM13xxProtocol, ChipType, Command, Frequency};
 use crate::job_generator::{JobGenerator, verify_nonce};
 use crate::tracing::prelude::*;
 
@@ -173,6 +173,30 @@ pub async fn task(running: CancellationToken) {
     info!("Mining session complete");
     stats.log_summary();
     
+    // Graceful shutdown sequence
+    info!("Starting graceful hardware shutdown...");
+    
+    // Stop sending new jobs by canceling any pending job on current chip
+    if let Some(job_id) = active_jobs.keys().next().copied() {
+        if let Err(e) = board.cancel_job(job_id).await {
+            warn!("Failed to cancel active job during shutdown: {}", e);
+        }
+    }
+    
+    // Send chain inactive command to stop hashing
+    if let Err(e) = shutdown_chips(&mut board).await {
+        error!("Failed to properly shutdown chips: {}", e);
+    }
+    
+    // Give chips time to stop hashing
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    
+    // Reset board to safe state
+    if let Err(e) = board.reset().await {
+        error!("Failed to reset board during shutdown: {}", e);
+    }
+    
+    info!("Hardware shutdown complete");
     trace!("Scheduler task stopped.");
 }
 
@@ -348,4 +372,17 @@ impl MiningStats {
             }
         }
     }
+}
+
+/// Shutdown chips by sending chain inactive command
+async fn shutdown_chips(board: &mut BitaxeBoard) -> Result<(), BoardError> {
+    info!("Sending chain inactive command to stop hashing");
+    
+    // Chain inactive command stops all chips from hashing
+    let command = Command::ChainInactive;
+    
+    board.send_config_command(command).await?;
+    
+    info!("Chips commanded to stop hashing");
+    Ok(())
 }
