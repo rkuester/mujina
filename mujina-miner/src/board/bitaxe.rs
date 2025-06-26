@@ -8,7 +8,7 @@ use futures::sink::SinkExt;
 
 use crate::board::{Board, BoardError, BoardInfo, BoardEvent, JobCompleteReason};
 use crate::chip::{ChipInfo, MiningJob};
-use crate::chip::bm13xx::{self, BM13xxProtocol};
+use crate::chip::bm13xx::{self, BM13xxProtocol, protocol::Command};
 
 /// Bitaxe Gamma hashboard abstraction.
 ///
@@ -97,6 +97,24 @@ impl BitaxeBoard {
     /// 
     /// Sends broadcast ReadRegister commands and collects responses
     /// to identify all chips on the serial bus.
+    /// Send a configuration command to the chips.
+    /// 
+    /// This is used during initialization to configure PLL, version rolling, etc.
+    pub async fn send_config_command(&mut self, command: Command) -> Result<(), BoardError> {
+        self.data_writer.send(command).await
+            .map_err(|e| BoardError::Communication(e))
+    }
+    
+    /// Send multiple configuration commands in sequence.
+    pub async fn send_config_commands(&mut self, commands: Vec<Command>) -> Result<(), BoardError> {
+        for command in commands {
+            self.send_config_command(command).await?;
+            // Small delay between commands to avoid overwhelming the chip
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        Ok(())
+    }
+    
     async fn discover_chips(&mut self) -> Result<(), BoardError> {
         // Get a mutable reference to the reader
         let reader = self.data_reader.as_mut()
