@@ -5,13 +5,14 @@
 //! functionality is added, after which the functionality is refactored out to
 //! where it belongs.
 
+use std::collections::HashMap;
 use std::time::Duration;
 use tokio_serial::{self, SerialPortBuilderExt};
 use tokio_util::sync::CancellationToken;
 
 use crate::board::{bitaxe::BitaxeBoard, Board, BoardEvent, BoardError};
 use crate::chip::bm13xx::protocol::{BM13xxProtocol, ChipType, Frequency};
-use crate::job_generator::JobGenerator;
+use crate::job_generator::{JobGenerator, verify_nonce};
 use crate::tracing::prelude::*;
 
 const CONTROL_SERIAL: &str = "/dev/ttyACM0";
@@ -71,13 +72,22 @@ pub async fn task(running: CancellationToken) {
     let mut job_generator = JobGenerator::new(1.0);
     info!("Created job generator with difficulty 1.0");
     
+    // Track active jobs for nonce verification
+    let mut active_jobs: HashMap<u64, crate::chip::MiningJob> = HashMap::new();
+    
+    // Track mining statistics
+    let mut stats = MiningStats::default();
+    
     // Send initial job to start mining
     let initial_job = job_generator.next_job();
+    let job_id = initial_job.job_id;
+    active_jobs.insert(job_id, initial_job.clone());
+    
     if let Err(e) = board.send_job(&initial_job).await {
         error!("Failed to send initial job: {e}");
         return;
     }
-    info!("Sent initial mining job to chips");
+    info!("Sent initial mining job {} to chips", job_id);
     
     // Main scheduler loop
     info!("Starting mining scheduler");
@@ -89,17 +99,49 @@ pub async fn task(running: CancellationToken) {
                 match event {
                     BoardEvent::NonceFound(nonce_result) => {
                         info!("Nonce found! Job {} nonce {:#x}", nonce_result.job_id, nonce_result.nonce);
-                        // TODO: Submit to pool
+                        
+                        stats.nonces_found += 1;
+                        
+                        // Verify the nonce
+                        if let Some(job) = active_jobs.get(&nonce_result.job_id) {
+                            match verify_nonce(job, nonce_result.nonce) {
+                                Ok((block_hash, valid)) => {
+                                    if valid {
+                                        stats.valid_nonces += 1;
+                                        info!("✓ Valid nonce! Block hash: {:x}", block_hash);
+                                        info!("  Job ID: {}, Nonce: {:#010x}", nonce_result.job_id, nonce_result.nonce);
+                                        // TODO: Submit to pool when connected
+                                    } else {
+                                        stats.invalid_nonces += 1;
+                                        warn!("✗ Invalid nonce - hash doesn't meet target");
+                                        warn!("  Job ID: {}, Nonce: {:#010x}", nonce_result.job_id, nonce_result.nonce);
+                                        warn!("  Hash: {:x}", block_hash);
+                                    }
+                                }
+                                Err(e) => {
+                                    error!("Failed to verify nonce: {}", e);
+                                }
+                            }
+                        } else {
+                            warn!("Received nonce for unknown job ID: {}", nonce_result.job_id);
+                        }
                     }
                     BoardEvent::JobComplete { job_id, reason } => {
                         info!("Job {} completed: {:?}", job_id, reason);
+                        stats.jobs_completed += 1;
+                        
+                        // Remove completed job from tracking
+                        active_jobs.remove(&job_id);
                         
                         // Send a new job to keep the chips busy
                         let new_job = job_generator.next_job();
+                        let new_job_id = new_job.job_id;
+                        active_jobs.insert(new_job_id, new_job.clone());
+                        
                         if let Err(e) = board.send_job(&new_job).await {
                             error!("Failed to send new job: {e}");
                         } else {
-                            debug!("Sent new job {} to chips", new_job.job_id);
+                            debug!("Sent new job {} to chips", new_job_id);
                         }
                     }
                     BoardEvent::ChipError { chip_address, error } => {
@@ -115,6 +157,7 @@ pub async fn task(running: CancellationToken) {
             // Periodic status check
             _ = tokio::time::sleep(tokio::time::Duration::from_secs(30)) => {
                 trace!("Scheduler heartbeat - mining active");
+                stats.log_summary();
             }
             
             // Shutdown
@@ -194,4 +237,29 @@ async fn configure_chips_for_mining(board: &mut BitaxeBoard) -> Result<(), Board
     
     info!("Chip configuration complete");
     Ok(())
+}
+
+/// Mining statistics tracker
+#[derive(Default)]
+struct MiningStats {
+    nonces_found: u64,
+    valid_nonces: u64,
+    invalid_nonces: u64,
+    jobs_completed: u64,
+}
+
+impl MiningStats {
+    fn log_summary(&self) {
+        info!("Mining statistics:");
+        info!("  Total nonces found: {}", self.nonces_found);
+        info!("  Valid nonces: {} ({:.2}%)", 
+              self.valid_nonces, 
+              if self.nonces_found > 0 { 
+                  self.valid_nonces as f64 / self.nonces_found as f64 * 100.0 
+              } else { 
+                  0.0 
+              });
+        info!("  Invalid nonces: {}", self.invalid_nonces);
+        info!("  Jobs completed: {}", self.jobs_completed);
+    }
 }
