@@ -831,7 +831,9 @@ impl Response {
 }
 
 #[derive(Default)]
-pub struct FrameCodec {}
+pub struct FrameCodec {
+    last_buffer_size: usize,
+}
 
 impl Encoder<Command> for FrameCodec {
     type Error = io::Error;
@@ -892,6 +894,20 @@ impl Decoder for FrameCodec {
         const FRAME_LEN: usize = PREAMBLE.len() + 9;
         const CALL_AGAIN: Result<Option<Response>, io::Error> = Ok(None);
 
+        // Log significant buffer changes
+        if src.len() != self.last_buffer_size {
+            if src.len() > self.last_buffer_size + 5 || // Growing significantly
+               (self.last_buffer_size >= FRAME_LEN && src.len() < FRAME_LEN) { // Dropped below frame size
+                trace!(
+                    "Decoder buffer: {} → {} bytes ({})",
+                    self.last_buffer_size,
+                    src.len(),
+                    if src.len() > self.last_buffer_size { "growing" } else { "shrinking" }
+                );
+            }
+            self.last_buffer_size = src.len();
+        }
+
         if src.len() < FRAME_LEN {
             return CALL_AGAIN;
         }
@@ -910,6 +926,9 @@ impl Decoder for FrameCodec {
         // Validate CRC5 over the entire frame (excluding preamble)
         // CRC5 is computed over the 9 data bytes after the preamble
         if !crc5_is_valid(&src[2..FRAME_LEN]) {
+            trace!(
+                "Frame sync lost: CRC5 failed for potential frame at position 0. Searching for next frame..."
+            );
             src.advance(1);
             return CALL_AGAIN;
         }

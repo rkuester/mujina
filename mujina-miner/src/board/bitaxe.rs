@@ -1,5 +1,7 @@
 use std::time::Duration;
-use tokio::{io::AsyncWriteExt, time};
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use tokio::{io::{AsyncWriteExt, AsyncRead, ReadBuf}, time};
 use tokio_serial::SerialStream;
 use async_trait::async_trait;
 use tokio_stream::StreamExt;
@@ -9,6 +11,48 @@ use futures::sink::SinkExt;
 use crate::board::{Board, BoardError, BoardInfo, BoardEvent, JobCompleteReason};
 use crate::chip::{ChipInfo, MiningJob};
 use crate::chip::bm13xx::{self, BM13xxProtocol, protocol::Command};
+use crate::tracing::prelude::*;
+
+/// A wrapper around AsyncRead that traces raw bytes as they're read
+struct TracingReader<R> {
+    inner: R,
+    name: &'static str,
+}
+
+impl<R: AsyncRead + Unpin> TracingReader<R> {
+    fn new(inner: R, name: &'static str) -> Self {
+        Self { inner, name }
+    }
+}
+
+impl<R: AsyncRead + Unpin> AsyncRead for TracingReader<R> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let before_len = buf.filled().len();
+        
+        // Call the inner reader
+        let result = Pin::new(&mut self.inner).poll_read(cx, buf);
+        
+        // If we read some bytes, trace them
+        if let Poll::Ready(Ok(())) = &result {
+            let after_len = buf.filled().len();
+            if after_len > before_len {
+                let new_bytes = &buf.filled()[before_len..after_len];
+                trace!(
+                    "{} RX: {} bytes => {:02x?}",
+                    self.name,
+                    new_bytes.len(),
+                    new_bytes
+                );
+            }
+        }
+        
+        result
+    }
+}
 
 /// Bitaxe Gamma hashboard abstraction.
 ///
@@ -20,7 +64,7 @@ pub struct BitaxeBoard {
     /// Writer for sending commands to chips
     data_writer: FramedWrite<tokio::io::WriteHalf<SerialStream>, bm13xx::FrameCodec>,
     /// Reader for receiving responses from chips (moved to event monitor during initialize)
-    data_reader: Option<FramedRead<tokio::io::ReadHalf<SerialStream>, bm13xx::FrameCodec>>,
+    data_reader: Option<FramedRead<TracingReader<tokio::io::ReadHalf<SerialStream>>, bm13xx::FrameCodec>>,
     /// Protocol handler for chip communication
     protocol: BM13xxProtocol,
     /// Discovered chip information (passive record-keeping)
@@ -50,10 +94,13 @@ impl BitaxeBoard {
         // Split the data stream immediately
         let (reader, writer) = tokio::io::split(data);
         
+        // Wrap the reader with tracing
+        let tracing_reader = TracingReader::new(reader, "Data");
+        
         BitaxeBoard { 
             control,
             data_writer: FramedWrite::new(writer, bm13xx::FrameCodec::default()),
-            data_reader: Some(FramedRead::new(reader, bm13xx::FrameCodec::default())),
+            data_reader: Some(FramedRead::new(tracing_reader, bm13xx::FrameCodec::default())),
             protocol: BM13xxProtocol::new(),
             chip_infos: Vec::new(),
             event_tx: None,
