@@ -9,6 +9,14 @@ Mujina-miner is organized as a single Rust crate with well-defined modules
 that separate concerns while maintaining simplicity. The architecture is
 fully async using Tokio for concurrent I/O operations.
 
+### Key Dependencies
+
+- **tokio**: Async runtime for concurrent I/O operations
+- **rust-bitcoin**: Core Bitcoin types and utilities
+- **tokio-serial**: Async serial port communication
+- **axum**: HTTP server framework (future)
+- **tracing**: Structured logging and diagnostics
+
 ## Module Structure
 
 ```
@@ -68,12 +76,10 @@ Centralized error types using `thiserror`. Provides a unified `Error` enum
 for the entire crate with conversions from underlying error types.
 
 #### `types.rs` (new)
-Core domain types shared across modules:
-- `Job` - Mining work from pools
-- `Share` - Valid nonces to submit
-- `Nonce` - 32-bit nonce values
-- `Target` - Difficulty targets
-- `HashRate` - Hashing speed measurements
+Core domain types shared across modules. This module re-exports commonly
+used types from rust-bitcoin and defines mining-specific types. Using
+rust-bitcoin provides battle-tested implementations of Bitcoin primitives
+while avoiding reinventing fundamental types.
 
 #### `config.rs` (new)
 Configuration management:
