@@ -4,80 +4,55 @@
 //! boards. It listens for transport events, looks up board types in the
 //! registry, and creates appropriate board instances.
 
-use crate::board::Board;
+use crate::board::{Board, BoardDescriptor};
 use crate::error::Result;
+use crate::transport::{TransportEvent, UsbDeviceInfo};
 use std::collections::HashMap;
 use tokio::sync::mpsc;
 
-/// USB vendor and product IDs for board identification.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct UsbId {
-    pub vid: u16,
-    pub pid: u16,
-}
-
-/// Board type enumeration.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BoardType {
-    BitaxeGamma,
-    S19Pro,
-    Avalon1366,
-    // Add more board types as supported
-}
-
-/// Registry of known board types.
-pub struct BoardRegistry {
-    usb_boards: HashMap<UsbId, BoardType>,
-}
+/// Board registry that uses inventory to find registered boards.
+pub struct BoardRegistry;
 
 impl BoardRegistry {
-    /// Create a new board registry with known boards.
-    pub fn new() -> Self {
-        let mut usb_boards = HashMap::new();
-        
-        // Register known USB boards
-        // TODO: Get actual VID/PID values
-        usb_boards.insert(UsbId { vid: 0x0403, pid: 0x6001 }, BoardType::BitaxeGamma);
-        
-        Self { usb_boards }
+    /// Find a board descriptor that can handle this USB device.
+    pub fn find_descriptor(&self, vid: u16, pid: u16) -> Option<&'static BoardDescriptor> {
+        inventory::iter::<BoardDescriptor>()
+            .find(|desc| desc.vid == vid && desc.pid == pid)
     }
     
-    /// Find board type by USB VID/PID.
-    pub fn find_by_usb(&self, vid: u16, pid: u16) -> Option<BoardType> {
-        self.usb_boards.get(&UsbId { vid, pid }).copied()
+    /// Create a board from USB device info.
+    pub async fn create_board(&self, device: UsbDeviceInfo) -> Result<Box<dyn Board + Send>> {
+        let desc = self.find_descriptor(device.vid, device.pid)
+            .ok_or_else(|| crate::error::Error::Other(
+                format!("No board registered for {:04x}:{:04x}", device.vid, device.pid)
+            ))?;
+        
+        tracing::info!("Creating {} board from USB device", desc.name);
+        (desc.create_fn)(device).await
     }
 }
 
-/// Transport discovery event.
-#[derive(Debug)]
-pub enum TransportEvent {
-    UsbConnected {
-        vid: u16,
-        pid: u16,
-        serial_number: Option<String>,
-        // Transport handles would go here
-    },
-    UsbDisconnected {
-        serial_number: Option<String>,
-    },
-    // Future: PCIe, Ethernet, etc.
-}
 
 /// Board manager that handles board lifecycle.
 pub struct BoardManager {
     registry: BoardRegistry,
-    #[expect(dead_code, reason = "Will be used when board creation is implemented")]
-    boards: HashMap<String, Box<dyn Board>>,
+    boards: HashMap<String, Box<dyn Board + Send>>,
     event_rx: mpsc::Receiver<TransportEvent>,
+    /// Channel to send initialized boards to the scheduler
+    scheduler_tx: mpsc::Sender<Box<dyn Board + Send>>,
 }
 
 impl BoardManager {
     /// Create a new board manager.
-    pub fn new(event_rx: mpsc::Receiver<TransportEvent>) -> Self {
+    pub fn new(
+        event_rx: mpsc::Receiver<TransportEvent>,
+        scheduler_tx: mpsc::Sender<Box<dyn Board + Send>>,
+    ) -> Self {
         Self {
-            registry: BoardRegistry::new(),
+            registry: BoardRegistry,
             boards: HashMap::new(),
             event_rx,
+            scheduler_tx,
         }
     }
     
@@ -85,20 +60,51 @@ impl BoardManager {
     pub async fn run(&mut self) -> Result<()> {
         while let Some(event) = self.event_rx.recv().await {
             match event {
-                TransportEvent::UsbConnected { vid, pid, serial_number: _, .. } => {
-                    tracing::info!("USB device connected: {:04x}:{:04x}", vid, pid);
-                    
-                    if let Some(board_type) = self.registry.find_by_usb(vid, pid) {
-                        // TODO: Create board instance based on type
-                        tracing::info!("Identified board type: {:?}", board_type);
-                    } else {
-                        tracing::warn!("Unknown USB device: {:04x}:{:04x}", vid, pid);
+                TransportEvent::Usb(usb_event) => {
+                    self.handle_usb_event(usb_event).await?;
+                }
+                // Future: handle other transport types
+            }
+        }
+        
+        Ok(())
+    }
+    
+    /// Handle USB transport events.
+    async fn handle_usb_event(&mut self, event: crate::transport::usb::TransportEvent) -> Result<()> {
+        use crate::transport::usb::TransportEvent;
+        
+        match event {
+            TransportEvent::UsbDeviceConnected(device_info) => {
+                let vid = device_info.vid;
+                let pid = device_info.pid;
+                tracing::info!("USB device connected: {:04x}:{:04x}", vid, pid);
+                
+                // Try to create a board from this USB device
+                match self.registry.create_board(device_info).await {
+                    Ok(board) => {
+                        let board_info = board.board_info();
+                        let board_id = board_info.serial_number.clone()
+                            .unwrap_or_else(|| "unknown".to_string());
+                        
+                        tracing::info!("Created {} board (serial: {})", board_info.model, board_id);
+                        
+                        // Send to scheduler
+                        if let Err(e) = self.scheduler_tx.send(board).await {
+                            tracing::error!("Failed to send board to scheduler: {}", e);
+                        } else {
+                            tracing::info!("Board {} sent to scheduler", board_id);
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to create board for device {:04x}:{:04x}: {}", 
+                                     vid, pid, e);
                     }
                 }
-                TransportEvent::UsbDisconnected { serial_number } => {
-                    tracing::info!("USB device disconnected: {:?}", serial_number);
-                    // TODO: Remove board from active boards
-                }
+            }
+            TransportEvent::UsbDeviceDisconnected { device_path } => {
+                tracing::info!("USB device disconnected: {}", device_path);
+                // TODO: Remove board from active boards and notify scheduler
             }
         }
         

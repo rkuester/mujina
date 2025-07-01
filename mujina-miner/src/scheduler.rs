@@ -7,16 +7,12 @@
 
 use std::collections::HashMap;
 use std::time::Duration;
-use tokio_serial::{self, SerialPortBuilderExt};
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::board::{bitaxe::BitaxeBoard, Board, BoardEvent, BoardError};
-use crate::asic::bm13xx::protocol::{BM13xxProtocol, ChipType, Command, Frequency};
+use crate::board::{Board, BoardEvent};
 use crate::job_generator::{JobGenerator, verify_nonce};
 use crate::tracing::prelude::*;
-
-const CONTROL_SERIAL: &str = "/dev/ttyACM0";
-const DATA_SERIAL: &str = "/dev/ttyACM1";
 
 /// Initial mining frequency in MHz (start conservative)
 const INITIAL_FREQUENCY_MHZ: f32 = 200.0;
@@ -34,39 +30,41 @@ const FREQUENCY_STEP_DELAY_MS: u64 = 500;
 // - Implement adaptive ramping based on chip response
 // - Add rollback on errors during ramp
 
-pub async fn task(running: CancellationToken) {
+/// Run the scheduler task, receiving boards from the board manager.
+pub async fn task(
+    running: CancellationToken,
+    mut board_rx: mpsc::Receiver<Box<dyn Board + Send>>,
+) {
     trace!("Scheduler task started.");
-
-    // In the future, a DeviceManager would create boards based on USB detection
-    // For now, we'll create a single board with known serial ports
-    let control_port = tokio_serial::new(CONTROL_SERIAL, 115200)
-        .open_native_async()
-        .expect("failed to open control serial port");
     
-    let data_port = tokio_serial::new(DATA_SERIAL, 115200)
-        .open_native_async()
-        .expect("failed to open data serial port");
-    
-    let mut board = BitaxeBoard::new(control_port, data_port);
-    
-    // Initialize the board (reset + chip discovery)
-    let mut event_rx = match board.initialize().await {
-        Ok(rx) => {
-            info!("Board initialized successfully");
-            info!("Found {} chip(s)", board.chip_count());
-            rx
+    // Wait for the first board from the board manager
+    let mut board = match board_rx.recv().await {
+        Some(board) => {
+            info!("Received board from board manager: {}", board.board_info().model);
+            info!("Board has {} chip(s)", board.chip_count());
+            board
         }
-        Err(e) => {
-            error!("Failed to initialize board: {e}");
+        None => {
+            error!("Board channel closed before receiving any boards");
+            return;
+        }
+    };
+    
+    // Get the event receiver from the board
+    let mut event_rx = match board.take_event_receiver() {
+        Some(rx) => rx,
+        None => {
+            error!("Board was not initialized properly - no event receiver available");
             return;
         }
     };
     
     // Configure chips for mining
-    if let Err(e) = configure_chips_for_mining(&mut board).await {
-        error!("Failed to configure chips: {e}");
-        return;
-    }
+    // TODO: This needs to be moved into board-specific initialization
+    // if let Err(e) = configure_chips_for_mining(&mut board).await {
+    //     error!("Failed to configure chips: {e}");
+    //     return;
+    // }
     
     // Create job generator for testing (using difficulty 1 for easy verification)
     let difficulty = 1.0;
@@ -184,9 +182,10 @@ pub async fn task(running: CancellationToken) {
     }
     
     // Send chain inactive command to stop hashing
-    if let Err(e) = shutdown_chips(&mut board).await {
-        error!("Failed to properly shutdown chips: {}", e);
-    }
+    // TODO: This needs to be moved into board-specific shutdown
+    // if let Err(e) = shutdown_chips(&mut board).await {
+    //     error!("Failed to properly shutdown chips: {}", e);
+    // }
     
     // Give chips time to stop hashing
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -201,74 +200,75 @@ pub async fn task(running: CancellationToken) {
     trace!("Scheduler task stopped.");
 }
 
-/// Configure discovered chips for mining operation.
-/// 
-/// This includes:
-/// - Setting initial PLL frequency (with ramping)
-/// - Enabling version rolling
-/// - Configuring other chip-specific settings
-async fn configure_chips_for_mining(board: &mut BitaxeBoard) -> Result<(), BoardError> {
-    info!("Configuring chips for mining...");
-    
-    // Get chip info to determine chip type
-    let chip_infos = board.chip_infos();
-    if chip_infos.is_empty() {
-        return Err(BoardError::InitializationFailed("No chips discovered".to_string()));
-    }
-    
-    // Check what type of chips we have
-    let chip_type = ChipType::from(chip_infos[0].chip_id);
-    info!("Detected chip type: {:?}", chip_type);
-    
-    // Create protocol handler
-    let protocol = BM13xxProtocol::new();
-    
-    // Get initialization commands for single chip (Bitaxe has one chip)
-    let init_freq = Frequency::from_mhz(INITIAL_FREQUENCY_MHZ)
-        .map_err(|e| BoardError::InitializationFailed(format!("Invalid frequency: {}", e)))?;
-    
-    let init_commands = protocol.single_chip_init(init_freq);
-    
-    // Send initialization commands
-    info!("Sending {} initialization commands", init_commands.len());
-    board.send_config_commands(init_commands).await?;
-    
-    // Wait for chip to stabilize at initial frequency
-    tokio::time::sleep(Duration::from_millis(FREQUENCY_STEP_DELAY_MS)).await;
-    
-    // Perform frequency ramping if needed
-    if TARGET_FREQUENCY_MHZ > INITIAL_FREQUENCY_MHZ {
-        info!("Starting frequency ramp from {} MHz to {} MHz", 
-              INITIAL_FREQUENCY_MHZ, TARGET_FREQUENCY_MHZ);
-        
-        let mut current_freq = INITIAL_FREQUENCY_MHZ;
-        while current_freq < TARGET_FREQUENCY_MHZ {
-            current_freq = (current_freq + FREQUENCY_STEP_MHZ).min(TARGET_FREQUENCY_MHZ);
-            
-            let freq = Frequency::from_mhz(current_freq)
-                .map_err(|e| BoardError::InitializationFailed(format!("Invalid frequency: {}", e)))?;
-            
-            // Generate PLL commands for new frequency
-            let pll_commands = protocol.frequency_ramp(
-                Frequency::from_mhz(current_freq - FREQUENCY_STEP_MHZ).unwrap(),
-                freq,
-                1  // Single step since we're doing it manually
-            );
-            
-            info!("Setting frequency to {} MHz", current_freq);
-            board.send_config_commands(pll_commands).await?;
-            
-            // Wait for chip to stabilize
-            tokio::time::sleep(Duration::from_millis(FREQUENCY_STEP_DELAY_MS)).await;
-        }
-        
-        info!("Frequency ramp complete");
-    }
-    
-    info!("Chip configuration complete");
-    Ok(())
-}
-
+// // TODO: Move board-specific configuration into board implementations
+// // /// Configure discovered chips for mining operation.
+// // /// 
+// // /// This includes:
+// // /// - Setting initial PLL frequency (with ramping)
+// // /// - Enabling version rolling
+// // /// - Configuring other chip-specific settings
+// // async fn configure_chips_for_mining(board: &mut BitaxeBoard) -> Result<(), BoardError> {
+//     info!("Configuring chips for mining...");
+//     
+//     // Get chip info to determine chip type
+//     let chip_infos = board.chip_infos();
+//     if chip_infos.is_empty() {
+//         return Err(BoardError::InitializationFailed("No chips discovered".to_string()));
+//     }
+//     
+//     // Check what type of chips we have
+//     let chip_type = ChipType::from(chip_infos[0].chip_id);
+//     info!("Detected chip type: {:?}", chip_type);
+//     
+//     // Create protocol handler
+//     let protocol = BM13xxProtocol::new();
+//     
+//     // Get initialization commands for single chip (Bitaxe has one chip)
+//     let init_freq = Frequency::from_mhz(INITIAL_FREQUENCY_MHZ)
+//         .map_err(|e| BoardError::InitializationFailed(format!("Invalid frequency: {}", e)))?;
+//     
+//     let init_commands = protocol.single_chip_init(init_freq);
+//     
+//     // Send initialization commands
+//     info!("Sending {} initialization commands", init_commands.len());
+//     board.send_config_commands(init_commands).await?;
+//     
+//     // Wait for chip to stabilize at initial frequency
+//     tokio::time::sleep(Duration::from_millis(FREQUENCY_STEP_DELAY_MS)).await;
+//     
+//     // Perform frequency ramping if needed
+//     if TARGET_FREQUENCY_MHZ > INITIAL_FREQUENCY_MHZ {
+//         info!("Starting frequency ramp from {} MHz to {} MHz", 
+//               INITIAL_FREQUENCY_MHZ, TARGET_FREQUENCY_MHZ);
+//         
+//         let mut current_freq = INITIAL_FREQUENCY_MHZ;
+//         while current_freq < TARGET_FREQUENCY_MHZ {
+//             current_freq = (current_freq + FREQUENCY_STEP_MHZ).min(TARGET_FREQUENCY_MHZ);
+//             
+//             let freq = Frequency::from_mhz(current_freq)
+//                 .map_err(|e| BoardError::InitializationFailed(format!("Invalid frequency: {}", e)))?;
+//             
+//             // Generate PLL commands for new frequency
+//             let pll_commands = protocol.frequency_ramp(
+//                 Frequency::from_mhz(current_freq - FREQUENCY_STEP_MHZ).unwrap(),
+//                 freq,
+//                 1  // Single step since we're doing it manually
+//             );
+//             
+//             info!("Setting frequency to {} MHz", current_freq);
+//             board.send_config_commands(pll_commands).await?;
+//             
+//             // Wait for chip to stabilize
+//             tokio::time::sleep(Duration::from_millis(FREQUENCY_STEP_DELAY_MS)).await;
+//         }
+//         
+//         info!("Frequency ramp complete");
+//     }
+//     
+//     info!("Chip configuration complete");
+//     Ok(())
+// }
+// 
 /// Mining statistics tracker
 struct MiningStats {
     nonces_found: u64,
@@ -375,15 +375,15 @@ impl MiningStats {
     }
 }
 
-/// Shutdown chips by sending chain inactive command
-async fn shutdown_chips(board: &mut BitaxeBoard) -> Result<(), BoardError> {
-    info!("Sending chain inactive command to stop hashing");
-    
-    // Chain inactive command stops all chips from hashing
-    let command = Command::ChainInactive;
-    
-    board.send_config_command(command).await?;
-    
-    info!("Chips commanded to stop hashing");
-    Ok(())
-}
+// /// Shutdown chips by sending chain inactive command
+// async fn shutdown_chips(board: &mut BitaxeBoard) -> Result<(), BoardError> {
+//     info!("Sending chain inactive command to stop hashing");
+//     
+//     // Chain inactive command stops all chips from hashing
+//     let command = Command::ChainInactive;
+//     
+//     board.send_config_command(command).await?;
+//     
+//     info!("Chips commanded to stop hashing");
+//     Ok(())
+// }

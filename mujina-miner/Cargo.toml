@@ -17,6 +17,7 @@ bytes = { workspace = true }
 crc_all = { workspace = true }
 futures = { workspace = true }
 hex = { workspace = true }
+inventory = { workspace = true }
 modular-bitfield = { workspace = true }
 serde = { workspace = true }
 sha2 = { workspace = true }

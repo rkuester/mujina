@@ -1,8 +1,38 @@
 //! Physical transport layer for board connections.
 //!
-//! This module handles low-level physical connections to mining boards,
-//! including USB serial, PCIe, and other future transports. It provides
-//! discovery, enumeration, and raw byte stream access without any
-//! protocol knowledge.
+//! This module handles discovery of mining boards across different
+//! physical transports (USB, PCIe, Ethernet, etc). Each transport
+//! implementation provides device discovery and emits transport-specific
+//! events when devices are connected or disconnected.
 
-// TODO: Implement transport traits and USB serial support
+pub mod usb;
+
+// Re-export transport implementations
+pub use usb::{UsbTransport, UsbDeviceInfo};
+
+/// Generic transport event that can represent different transport types.
+#[derive(Debug)]
+pub enum TransportEvent {
+    /// USB device event
+    Usb(usb::TransportEvent),
+    
+    // Future transport types:
+    // /// PCIe device event  
+    // Pcie(pcie::TransportEvent),
+    //
+    // /// Ethernet device event
+    // Ethernet(ethernet::TransportEvent),
+}
+
+/// Common trait for transport discovery (future enhancement).
+/// 
+/// Each transport implementation could implement this trait to provide
+/// a consistent interface for device discovery across different transports.
+#[async_trait::async_trait]
+pub trait TransportDiscovery: Send + Sync {
+    /// Start discovering devices on this transport.
+    async fn start_discovery(&self) -> crate::error::Result<()>;
+    
+    /// Stop discovery and clean up resources.
+    async fn stop_discovery(&self) -> crate::error::Result<()>;
+}

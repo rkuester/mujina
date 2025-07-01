@@ -3,9 +3,12 @@ pub(crate) mod bitaxe;
 use async_trait::async_trait;
 use std::error::Error;
 use std::fmt;
+use std::future::Future;
+use std::pin::Pin;
 use tokio::sync::mpsc;
 
 use crate::asic::{ChipError, ChipInfo, MiningJob, NonceResult};
+use crate::transport::UsbDeviceInfo;
 
 /// Events emitted by a board during operation.
 #[derive(Debug, Clone)]
@@ -98,6 +101,12 @@ pub trait Board: Send {
     
     /// Get board identification/info
     fn board_info(&self) -> BoardInfo;
+    
+    /// Get the event receiver for this board.
+    /// 
+    /// This should be called after initialization to receive board events.
+    /// Returns None if the board hasn't been initialized yet.
+    fn take_event_receiver(&mut self) -> Option<mpsc::Receiver<BoardEvent>>;
 }
 
 /// Information about a board
@@ -151,3 +160,25 @@ impl From<ChipError> for BoardError {
         BoardError::Chip(err)
     }
 }
+
+/// Helper type for async board factory functions
+type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+/// Board descriptor that gets collected by inventory.
+/// 
+/// Board implementors use `inventory::submit!` to register their board type
+/// with the system. The board manager will automatically discover all registered
+/// boards at runtime.
+pub struct BoardDescriptor {
+    /// USB vendor ID this board handles
+    pub vid: u16,
+    /// USB product ID this board handles
+    pub pid: u16,
+    /// Human-readable board name (e.g., "Bitaxe Gamma")
+    pub name: &'static str,
+    /// Factory function to create the board from USB device info
+    pub create_fn: fn(UsbDeviceInfo) -> BoxFuture<'static, crate::error::Result<Box<dyn Board + Send>>>,
+}
+
+// This creates the inventory collection for board descriptors
+inventory::collect!(BoardDescriptor);

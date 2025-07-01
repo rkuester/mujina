@@ -71,6 +71,8 @@ pub struct BitaxeBoard {
     chip_infos: Vec<ChipInfo>,
     /// Channel for sending board events
     event_tx: Option<tokio::sync::mpsc::Sender<BoardEvent>>,
+    /// Channel for receiving board events (stored after initialization)
+    event_rx: Option<tokio::sync::mpsc::Receiver<BoardEvent>>,
     /// Current job ID
     current_job_id: Option<u64>,
     /// Job ID counter for cycling through 0-127
@@ -104,6 +106,7 @@ impl BitaxeBoard {
             protocol: BM13xxProtocol::new(),
             chip_infos: Vec::new(),
             event_tx: None,
+            event_rx: None,
             current_job_id: None,
             next_job_id: 0,
         }
@@ -375,11 +378,16 @@ impl Board for BitaxeBoard {
         // Create event channel
         let (tx, rx) = tokio::sync::mpsc::channel(100);
         self.event_tx = Some(tx);
+        self.event_rx = Some(rx);
         
         // TODO: Spawn task to monitor chip responses and emit events
         self.spawn_event_monitor();
         
-        Ok(rx)
+        // Return a dummy receiver for backward compatibility
+        // The real receiver is stored and can be retrieved with take_event_receiver()
+        let (dummy_tx, dummy_rx) = tokio::sync::mpsc::channel(1);
+        drop(dummy_tx);
+        Ok(dummy_rx)
     }
     
     fn chip_count(&self) -> usize {
@@ -437,5 +445,56 @@ impl Board for BitaxeBoard {
             firmware_version: Some("bitaxe-raw".to_string()),
             serial_number: None, // Could be read from the board in future
         }
+    }
+    
+    fn take_event_receiver(&mut self) -> Option<tokio::sync::mpsc::Receiver<BoardEvent>> {
+        self.event_rx.take()
+    }
+}
+
+// Factory function to create a Bitaxe board from USB device info
+async fn create_from_usb(device: crate::transport::UsbDeviceInfo) -> crate::error::Result<Box<dyn Board + Send>> {
+    use tokio_serial::SerialPortBuilderExt;
+    
+    // Bitaxe Gamma requires exactly 2 serial ports
+    if device.serial_ports.len() != 2 {
+        return Err(crate::error::Error::Hardware(
+            format!("Bitaxe Gamma requires exactly 2 serial ports, found {}", device.serial_ports.len())
+        ));
+    }
+    
+    tracing::info!("Opening Bitaxe Gamma serial ports: control={}, data={}", 
+                  device.serial_ports[0], device.serial_ports[1]);
+    
+    // Open control port at 115200 baud
+    let control_port = tokio_serial::new(&device.serial_ports[0], 115200)
+        .open_native_async()?;
+    
+    // Open data port at 115200 baud  
+    let data_port = tokio_serial::new(&device.serial_ports[1], 115200)
+        .open_native_async()?;
+    
+    // Create the board
+    let mut board = BitaxeBoard::new(control_port, data_port);
+    
+    // Initialize the board (reset, discover chips, start event monitoring)
+    let _dummy_rx = board.initialize().await
+        .map_err(|e| crate::error::Error::Hardware(format!("Failed to initialize board: {}", e)))?;
+    
+    // The real event receiver is stored in the board and can be retrieved
+    // by the scheduler using take_event_receiver()
+    
+    tracing::info!("Bitaxe board initialized successfully with {} chips", board.chip_count());
+    
+    Ok(Box::new(board))
+}
+
+// Register this board type with the inventory system
+inventory::submit! {
+    crate::board::BoardDescriptor {
+        vid: 0x0403,
+        pid: 0x6015,
+        name: "Bitaxe Gamma",
+        create_fn: |device| Box::pin(create_from_usb(device)),
     }
 }

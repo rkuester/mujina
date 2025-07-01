@@ -4,9 +4,10 @@
 //! task management, signal handling, and graceful shutdown.
 
 use tokio::signal::unix::{self, SignalKind};
+use tokio::sync::mpsc;
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
-use crate::scheduler;
+use crate::{board::Board, board_manager::BoardManager, scheduler, transport::{TransportEvent, UsbTransport}};
 use crate::tracing::prelude::*;
 
 /// The main daemon that coordinates all mining operations.
@@ -26,8 +27,43 @@ impl Daemon {
 
     /// Run the daemon until shutdown is requested.
     pub async fn run(self) -> anyhow::Result<()> {
-        // Spawn the scheduler task
-        self.tracker.spawn(scheduler::task(self.shutdown.clone()));
+        // Create channels for component communication
+        let (transport_tx, transport_rx) = mpsc::channel::<TransportEvent>(100);
+        let (board_tx, board_rx) = mpsc::channel::<Box<dyn Board + Send>>(10);
+        
+        // Create and start USB transport discovery
+        let usb_transport = UsbTransport::new(transport_tx.clone());
+        self.tracker.spawn({
+            let shutdown = self.shutdown.clone();
+            async move {
+                if let Err(e) = usb_transport.start_discovery().await {
+                    error!("USB discovery failed: {}", e);
+                }
+                // Keep the transport task alive until shutdown
+                shutdown.cancelled().await;
+            }
+        });
+        
+        // Create and start board manager
+        let mut board_manager = BoardManager::new(transport_rx, board_tx);
+        self.tracker.spawn({
+            let shutdown = self.shutdown.clone();
+            async move {
+                tokio::select! {
+                    result = board_manager.run() => {
+                        if let Err(e) = result {
+                            error!("Board manager error: {}", e);
+                        }
+                    }
+                    _ = shutdown.cancelled() => {
+                        debug!("Board manager shutting down");
+                    }
+                }
+            }
+        });
+        
+        // Start the scheduler with board receiver
+        self.tracker.spawn(scheduler::task(self.shutdown.clone(), board_rx));
         self.tracker.close();
 
         info!("Started.");
