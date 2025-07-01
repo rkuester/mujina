@@ -1,7 +1,7 @@
 # Mujina Miner Architecture
 
-This document describes the high-level architecture of mujina-miner, an
-async Bitcoin mining software built on Tokio.
+This document describes the high-level architecture of mujina-miner,
+Bitcoin mining software built in Rust.
 
 ## Overview
 
@@ -12,9 +12,9 @@ fully async using Tokio for concurrent I/O operations.
 ### Key Dependencies
 
 - **tokio**: Async runtime for concurrent I/O operations
-- **rust-bitcoin**: Core Bitcoin types and utilities
 - **tokio-serial**: Async serial port communication
-- **axum**: HTTP server framework (future)
+- **rust-bitcoin**: Core Bitcoin types and utilities
+- **axum**: HTTP server framework
 - **tracing**: Structured logging and diagnostics
 
 ## Module Structure
@@ -30,15 +30,16 @@ src/
 ├── types.rs          # Core types (Job, Share, Nonce, etc.)
 ├── config.rs         # Configuration loading and validation
 ├── daemon.rs         # Daemon lifecycle management
-├── board/            # Mining board abstractions
-├── chip/             # ASIC chip protocols
-├── transport/        # USB/Serial communication layer
-├── control/          # Hashboard control protocols
-├── hal/              # Hardware abstraction layer
-├── drivers/          # Peripheral device drivers
-├── pool/             # Mining pool connectivity
+├── board/            # Hash board implementations
+├── board_io/         # Physical connections to boards
+├── board_protocol/   # Board control protocols
+├── chip_io/          # Hardware interface traits (I2C, SPI, GPIO)
+├── misc_chips/       # Peripheral chip drivers
+├── asic/             # Mining ASIC drivers
+├── board_manager.rs  # Board lifecycle and hotplug management
 ├── scheduler.rs      # Work scheduling and distribution
 ├── job_generator.rs  # Local job generation (testing/solo)
+├── pool/             # Mining pool connectivity
 ├── api/              # HTTP API and WebSocket
 ├── api_client/       # Shared API client library
 │   ├── mod.rs        # Client implementation
@@ -97,7 +98,7 @@ Daemon lifecycle management:
 
 ### Hardware Communication Layer
 
-The hardware communication layer is organized in four distinct levels, each
+The hardware communication layer is organized in distinct levels, each
 with a specific responsibility. This design enables maximum code reuse and
 testability.
 
@@ -110,8 +111,8 @@ testability.
                │Peripherals                    │ASIC Chain      
                │                               │                
 ┌─────────────────────────────┐ ┌──────────────────────────────┐
-│           Drivers           │ │        ASIC Protocols        │
-│     board support chips     │ │   ┌──────────────────────┐   │
+│         Misc Chips          │ │            ASIC              │
+│     peripheral drivers      │ │   ┌──────────────────────┐   │
 │ ┌──────┐ ┌───────┐┌───────┐ │ │   │     BM13xx Family    │   │
 │ │ TMP75│ │INA260 ││EMC2101│ │ │   │  ┌──────┐ ┌──────┐   │   │
 │ └───┬──┘ └───┬───┘└───┬───┘ │ │   │  │BM1370│ │BM1362│   │   │
@@ -120,28 +121,28 @@ testability.
       └────────┼────────┘       └──────────────────────────────┘
                │                           └────┬───┘           
         ┌─────────────┐                         │               
-        │ HAL Traits  │                         │               
+        │  Chip I/O   │                         │               
 ┌───────└─────────────┘───────┐                 │               
-│        HAL Adapters         │                 │               
-│ ┌──────────┐ ┌────────────┐ │                 │               
-│ │I2cOverCtl│ │GpioOverCtrl│ │                 │               
-│ └────┬─────┘ └───────┬────┘ │                 │               
+│    Board Protocol Adapters  │                 │               
+│ ┌────────────┐ ┌──────────┐ │                 │               
+│ │I2c via     │ │Gpio via  │ │                 │               
+│ │bitaxe_raw  │ │bitaxe_raw│ │                 │               
+│ └────┬───────┘ └─────┬────┘ │                 │               
 └─────────────────────────────┘                 │               
        └───────┬───────┘                        │               
                │                                │               
     ┌─────────────────────┐           ┌──────────────────┐      
     │   Control Channel   │           │   Data Channel   │      
-    │  control  protocol  │           │  direct  serial  │      
+    │   board protocols   │           │  direct  serial  │      
     └─────────────────────┘           └──────────────────┘      
               │                                 │               
               └────────────────┬────────────────┘               
                                │                                
 ┌──────────────────────────────────────────────────────────────┐
-│                          Transport                           │
-│                    USB/serial abstraction                    │
+│                         Board I/O                            │
+│              Physical connections to boards                  │
 │    ┌─────────────────────┐       ┌──────────────────────┐    │
-│    │   Control Channel   │       │     Data Channel     │    │
-│    │    /dev/ttyACM0     │       │     /dev/ttyACM1     │    │
+│    │     USB Serial      │       │  PCIe, Ethernet, ... │    │
 │    └─────────────────────┘       └──────────────────────┘    │
 └──────────────────────────────────────────────────────────────┘
 ```
@@ -161,41 +162,40 @@ Mining boards typically have two distinct communication paths:
    - Uses chip-specific protocols (BM13xx, etc.)
    - Often a separate serial port connected directly to the ASIC chain
 
-#### `transport/`
-Raw communication with hardware devices. This layer handles:
+#### `board_io/`
+Physical connections to hash boards. This layer handles:
 - USB device discovery and enumeration
+- Hotplug detection and events
 - Opening and configuring serial ports
 - Managing dual-channel devices (control + data channels)
 - No protocol knowledge - just raw byte streams
+- Emits `BoardConnected`/`BoardDisconnected` events
 
-#### `control/`
-Protocol implementations for hashboard control channels. This layer:
+#### `board_protocol/`
+Protocol implementations for hash board control channels. This layer:
 - Implements specific packet formats (e.g., bitaxe-raw's 7-byte header)
 - Provides protocol operations: GPIO control, ADC readings, I2C passthrough
 - Handles command/response sequencing and error checking
 - Translates high-level operations into protocol packets
+- Provides adapters that implement `chip_io` traits over protocols
 
-#### `hal/`
-Hardware Abstraction Layer providing standard async traits. This layer:
-- Defines traits like `I2c`, `Gpio`, `Adc` that drivers can use
-- Provides adapters that implement these traits over control protocols
-- Enables drivers to work with any underlying transport
-- Allows the same driver to work with native Linux I2C or I2C-over-serial
+#### `chip_io/`
+Hardware interface traits and native implementations. This layer:
+- Defines traits like `I2c`, `Gpio`, `Adc` that peripheral drivers use
+- Provides native Linux implementations for local buses
+- Allows the same driver to work with Linux I2C or I2C-over-protocol
 
-#### `drivers/`
-Reusable device drivers for mining peripherals. These drivers:
-- Are generic over HAL traits (work with any `I2c` implementation)
-- Provide high-level APIs for specific chips
-- Handle device-specific registers and protocols
-- Can be tested with mock HAL implementations
+#### `misc_chips/`
+Reusable drivers for peripheral chips (not mining ASICs). These drivers:
+- Are generic over `chip_io` traits (work with any `I2c` implementation)
+- Can be tested with mock implementations
+- Used on both control boards and hash boards
 
-#### `chip/` (ASIC protocols)
-ASIC chip communication protocols - the heart of mining operations:
+#### `asic/` (Mining ASIC protocols)
+Mining ASIC communication protocols - the heart of mining operations:
 - Implements protocols for different ASIC families (BM13xx, etc.)
-- Handles work distribution and nonce collection
 - Manages chip initialization, frequency control, and status
-- Communicates directly via the data channel serial port
-- Each chip family has its own protocol implementation
+- Communicates directly via the data channel
 
 ### Example: EmberOne Board Implementation
 
@@ -203,34 +203,33 @@ Here's how these layers work together in practice:
 
 ```rust
 // board/ember_one.rs
-use crate::transport::DualSerialTransport;
-use crate::control::bitaxe_raw::BitaxeRawControl;
-use crate::hal::adapters::I2cOverControl;
-use crate::drivers::{TMP75, INA260};
-use crate::chip::bm13xx::{BM1370, ChipChain};
+use crate::board_io::UsbSerial;
+use crate::board_protocol::bitaxe_raw::{Protocol, I2c as BitaxeI2c};
+use crate::misc_chips::{TMP75, INA260};
+use crate::asic::bm13xx::{BM1370, ChipChain};
 
 pub struct EmberOneBoard {
-    transport: DualSerialTransport,
-    control: BitaxeRawControl,
+    transport: UsbSerial,
+    protocol: Protocol,
     asic_chain: ChipChain<BM1370>,
-    temp_sensor: TMP75<I2cOverControl>,
-    power_monitor: INA260<I2cOverControl>,
+    temp_sensor: TMP75<BitaxeI2c>,
+    power_monitor: INA260<BitaxeI2c>,
 }
 
 impl EmberOneBoard {
     pub async fn new(control_port: &str, data_port: &str) -> Result<Self> {
-        // 1. Create transport layer (dual serial ports)
-        let transport = DualSerialTransport::open(control_port, data_port)
+        // 1. Create board I/O layer (dual serial ports)
+        let transport = UsbSerial::open_dual(control_port, data_port)
             .await
             .context("Failed to open serial ports")?;
         
-        // 2. Create control protocol handler for board management
-        let mut control = BitaxeRawControl::new(transport.control_channel());
+        // 2. Create board protocol handler for board management
+        let mut protocol = Protocol::new(transport.control_channel());
         
-        // 3. Initialize the board via control channel
-        control.set_gpio(ASIC_RESET_PIN, false).await?; // Reset ASICs
+        // 3. Initialize the board via control protocol
+        protocol.set_gpio(ASIC_RESET_PIN, false).await?; // Reset ASICs
         tokio::time::sleep(Duration::from_millis(100)).await;
-        control.set_gpio(ASIC_RESET_PIN, true).await?;  // Release reset
+        protocol.set_gpio(ASIC_RESET_PIN, true).await?;  // Release reset
         
         // 4. Create ASIC chain on the data channel
         let asic_chain = ChipChain::<BM1370>::new(
@@ -242,16 +241,16 @@ impl EmberOneBoard {
         asic_chain.enumerate_chips().await?;
         asic_chain.set_frequency(500.0).await?; // 500 MHz
         
-        // 6. Create HAL adapter for board peripherals
-        let i2c = I2cOverControl::new(&mut control);
+        // 6. Create chip_io adapter for board peripherals
+        let i2c = BitaxeI2c::new(&mut protocol);
         
-        // 7. Create drivers for board support chips
+        // 7. Create drivers for peripheral chips
         let temp_sensor = TMP75::new(i2c.clone(), 0x48);
         let power_monitor = INA260::new(i2c, 0x40);
         
         Ok(Self {
             transport,
-            control,
+            protocol,
             asic_chain,
             temp_sensor,
             power_monitor,
@@ -269,7 +268,7 @@ impl EmberOneBoard {
     }
     
     pub async fn read_diagnostics(&mut self) -> Result<Diagnostics> {
-        // Read from board peripherals via control channel
+        // Read from board peripherals via control protocol
         let temp = self.temp_sensor.read_temperature().await?;
         let power = self.power_monitor.read_power().await?;
         let hashrate = self.asic_chain.estimate_hashrate();
@@ -279,36 +278,40 @@ impl EmberOneBoard {
 }
 ```
 
-This architecture provides several key benefits:
+This architecture has these aims and objectives:
 
-1. **Clear separation**: ASICs communicate via data channel, peripherals via control
-2. **Reusability**: Drivers work with any HAL implementation, ASIC protocols work with any serial port
-3. **Testability**: Each layer can be tested in isolation with mocks
-4. **Flexibility**: New boards can mix and match components:
+1. **Reusability**: Drivers work with any `chip_io` implementation, ASIC protocols work with any serial port
+2. **Testability**: Each layer can be tested in isolation with mocks
+3. **Flexibility**: New boards can mix and match components:
    - Different ASIC chips (BM1370, BM1397, etc.)
-   - Different control protocols (bitaxe-raw, custom protocols)
+   - Different board protocols (bitaxe-raw, custom protocols)
    - Different peripheral chips (various temp sensors, power monitors)
-5. **Maintainability**: Clear boundaries between transport, protocols, and business logic
+4. **Maintainability**: Clear boundaries between connections, protocols, and business logic
+5. **Hotplug support**: Handles dynamic board connections
 
 ### Mining Logic
 
 #### `board/`
-**Existing module - expanded scope**
-
-Mining board abstractions that compose all hardware elements:
-- `Board` trait defining the interface for all mining boards
+Hash board implementations that compose all hardware elements:
+- `Board` trait defining the interface for all hash boards
 - `bitaxe.rs` - Original Bitaxe board implementation
 - `ember_one.rs` - EmberOne board using layered architecture
-- `generic_usb.rs` - Auto-detecting USB boards
-- Manages: chip chains, cooling, power delivery, monitoring
+- `registry.rs` - Board type registry for dynamic instantiation
+- Manages: ASIC chains, cooling, power delivery, monitoring
 
-#### `chip/`
-**Existing module - unchanged location**
-
-ASIC chip protocols and implementations:
+#### `asic/`
+Mining ASIC protocols and implementations:
 - Current: `bm13xx/` family with protocol documentation
-- Future: Other ASIC families
+- Future: Other ASIC families (BM1397, etc.)
 - Handles: work distribution, nonce collection, frequency control
+
+#### `board_manager.rs`
+Manages board lifecycle and hotplug events:
+- Listens to `board_io` discovery events
+- Identifies board types (USB VID/PID or probing)
+- Creates/destroys board instances
+- Maintains active board registry
+- Routes boards to/from scheduler
 
 #### `pool/`
 Mining pool client implementations:
@@ -319,8 +322,6 @@ Mining pool client implementations:
 - Handles: work fetching, share submission, difficulty adjustments
 
 #### `scheduler.rs`
-**Existing module - enhanced**
-
 Orchestrates the mining operation:
 - Receives work from pools
 - Distributes work to boards/chips
@@ -329,8 +330,6 @@ Orchestrates the mining operation:
 - Manages board lifecycle
 
 #### `job_generator.rs`
-**Existing module - unchanged**
-
 Local job generation for testing and solo mining:
 - Generates valid block templates
 - Updates timestamp/nonce fields
@@ -347,8 +346,6 @@ HTTP API server (new):
 - Prometheus metrics endpoint
 
 #### `tracing.rs`
-**Existing module - unchanged**
-
 Structured logging and observability:
 - tracing subscriber setup
 - journald or stdout output
@@ -369,10 +366,23 @@ Mining Pool <--[Stratum]--> pool::PoolClient
              board::Board                  board::Board
                     |                             |
                     v                             v
-          chip::BM13xxChip              chip::BM13xxChip
+          asic::BM13xxChip              asic::BM13xxChip
                     |                             |
                     v                             v
-    transport::SerialPort          transport::SerialPort
+       board_io::UsbSerial         board_io::UsbSerial
+
+
+Hotplug Flow:
+USB Device ──> board_io ──> BoardConnected Event ──> board_manager
+                                                           |
+                                                           v
+                                                    Creates Board
+                                                           |
+                                                           v
+                                                  Registers with Scheduler
+                                                           |
+                                                           v
+                                              Scheduler talks directly to Board
 ```
 
 ## Async Patterns
@@ -389,11 +399,12 @@ All I/O operations are async using Tokio:
 The architecture supports extension through several mechanisms:
 
 1. **New Board Types**: Implement the `Board` trait
-2. **New Chip Families**: Add modules under `chip/`
+2. **New ASIC Families**: Add modules under `asic/`
 3. **New Pool Protocols**: Implement `PoolClient` trait
-4. **New Control Protocols**: Implement `ControlProtocol` trait
+4. **New Board Protocols**: Add under `board_protocol/`
 5. **Custom Schedulers**: Pluggable scheduling strategies
-6. **Additional Drivers**: Add I2C/SPI device drivers
+6. **Additional Peripheral Chips**: Add drivers to `misc_chips/`
+7. **New Connection Types**: Extend `board_io/` (PCIe, Ethernet)
 
 ## Configuration
 
