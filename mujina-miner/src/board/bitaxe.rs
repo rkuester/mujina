@@ -499,6 +499,23 @@ impl Board for BitaxeBoard {
     fn take_event_receiver(&mut self) -> Option<tokio::sync::mpsc::Receiver<BoardEvent>> {
         self.event_rx.take()
     }
+    
+    async fn shutdown(&mut self) -> Result<(), BoardError> {
+        tracing::info!("Shutting down Bitaxe board");
+        
+        // Send chain inactive command to stop all chips from hashing
+        let command = Command::ChainInactive;
+        self.send_config_command(command).await?;
+        
+        // Give chips time to stop hashing
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        
+        // Hold chips in reset to ensure they stay in a safe state
+        self.hold_in_reset().await?;
+        
+        tracing::info!("Bitaxe board shutdown complete");
+        Ok(())
+    }
 }
 
 // Factory function to create a Bitaxe board from USB device info

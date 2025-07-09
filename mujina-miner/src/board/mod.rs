@@ -107,6 +107,13 @@ pub trait Board: Send {
     /// This should be called after initialization to receive board events.
     /// Returns None if the board hasn't been initialized yet.
     fn take_event_receiver(&mut self) -> Option<mpsc::Receiver<BoardEvent>>;
+    
+    /// Gracefully shutdown the board.
+    /// 
+    /// This should stop all mining activity and put the hardware in a safe 
+    /// state. The exact implementation is board-specific but typically includes
+    /// stopping hashing and ensuring chips are in a low-power or reset state.
+    async fn shutdown(&mut self) -> Result<(), BoardError>;
 }
 
 /// Information about a board

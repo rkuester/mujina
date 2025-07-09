@@ -6,7 +6,6 @@
 //! where it belongs.
 
 use std::collections::HashMap;
-use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -177,29 +176,20 @@ pub async fn task(running: CancellationToken, mut board_rx: mpsc::Receiver<Box<d
     // Graceful shutdown sequence
     info!("Starting graceful hardware shutdown...");
 
-    // Stop sending new jobs by canceling any pending job on current chip
+    // Stop sending new jobs by canceling any pending job
     if let Some(job_id) = active_jobs.keys().next().copied() {
         if let Err(e) = board.cancel_job(job_id).await {
             warn!("Failed to cancel active job during shutdown: {}", e);
         }
     }
 
-    // Send chain inactive command to stop hashing
-    // TODO: This needs to be moved into board-specific shutdown
-    // if let Err(e) = shutdown_chips(&mut board).await {
-    //     error!("Failed to properly shutdown chips: {}", e);
-    // }
-
-    // Give chips time to stop hashing
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
-    // Hold chips in reset to ensure they stay in a safe state
-    info!("Holding chips in reset");
-    if let Err(e) = board.hold_in_reset().await {
-        error!("Failed to hold chips in reset during shutdown: {}", e);
+    // Gracefully shutdown the board
+    info!("Shutting down board");
+    if let Err(e) = board.shutdown().await {
+        error!("Failed to shutdown board properly: {}", e);
     }
 
-    info!("Hardware shutdown complete");
+    info!("Board shutdown complete");
     trace!("Scheduler task stopped.");
 }
 
