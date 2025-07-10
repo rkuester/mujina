@@ -15,9 +15,11 @@ use crate::asic::bm13xx::{self, protocol::Command, BM13xxProtocol};
 use crate::asic::{ChipInfo, MiningJob};
 use crate::board::{Board, BoardError, BoardEvent, BoardInfo, JobCompleteReason};
 use crate::hw_trait::gpio::{Gpio, GpioPin, PinValue};
+use crate::hw_trait::i2c::I2c;
 use crate::mgmt_protocol::{ControlChannel, BitaxeRawGpio};
 use crate::mgmt_protocol::bitaxe_raw::i2c::BitaxeRawI2c;
 use crate::peripheral::emc2101::Emc2101;
+use crate::peripheral::tps546::{Tps546, Tps546Config};
 use crate::tracing::prelude::*;
 
 /// A wrapper around AsyncRead that traces raw bytes as they're read
@@ -75,6 +77,8 @@ pub struct BitaxeBoard {
     i2c: BitaxeRawI2c,
     /// Fan controller (EMC2101)
     fan_controller: Option<Emc2101<BitaxeRawI2c>>,
+    /// Power management controller (TPS546D24A)
+    power_controller: Option<Tps546<BitaxeRawI2c>>,
     /// Writer for sending commands to chips
     data_writer: FramedWrite<tokio::io::WriteHalf<SerialStream>, bm13xx::FrameCodec>,
     /// Reader for receiving responses from chips (moved to event monitor during initialize)
@@ -130,6 +134,7 @@ impl BitaxeBoard {
             gpio,
             i2c,
             fan_controller: None,
+            power_controller: None,
             data_writer: FramedWrite::new(data_writer, bm13xx::FrameCodec::default()),
             data_reader: Some(FramedRead::new(
                 tracing_reader,
@@ -401,6 +406,50 @@ impl BitaxeBoard {
         self.spawn_job_timer(current_job_id);
     }
     
+    /// Initialize the power controller
+    async fn init_power_controller(&mut self) -> Result<(), BoardError> {
+        // Set I2C frequency to 100kHz for PMBus devices
+        self.i2c.set_frequency(100_000).await
+            .map_err(|e| BoardError::InitializationFailed(
+                format!("Failed to set I2C frequency: {}", e)
+            ))?;
+        
+        // Clone the I2C bus for the power controller
+        let power_i2c = self.i2c.clone();
+        let config = Tps546Config::bitaxe_gamma();
+        let mut tps546 = Tps546::new(power_i2c, config);
+        
+        // Initialize the TPS546
+        match tps546.init().await {
+            Ok(()) => {
+                info!("TPS546D24A power controller initialized");
+                
+                // Delay before setting voltage
+                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                
+                // Set initial output voltage (1.2V)
+                match tps546.set_vout(1.2).await {
+                    Ok(()) => info!("Core voltage set to 1.2V"),
+                    Err(e) => {
+                        error!("Failed to set initial core voltage: {}", e);
+                        return Err(BoardError::InitializationFailed(
+                            format!("Failed to set core voltage: {}", e)
+                        ));
+                    }
+                }
+                
+                self.power_controller = Some(tps546);
+                Ok(())
+            }
+            Err(e) => {
+                error!("Failed to initialize TPS546D24A power controller: {}", e);
+                Err(BoardError::InitializationFailed(
+                    format!("Power controller init failed: {}", e)
+                ))
+            }
+        }
+    }
+    
     /// Initialize the fan controller
     async fn init_fan_controller(&mut self) -> Result<(), BoardError> {
         // Clone the I2C bus for the fan controller
@@ -440,8 +489,10 @@ impl BitaxeBoard {
             let mut interval = tokio::time::interval(STATS_INTERVAL);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             
-            // Create a new fan controller for the stats task
-            let mut fan = Emc2101::new(i2c);
+            // Create new controllers for the stats task
+            let mut fan = Emc2101::new(i2c.clone());
+            let config = Tps546Config::bitaxe_gamma();
+            let mut power = Tps546::new(i2c, config);
             
             loop {
                 interval.tick().await;
@@ -474,9 +525,40 @@ impl BitaxeBoard {
                     }
                 };
                 
+                // Read power stats
+                let vin = match power.get_vin().await {
+                    Ok(mv) => format!("{:.2}V", mv as f32 / 1000.0),
+                    Err(_) => "N/A".to_string(),
+                };
+                
+                let vout = match power.get_vout().await {
+                    Ok(mv) => format!("{:.3}V", mv as f32 / 1000.0),
+                    Err(_) => "N/A".to_string(),
+                };
+                
+                let iout = match power.get_iout().await {
+                    Ok(ma) => format!("{:.2}A", ma as f32 / 1000.0),
+                    Err(_) => "N/A".to_string(),
+                };
+                
+                let power_w = match power.get_power().await {
+                    Ok(mw) => format!("{:.1}W", mw as f32 / 1000.0),
+                    Err(_) => "N/A".to_string(),
+                };
+                
+                let vr_temp = match power.get_temperature().await {
+                    Ok(t) => format!("{}°C", t),
+                    Err(_) => "N/A".to_string(),
+                };
+                
+                // Check power status
+                if let Err(e) = power.check_status().await {
+                    warn!("Power controller status check failed: {}", e);
+                }
+                
                 info!(
-                    "Board stats - Chips: {}, ASIC temp: {}, Fan: {} ({})",
-                    chip_count, temp, fan_pwm, fan_rpm
+                    "Board stats - Chips: {}, ASIC: {}, Fan: {} ({}), VR: {}, Power: {} @ {} (Vin: {}, Vout: {})",
+                    chip_count, temp, fan_pwm, fan_rpm, vr_temp, power_w, iout, vin, vout
                 );
             }
         });
@@ -522,8 +604,11 @@ impl Board for BitaxeBoard {
 
         tracing::info!("Board initialized with {} chip(s)", self.chip_infos.len());
         
-        // Initialize fan controller
+        // Initialize fan controller first to test I2C
         self.init_fan_controller().await?;
+        
+        // Initialize power controller
+        self.init_power_controller().await?;
 
         // Create event channel
         let (tx, rx) = tokio::sync::mpsc::channel(100);
@@ -612,6 +697,14 @@ impl Board for BitaxeBoard {
         
         // Hold chips in reset to ensure they stay in a safe state
         self.hold_in_reset().await?;
+        
+        // Turn off core voltage
+        if let Some(ref mut power) = self.power_controller {
+            match power.set_vout(0.0).await {
+                Ok(()) => info!("Core voltage turned off"),
+                Err(e) => warn!("Failed to turn off core voltage: {}", e),
+            }
+        }
         
         // Cancel the statistics monitoring task
         if let Some(handle) = self.stats_task_handle.take() {
