@@ -6,6 +6,7 @@
 
 pub mod channel;
 pub mod gpio;
+pub mod i2c;
 
 use std::io;
 use bytes::{BufMut, BytesMut};

@@ -16,6 +16,8 @@ use crate::asic::{ChipInfo, MiningJob};
 use crate::board::{Board, BoardError, BoardEvent, BoardInfo, JobCompleteReason};
 use crate::hw_trait::gpio::{Gpio, GpioPin, PinValue};
 use crate::mgmt_protocol::{ControlChannel, BitaxeRawGpio};
+use crate::mgmt_protocol::bitaxe_raw::i2c::BitaxeRawI2c;
+use crate::peripheral::emc2101::Emc2101;
 use crate::tracing::prelude::*;
 
 /// A wrapper around AsyncRead that traces raw bytes as they're read
@@ -68,6 +70,10 @@ pub struct BitaxeBoard {
     control_channel: ControlChannel,
     /// GPIO controller
     gpio: BitaxeRawGpio,
+    /// I2C bus controller
+    i2c: BitaxeRawI2c,
+    /// Fan controller (EMC2101)
+    fan_controller: Option<Emc2101<BitaxeRawI2c>>,
     /// Writer for sending commands to chips
     data_writer: FramedWrite<tokio::io::WriteHalf<SerialStream>, bm13xx::FrameCodec>,
     /// Reader for receiving responses from chips (moved to event monitor during initialize)
@@ -85,6 +91,8 @@ pub struct BitaxeBoard {
     current_job_id: Option<u64>,
     /// Job ID counter for cycling through 0-127
     next_job_id: u8,
+    /// Handle for the statistics task
+    stats_task_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl BitaxeBoard {
@@ -104,9 +112,10 @@ impl BitaxeBoard {
     /// In the future, a DeviceManager will create boards when USB devices
     /// are detected (by VID/PID) and pass already-opened serial streams.
     pub fn new(control: SerialStream, data: SerialStream) -> Self {
-        // Create control channel and GPIO controller
+        // Create control channel, GPIO and I2C controllers
         let control_channel = ControlChannel::new(control);
         let gpio = BitaxeRawGpio::new(control_channel.clone());
+        let i2c = BitaxeRawI2c::new(control_channel.clone());
 
         // Split data stream
         let (data_reader, data_writer) = tokio::io::split(data);
@@ -117,6 +126,8 @@ impl BitaxeBoard {
         BitaxeBoard {
             control_channel,
             gpio,
+            i2c,
+            fan_controller: None,
             data_writer: FramedWrite::new(data_writer, bm13xx::FrameCodec::default()),
             data_reader: Some(FramedRead::new(
                 tracing_reader,
@@ -128,6 +139,7 @@ impl BitaxeBoard {
             event_rx: None,
             current_job_id: None,
             next_job_id: 0,
+            stats_task_handle: None,
         }
     }
 
@@ -385,6 +397,89 @@ impl BitaxeBoard {
         // Spawn job completion timer outside the main monitoring task
         self.spawn_job_timer(current_job_id);
     }
+    
+    /// Initialize the fan controller
+    async fn init_fan_controller(&mut self) -> Result<(), BoardError> {
+        // Clone the I2C bus for the fan controller
+        let fan_i2c = self.i2c.clone();
+        let mut fan = Emc2101::new(fan_i2c);
+        
+        // Initialize the EMC2101
+        match fan.init().await {
+            Ok(()) => {
+                info!("EMC2101 fan controller initialized");
+                
+                // Set initial fan speed to 50%
+                const INITIAL_FAN_PERCENT: u8 = 50;
+                if let Err(e) = fan.set_pwm_percent(INITIAL_FAN_PERCENT).await {
+                    warn!("Failed to set initial fan speed: {}", e);
+                }
+                
+                self.fan_controller = Some(fan);
+                Ok(())
+            }
+            Err(e) => {
+                warn!("Failed to initialize EMC2101 fan controller: {}", e);
+                // Continue without fan control - not critical for operation
+                Ok(())
+            }
+        }
+    }
+    
+    /// Spawn a task to periodically log management statistics
+    fn spawn_stats_monitor(&mut self) {
+        // Clone what we need for the task
+        let i2c = self.i2c.clone();
+        let chip_count = self.chip_infos.len();
+        
+        let handle = tokio::spawn(async move {
+            const STATS_INTERVAL: Duration = Duration::from_secs(30);
+            let mut interval = tokio::time::interval(STATS_INTERVAL);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            
+            // Create a new fan controller for the stats task
+            let mut fan = Emc2101::new(i2c);
+            
+            loop {
+                interval.tick().await;
+                
+                // Read temperature
+                let temp = match fan.get_external_temperature().await {
+                    Ok(t) => format!("{:.1}°C", t),
+                    Err(_) => "N/A".to_string(),
+                };
+                
+                // Read fan PWM duty
+                let fan_pwm = match fan.get_pwm_percent().await {
+                    Ok(p) => format!("{}%", p),
+                    Err(_) => "N/A".to_string(),
+                };
+                
+                // Read fan RPM (if TACH is connected)
+                let fan_rpm = match fan.get_tach_count().await {
+                    Ok(count) => {
+                        debug!("TACH count: 0x{:04x}", count);
+                        match fan.get_rpm().await {
+                            Ok(rpm) if rpm > 0 => format!("{} RPM", rpm),
+                            Ok(_) => format!("0 RPM (TACH: 0x{:04x})", count),
+                            Err(_) => "N/A".to_string(),
+                        }
+                    }
+                    Err(e) => {
+                        debug!("Failed to read TACH: {}", e);
+                        "N/A".to_string()
+                    }
+                };
+                
+                info!(
+                    "Board stats - Chips: {}, ASIC temp: {}, Fan: {} ({})",
+                    chip_count, temp, fan_pwm, fan_rpm
+                );
+            }
+        });
+        
+        self.stats_task_handle = Some(handle);
+    }
 }
 
 #[async_trait]
@@ -423,6 +518,9 @@ impl Board for BitaxeBoard {
         self.discover_chips().await?;
 
         tracing::info!("Board initialized with {} chip(s)", self.chip_infos.len());
+        
+        // Initialize fan controller
+        self.init_fan_controller().await?;
 
         // Create event channel
         let (tx, rx) = tokio::sync::mpsc::channel(100);
@@ -431,6 +529,9 @@ impl Board for BitaxeBoard {
 
         // TODO: Spawn task to monitor chip responses and emit events
         self.spawn_event_monitor();
+        
+        // Spawn statistics monitoring task
+        self.spawn_stats_monitor();
 
         // Return a dummy receiver for backward compatibility
         // The real receiver is stored and can be retrieved with take_event_receiver()
@@ -508,6 +609,11 @@ impl Board for BitaxeBoard {
         
         // Hold chips in reset to ensure they stay in a safe state
         self.hold_in_reset().await?;
+        
+        // Cancel the statistics monitoring task
+        if let Some(handle) = self.stats_task_handle.take() {
+            handle.abort();
+        }
         
         tracing::info!("Bitaxe board shutdown complete");
         Ok(())
