@@ -31,6 +31,9 @@ tokio-util = { workspace = true }
 tracing = { workspace = true }
 tracing-journald = { workspace = true }
 tracing-subscriber = { workspace = true }
+nix = { workspace = true }
+parking_lot = { workspace = true }
+rustix = { workspace = true }
 
 [[bin]]
 name = "mujina-minerd"
