@@ -79,6 +79,12 @@ pub enum SerialError {
 
     #[error("Serial port disconnected")]
     Disconnected,
+    
+    #[error("Hardware error on serial port")]
+    HardwareError,
+    
+    #[error("Operation timed out")]
+    Timeout,
 }
 
 /// Statistics for a serial port.
@@ -326,7 +332,12 @@ impl AsyncRead for SerialReader {
                         Err(io::Error::from(io::ErrorKind::WouldBlock))
                     }
                     Err(rustix::io::Errno::IO) => {
-                        Err(io::Error::new(io::ErrorKind::Other, SerialError::Disconnected))
+                        // EIO can mean various hardware errors, not just disconnection
+                        Err(io::Error::new(io::ErrorKind::Other, SerialError::HardwareError))
+                    }
+                    Err(rustix::io::Errno::PIPE) => {
+                        // EPIPE is more likely to indicate disconnection
+                        Err(io::Error::new(io::ErrorKind::BrokenPipe, SerialError::Disconnected))
                     }
                     Err(e) => Err(e.into()),
                 }
@@ -365,7 +376,12 @@ impl AsyncWrite for SerialWriter {
                         Err(io::Error::from(io::ErrorKind::WouldBlock))
                     }
                     Err(rustix::io::Errno::IO) => {
-                        Err(io::Error::new(io::ErrorKind::Other, SerialError::Disconnected))
+                        // EIO can mean various hardware errors, not just disconnection
+                        Err(io::Error::new(io::ErrorKind::Other, SerialError::HardwareError))
+                    }
+                    Err(rustix::io::Errno::PIPE) => {
+                        // EPIPE is more likely to indicate disconnection
+                        Err(io::Error::new(io::ErrorKind::BrokenPipe, SerialError::Disconnected))
                     }
                     Err(e) => Err(e.into()),
                 }
