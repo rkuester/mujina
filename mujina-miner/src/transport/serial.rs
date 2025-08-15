@@ -596,66 +596,6 @@ mod tests {
         }
     }
 
-    // Mock file descriptor for unit tests
-    #[allow(dead_code)]
-    mod mock {
-        use super::*;
-        use std::collections::VecDeque;
-        use std::sync::atomic::AtomicBool;
-        use std::sync::Mutex;
-
-        pub struct MockFd {
-            read_buffer: Mutex<VecDeque<u8>>,
-            write_buffer: Mutex<Vec<u8>>,
-            baud_rate: Mutex<u32>,
-            simulate_eagain: AtomicBool,
-        }
-
-        impl MockFd {
-            pub fn new() -> Self {
-                Self {
-                    read_buffer: Mutex::new(VecDeque::new()),
-                    write_buffer: Mutex::new(Vec::new()),
-                    baud_rate: Mutex::new(115200),
-                    simulate_eagain: AtomicBool::new(false),
-                }
-            }
-
-            pub fn push_read_data(&self, data: &[u8]) {
-                self.read_buffer.lock().unwrap().extend(data);
-            }
-
-            pub fn take_written_data(&self) -> Vec<u8> {
-                self.write_buffer.lock().unwrap().drain(..).collect()
-            }
-
-            pub fn set_simulate_eagain(&self, value: bool) {
-                self.simulate_eagain.store(value, Ordering::SeqCst);
-            }
-
-            pub fn read(&self, buf: &mut [u8]) -> rustix::io::Result<usize> {
-                if self.simulate_eagain.load(Ordering::SeqCst) {
-                    return Err(rustix::io::Errno::AGAIN);
-                }
-
-                let mut buffer = self.read_buffer.lock().unwrap();
-                let len = buf.len().min(buffer.len());
-                for i in 0..len {
-                    buf[i] = buffer.pop_front().unwrap();
-                }
-                Ok(len)
-            }
-
-            pub fn write(&self, buf: &[u8]) -> rustix::io::Result<usize> {
-                if self.simulate_eagain.load(Ordering::SeqCst) {
-                    return Err(rustix::io::Errno::AGAIN);
-                }
-
-                self.write_buffer.lock().unwrap().extend_from_slice(buf);
-                Ok(buf.len())
-            }
-        }
-    }
 
     // Test helper to create virtual serial port pairs
     pub mod test_support {
@@ -680,19 +620,6 @@ mod tests {
             Ok((master_stream, slave_stream))
         }
 
-        /// Test fixture with pre-configured streams
-        #[allow(dead_code)]
-        pub struct SerialTestFixture {
-            pub stream_a: SerialStream,
-            pub stream_b: SerialStream,
-        }
-
-        impl SerialTestFixture {
-            pub async fn new() -> Result<Self, SerialError> {
-                let (stream_a, stream_b) = create_virtual_pair().await?;
-                Ok(Self { stream_a, stream_b })
-            }
-        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
