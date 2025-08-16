@@ -7,7 +7,6 @@ use tokio::{
     io::{AsyncRead, ReadBuf},
     time,
 };
-use tokio_serial::SerialStream;
 use tokio_stream::StreamExt;
 use tokio_util::codec::{FramedRead, FramedWrite};
 
@@ -21,6 +20,7 @@ use crate::mgmt_protocol::bitaxe_raw::i2c::BitaxeRawI2c;
 use crate::peripheral::emc2101::Emc2101;
 use crate::peripheral::tps546::{Tps546, Tps546Config};
 use crate::tracing::prelude::*;
+use crate::transport::serial::{SerialStream, SerialControl, SerialReader, SerialWriter};
 
 /// A wrapper around AsyncRead that traces raw bytes as they're read
 struct TracingReader<R> {
@@ -80,10 +80,11 @@ pub struct BitaxeBoard {
     /// Power management controller (TPS546D24A)
     power_controller: Option<Tps546<BitaxeRawI2c>>,
     /// Writer for sending commands to chips
-    data_writer: FramedWrite<tokio::io::WriteHalf<SerialStream>, bm13xx::FrameCodec>,
+    data_writer: FramedWrite<SerialWriter, bm13xx::FrameCodec>,
     /// Reader for receiving responses from chips (moved to event monitor during initialize)
-    data_reader:
-        Option<FramedRead<TracingReader<tokio::io::ReadHalf<SerialStream>>, bm13xx::FrameCodec>>,
+    data_reader: Option<FramedRead<TracingReader<SerialReader>, bm13xx::FrameCodec>>,
+    /// Control handle for data channel (for baud rate changes)
+    data_control: SerialControl,
     /// Protocol handler for chip communication
     #[expect(dead_code, reason = "Will be used for protocol-specific operations")]
     protocol: BM13xxProtocol,
@@ -109,7 +110,7 @@ impl BitaxeBoard {
     ///
     /// # Arguments
     /// * `control` - Serial stream for sending board control commands
-    /// * `data` - Serial stream for chip communication
+    /// * `data_path` - Path to the data serial port (e.g., "/dev/ttyACM1")
     ///
     /// # Returns
     /// A new BitaxeBoard instance ready for hardware operations
@@ -117,19 +118,21 @@ impl BitaxeBoard {
     /// # Design Note
     /// In the future, a DeviceManager will create boards when USB devices
     /// are detected (by VID/PID) and pass already-opened serial streams.
-    pub fn new(control: SerialStream, data: SerialStream) -> Self {
+    pub fn new(control: tokio_serial::SerialStream, data_path: &str) -> Result<Self, BoardError> {
         // Create control channel, GPIO and I2C controllers
         let control_channel = ControlChannel::new(control);
         let gpio = BitaxeRawGpio::new(control_channel.clone());
         let i2c = BitaxeRawI2c::new(control_channel.clone());
 
-        // Split data stream
-        let (data_reader, data_writer) = tokio::io::split(data);
+        // Create SerialStream for data channel at initial baud rate
+        let data_stream = SerialStream::new(data_path, 115200)
+            .map_err(|e| BoardError::InitializationFailed(format!("Failed to open data port: {}", e)))?;
+        let (data_reader, data_writer, data_control) = data_stream.split();
 
         // Wrap the data reader with tracing
         let tracing_reader = TracingReader::new(data_reader, "Data");
 
-        BitaxeBoard {
+        Ok(BitaxeBoard {
             control_channel,
             gpio,
             i2c,
@@ -140,6 +143,7 @@ impl BitaxeBoard {
                 tracing_reader,
                 bm13xx::FrameCodec::default(),
             )),
+            data_control,
             protocol: BM13xxProtocol::new(),
             chip_infos: Vec::new(),
             event_tx: None,
@@ -147,7 +151,7 @@ impl BitaxeBoard {
             current_job_id: None,
             next_job_id: 0,
             stats_task_handle: None,
-        }
+        })
     }
 
     /// Performs a momentary reset of the mining chips via GPIO control.
@@ -881,11 +885,9 @@ async fn create_from_usb(
     // Open control port at 115200 baud
     let control_port = tokio_serial::new(&device.serial_ports[0], 115200).open_native_async()?;
 
-    // Open data port at 115200 baud
-    let data_port = tokio_serial::new(&device.serial_ports[1], 115200).open_native_async()?;
-
-    // Create the board
-    let mut board = BitaxeBoard::new(control_port, data_port);
+    // Create the board with the control port and data port path
+    let mut board = BitaxeBoard::new(control_port, &device.serial_ports[1])
+        .map_err(|e| crate::error::Error::Hardware(format!("Failed to create board: {}", e)))?;
 
     // Initialize the board (reset, discover chips, start event monitoring)
     let _dummy_rx = board
