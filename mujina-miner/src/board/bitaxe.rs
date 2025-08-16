@@ -612,6 +612,9 @@ impl Board for BitaxeBoard {
         // Reset the board first
         self.reset().await?;
 
+        // Phase 1: Initial communication at 115200 baud
+        tracing::info!("Starting initialization at 115200 baud");
+
         // Enable version rolling before chip discovery (as seen in serial captures)
         // Write 0xFFFF0090 to register 0xA4 to enable version rolling
         let version_cmd = Command::WriteRegister {
@@ -663,6 +666,31 @@ impl Board for BitaxeBoard {
                 },
             };
             self.send_config_command(core_reg_cmd2).await?;
+            
+            // Phase 2: Send baud rate change command to chip
+            // Bitaxe Gamma always changes from 115200 to 1Mbps
+            tracing::info!("Sending baud rate change command to BM1370 for {} baud", Self::TARGET_BAUD_RATE);
+            let baud_cmd = Command::WriteRegister {
+                all: true,
+                chip_address: 0x00,
+                register: bm13xx::protocol::Register::UartBaud(Self::CHIP_BAUD_REGISTER),
+            };
+            self.send_config_command(baud_cmd).await?;
+            
+            // Give chip time to process baud rate change
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            
+            // Phase 3: Change host baud rate to match
+            tracing::info!("Changing host serial port from 115200 to {} baud", Self::TARGET_BAUD_RATE);
+            self.data_control.set_baud_rate(Self::TARGET_BAUD_RATE)
+                .map_err(|e| BoardError::InitializationFailed(
+                    format!("Failed to change baud rate: {}", e)
+                ))?;
+            
+            // Wait for baud rate change to stabilize
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            
+            tracing::info!("Baud rate change complete, continuing at {} baud", Self::TARGET_BAUD_RATE);
             
             // Start with lower frequency like esp-miner does
             // esp-miner starts at 62.5MHz and ramps up to target
