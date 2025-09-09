@@ -444,6 +444,11 @@ impl BitaxeBoard {
                             Ok(mv) => info!("Core voltage readback: {:.3}V", mv as f32 / 1000.0),
                             Err(e) => warn!("Failed to read core voltage: {}", e),
                         }
+                        
+                        // Dump complete configuration for debugging
+                        if let Err(e) = tps546.dump_configuration().await {
+                            warn!("Failed to dump TPS546 configuration: {}", e);
+                        }
                     }
                     Err(e) => {
                         error!("Failed to set initial core voltage: {}", e);
