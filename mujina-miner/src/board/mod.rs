@@ -34,6 +34,13 @@ pub enum BoardEvent {
         temperature_c: Option<f32>,
         frequency_mhz: Option<u32>,
     },
+
+    /// A critical board fault occurred
+    BoardFault {
+        component: String,  // e.g., "power_controller", "temperature_sensor"
+        fault: String,      // Description of the fault
+        recoverable: bool,  // Whether the board might recover
+    },
 }
 
 /// Reasons why a mining job completed.
