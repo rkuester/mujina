@@ -497,6 +497,112 @@ impl BitaxeBoard {
         }
     }
 
+    /// Generate frequency ramp steps for smooth PLL transitions
+    /// 
+    /// Calculates PLL configurations for each frequency step from start to target.
+    /// Uses the same algorithm as esp-miner for BM1370 chips.
+    fn generate_frequency_ramp_steps(start_mhz: f32, target_mhz: f32, step_mhz: f32) -> Vec<bm13xx::protocol::PllConfig> {
+        let mut configs = Vec::new();
+        let mut current = start_mhz;
+        
+        // Generate steps from start to target
+        while current <= target_mhz {
+            if let Some(config) = Self::calculate_pll_for_frequency(current) {
+                configs.push(config);
+            } else {
+                tracing::warn!("Failed to calculate PLL for {:.2} MHz, skipping", current);
+            }
+            
+            current += step_mhz;
+            
+            // Ensure we don't overshoot but always include the target
+            if current > target_mhz && (current - step_mhz) < target_mhz {
+                current = target_mhz;
+            }
+        }
+        
+        configs
+    }
+    
+    /// Calculate PLL configuration for a specific frequency
+    /// 
+    /// This follows the BM1370/esp-miner algorithm exactly:
+    /// - Crystal frequency: 25 MHz
+    /// - ref_div: 2 or 1 (prefer 2)
+    /// - post_div1: 1-7 (must be >= post_div2)
+    /// - post_div2: 1-7
+    /// - fb_div: 0xa0-0xef (160-239)
+    /// 
+    /// Formula: freq = 25 * fb_div / (ref_div * post_div1 * post_div2)
+    /// 
+    /// Note: esp-miner uses a "first-found" algorithm rather than finding the optimal
+    /// configuration, and we need to match its behavior for consistency.
+    fn calculate_pll_for_frequency(target_freq: f32) -> Option<bm13xx::protocol::PllConfig> {
+        const CRYSTAL_FREQ: f32 = 25.0;
+        const MAX_FREQ_ERROR: f32 = 1.0; // Maximum acceptable frequency error in MHz
+        
+        let mut best_fb_div = 0u16;
+        let mut best_ref_div = 0u8;
+        let mut best_post_div1 = 0u8;
+        let mut best_post_div2 = 0u8;
+        let mut min_error = 10.0; // esp-miner starts with min_difference = 10
+        
+        // Follow esp-miner's exact loop order to get same results
+        // It stops at first solution under max_diff (1.0 MHz)
+        for ref_div in [2, 1] {
+            if best_fb_div != 0 { break; } // Stop once we find a solution
+            
+            for post_div1 in (1..=7).rev() {
+                if best_fb_div != 0 { break; }
+                
+                for post_div2 in (1..=7).rev() {
+                    if best_fb_div != 0 { break; }
+                    
+                    if post_div1 >= post_div2 {
+                        // Calculate required feedback divider (esp-miner uses round())
+                        let fb_div_f = (post_div1 * post_div2) as f32 * target_freq * ref_div as f32 / CRYSTAL_FREQ;
+                        let fb_div = fb_div_f.round() as u16;
+                        
+                        // Check if fb_div is in valid range
+                        if fb_div >= 0xa0 && fb_div <= 0xef {
+                            // Calculate actual frequency with this configuration
+                            let actual_freq = CRYSTAL_FREQ * fb_div as f32 / (ref_div * post_div1 * post_div2) as f32;
+                            let error = (actual_freq - target_freq).abs();
+                            
+                            // esp-miner accepts first solution with error < min_difference AND < max_diff
+                            if error < min_error && error < MAX_FREQ_ERROR {
+                                best_fb_div = fb_div;
+                                best_ref_div = ref_div;
+                                best_post_div1 = post_div1;
+                                best_post_div2 = post_div2;
+                                min_error = error;
+                                // esp-miner stops at first solution meeting criteria
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        if best_fb_div == 0 {
+            return None;
+        }
+        
+        // Encode post dividers as per hardware format
+        let post_div = ((best_post_div1 - 1) << 4) | (best_post_div2 - 1);
+        
+        // Add the 0x50 flag for most frequencies, 0x40 for high frequencies
+        // esp-miner checks: if (fb_divider * 25 / (float) ref_divider >= 2400)
+        let fb_div_with_flag = if (best_fb_div as f32 * CRYSTAL_FREQ / best_ref_div as f32) >= 2400.0 {
+            // This condition is rarely met with our frequency range
+            best_fb_div | 0x5000  // Actually esp-miner doesn't set any flag here, just uses 0x50
+        } else {
+            best_fb_div | 0x5000  // esp-miner sets freqbuf[2] = 0x50 for normal frequencies
+        };
+        
+        Some(bm13xx::protocol::PllConfig::new(fb_div_with_flag, best_ref_div, post_div))
+    }
+
     /// Spawn a task to periodically log management statistics
     fn spawn_stats_monitor(&mut self) {
         // Clone what we need for the task
@@ -666,24 +772,31 @@ impl Board for BitaxeBoard {
         // Phase 4: Initial communication at 115200 baud
         tracing::info!("Starting chip initialization at 115200 baud");
 
-        // Enable version rolling before chip discovery (as seen in serial captures)
-        // Write 0xFFFF0090 to register 0xA4 to enable version rolling
-        let version_cmd = Command::WriteRegister {
-            all: true, // Broadcast to all chips
-            chip_address: 0x00,
-            register: bm13xx::protocol::Register::VersionMask(
-                bm13xx::protocol::VersionMask::full_rolling(),
-            ),
-        };
-        self.send_config_command(version_cmd).await?;
+        // Step 1: Version Mask Configuration (Enable 11-bit responses)
+        // The very first commands sent are to configure the version mask.
+        // This MUST be done before chip discovery to enable 11-bit response frames.
+        // Send 3 times as per reference implementation
+        tracing::debug!("Sending version mask configuration (3 times)");
+        for i in 1..=3 {
+            tracing::trace!("Version mask send {}/3", i);
+            let version_cmd = Command::WriteRegister {
+                all: true, // Broadcast to all chips
+                chip_address: 0x00,
+                register: bm13xx::protocol::Register::VersionMask(
+                    bm13xx::protocol::VersionMask::full_rolling(),
+                ),
+            };
+            self.send_config_command(version_cmd).await?;
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
 
         // Small delay after version rolling configuration
         tokio::time::sleep(Duration::from_millis(10)).await;
 
-        // Discover connected chips
+        // Step 2: Chip Discovery
         self.discover_chips().await?;
 
-        tracing::info!("Board initialized with {} chip(s)", self.chip_infos.len());
+        tracing::info!("Discovered {} chip(s)", self.chip_infos.len());
 
         // Verify we found the expected BM1370 chip
         if let Some(first_chip) = self.chip_infos.first() {
@@ -697,148 +810,270 @@ impl Board for BitaxeBoard {
             tracing::debug!("Found expected BM1370 chip");
         }
 
+        // Step 3: Pre-Configuration (after 1-second pause per reference)
+        tracing::info!("Waiting 1 second before configuration...");
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        // Send version mask again
+        tracing::debug!("Sending version mask again after discovery");
+        let version_cmd = Command::WriteRegister {
+            all: true,
+            chip_address: 0x00,
+            register: bm13xx::protocol::Register::VersionMask(
+                bm13xx::protocol::VersionMask::full_rolling(),
+            ),
+        };
+        self.send_config_command(version_cmd).await?;
+
+        // InitControl register = 0x0700
+        let init_control_cmd = Command::WriteRegister {
+            all: true,
+            chip_address: 0x00,
+            register: bm13xx::protocol::Register::InitControl {
+                raw_value: 0x00000700,
+            },
+        };
+        self.send_config_command(init_control_cmd).await?;
+
+        // MiscControl register = 0xC100F0
+        let misc_control_cmd = Command::WriteRegister {
+            all: true,
+            chip_address: 0x00,
+            register: bm13xx::protocol::Register::MiscControl {
+                raw_value: 0x00C100F0,
+            },
+        };
+        self.send_config_command(misc_control_cmd).await?;
+
+        // ChainInactive command
+        self.send_config_command(Command::ChainInactive).await?;
+
+        // SetChipAddress command for addr=0x00
+        let set_addr_cmd = Command::SetChipAddress {
+            chip_address: 0x00,
+        };
+        self.send_config_command(set_addr_cmd).await?;
+
         // BM1370 requires additional initialization after chip discovery
-        if self.chip_infos.len() > 0 {
-            // Send core register control commands
-            let core_reg_cmd1 = Command::WriteRegister {
+        // Step 4: Core Configuration (Broadcast)
+        tracing::debug!("Sending broadcast core configuration");
+        
+        // CoreRegister = 0x8B0080 (sent as big-endian: 0x80 0x00 0x8B 0x00)
+        let core_reg_cmd1 = Command::WriteRegister {
+            all: true,
+            chip_address: 0x00,
+            register: bm13xx::protocol::Register::CoreRegister {
+                raw_value: 0x8000_8B00,  // Big-endian encoding
+            },
+        };
+        self.send_config_command(core_reg_cmd1).await?;
+
+        // CoreRegister = 0x0C8080 (sent as big-endian: 0x80 0x00 0x80 0x0C)
+        let core_reg_cmd2 = Command::WriteRegister {
+            all: true,
+            chip_address: 0x00,
+            register: bm13xx::protocol::Register::CoreRegister {
+                raw_value: 0x8000_800C,  // Big-endian encoding
+            },
+        };
+        self.send_config_command(core_reg_cmd2).await?;
+
+        // Set ticket mask for difficulty (before IoDriverStrength)
+        // Register 0x14: ticket mask (difficulty control)
+        let difficulty_mask = bm13xx::protocol::DifficultyMask::from_difficulty(255);  // Start with difficulty 255
+        let ticket_mask_cmd = Command::WriteRegister {
+            all: true,
+            chip_address: 0x00,
+            register: bm13xx::protocol::Register::TicketMask(difficulty_mask),
+        };
+        self.send_config_command(ticket_mask_cmd).await?;
+
+        // IoDriverStrength = 0x11110100
+        let io_strength_cmd = Command::WriteRegister {
+            all: true,
+            chip_address: 0x00,
+            register: bm13xx::protocol::Register::IoDriverStrength(
+                bm13xx::protocol::IoDriverStrength::normal()
+            ),
+        };
+        self.send_config_command(io_strength_cmd).await?;
+
+        // Step 5: Chip-Specific Configuration (addr=0x00)
+        tracing::debug!("Sending chip-specific configuration for address 0x00");
+        
+        // InitControl = 0xF0010700 (chip-specific, not broadcast)
+        let init_control_specific = Command::WriteRegister {
+            all: false,  // Not broadcast - specific to chip 0x00
+            chip_address: 0x00,
+            register: bm13xx::protocol::Register::InitControl {
+                raw_value: 0xF0010700,
+            },
+        };
+        self.send_config_command(init_control_specific).await?;
+
+        // MiscControl = 0xC100F0 (chip-specific)
+        let misc_control_specific = Command::WriteRegister {
+            all: false,
+            chip_address: 0x00,
+            register: bm13xx::protocol::Register::MiscControl {
+                raw_value: 0x00C100F0,
+            },
+        };
+        self.send_config_command(misc_control_specific).await?;
+
+        // CoreRegister = 0x8B0080 (chip-specific)
+        let core_reg_specific1 = Command::WriteRegister {
+            all: false,
+            chip_address: 0x00,
+            register: bm13xx::protocol::Register::CoreRegister {
+                raw_value: 0x8000_8B00,  // Big-endian
+            },
+        };
+        self.send_config_command(core_reg_specific1).await?;
+
+        // CoreRegister = 0x0C8080 (chip-specific)
+        let core_reg_specific2 = Command::WriteRegister {
+            all: false,
+            chip_address: 0x00,
+            register: bm13xx::protocol::Register::CoreRegister {
+                raw_value: 0x8000_800C,  // Big-endian
+            },
+        };
+        self.send_config_command(core_reg_specific2).await?;
+
+        // CoreRegister = 0xAA820080 (chip-specific)
+        let core_reg_specific3 = Command::WriteRegister {
+            all: false,
+            chip_address: 0x00,
+            register: bm13xx::protocol::Register::CoreRegister {
+                raw_value: 0x8000_82AA,  // Big-endian encoding
+            },
+        };
+        self.send_config_command(core_reg_specific3).await?;
+
+        // Step 6: Additional Settings
+        tracing::debug!("Sending additional settings");
+        
+        // MiscSettings = 0x80440000 (note: different from current 0x00004480)
+        let misc_b9_cmd = Command::WriteRegister {
+            all: true,
+            chip_address: 0x00,
+            register: bm13xx::protocol::Register::MiscSettings {
+                raw_value: 0x80440000,  // Little-endian: bytes 00 00 44 80
+            },
+        };
+        self.send_config_command(misc_b9_cmd).await?;
+
+        // Register 0x54: Analog mux control (temperature diode)
+        let analog_mux_cmd = Command::WriteRegister {
+            all: true,
+            chip_address: 0x00,
+            register: bm13xx::protocol::Register::AnalogMux {
+                raw_value: 0x02000000,  // Little-endian: bytes 00 00 00 02
+            },
+        };
+        self.send_config_command(analog_mux_cmd).await?;
+
+        // Send misc B9 again (esp-miner does this)
+        let misc_b9_cmd2 = Command::WriteRegister {
+            all: true,
+            chip_address: 0x00,
+            register: bm13xx::protocol::Register::MiscSettings {
+                raw_value: 0x80440000,  // Little-endian: bytes 00 00 44 80
+            },
+        };
+        self.send_config_command(misc_b9_cmd2).await?;
+
+        // Additional CoreRegister = 0xEE8D0080 (after misc settings)
+        let core_reg_final = Command::WriteRegister {
+            all: true,
+            chip_address: 0x00,
+            register: bm13xx::protocol::Register::CoreRegister {
+                raw_value: 0x8000_8DEE,  // Big-endian encoding
+            },
+        };
+        self.send_config_command(core_reg_final).await?;
+
+        // Step 7: Frequency Ramping (56.25 MHz → 525 MHz)
+        // The frequency is ramped up gradually through many steps
+        // Following esp-miner's approach: 6.25 MHz steps with 100ms delays
+        tracing::info!("Starting frequency ramping from 56.25 MHz to 525 MHz");
+        
+        // Generate frequency steps programmatically
+        // Start at 56.25 MHz, increment by 6.25 MHz up to 525 MHz
+        let frequency_steps = Self::generate_frequency_ramp_steps(56.25, 525.0, 6.25);
+        
+        tracing::debug!("Ramping through {} frequency steps", frequency_steps.len());
+        
+        for (i, pll_config) in frequency_steps.iter().enumerate() {
+            let pll_cmd = Command::WriteRegister {
                 all: true,
                 chip_address: 0x00,
-                register: bm13xx::protocol::Register::CoreRegister {
-                    raw_value: 0x8000_8B00,
-                },
+                register: bm13xx::protocol::Register::PllDivider(*pll_config),
             };
-            self.send_config_command(core_reg_cmd1).await?;
-
-            let core_reg_cmd2 = Command::WriteRegister {
-                all: true,
-                chip_address: 0x00,
-                register: bm13xx::protocol::Register::CoreRegister {
-                    raw_value: 0x8000_800C,
-                },
-            };
-            self.send_config_command(core_reg_cmd2).await?;
-
-            let core_reg_cmd3 = Command::WriteRegister {
-                all: true,
-                chip_address: 0x00,
-                register: bm13xx::protocol::Register::CoreRegister {
-                    raw_value: 0x8000_8DEE,
-                },
-            };
-            self.send_config_command(core_reg_cmd3).await?;
-
-            // Phase 3: Send baud rate change command to chip
-            // Bitaxe Gamma always changes from 115200 to 1Mbps
-            tracing::info!("Sending baud rate change command to BM1370 for {} baud", Self::TARGET_BAUD_RATE);
-            let baud_cmd = Command::WriteRegister {
-                all: true,
-                chip_address: 0x00,
-                register: bm13xx::protocol::Register::UartBaud(Self::CHIP_BAUD_REGISTER),
-            };
-            self.send_config_command(baud_cmd).await?;
-
-            // Give chip time to process baud rate change
-            tokio::time::sleep(Duration::from_millis(50)).await;
-
-            // Phase 3: Change host baud rate to match
-            tracing::info!("Changing host serial port from 115200 to {} baud", Self::TARGET_BAUD_RATE);
-            self.data_control.set_baud_rate(Self::TARGET_BAUD_RATE)
-                .map_err(|e| BoardError::InitializationFailed(
-                    format!("Failed to change baud rate: {}", e)
-                ))?;
-
-            // Wait for baud rate change to stabilize
+            self.send_config_command(pll_cmd).await?;
+            
+            // Wait ~100ms between frequency steps (matching esp-miner)
             tokio::time::sleep(Duration::from_millis(100)).await;
-
-            tracing::info!("Baud rate change complete, continuing at {} baud", Self::TARGET_BAUD_RATE);
-
-            // Start with lower frequency like esp-miner does
-            // esp-miner starts at 62.5MHz and ramps up to target
-            let start_freq_config = bm13xx::protocol::PllConfig::new(
-                0x00A0, // Start lower: 62.5MHz (fb_div 0xA0, no 0x40 flag)
-                0x02,   // ref_div
-                0x41,   // post_div
-            );
-            let start_pll_cmd = Command::WriteRegister {
-                all: true,
-                chip_address: 0x00,
-                register: bm13xx::protocol::Register::PllDivider(start_freq_config),
-            };
-            self.send_config_command(start_pll_cmd).await?;
-
-            // Small delay for initial PLL to stabilize
-            tokio::time::sleep(Duration::from_millis(200)).await;
-
-            // Now set target frequency (200 MHz)
-            let target_pll_config = bm13xx::protocol::PllConfig::new(
-                0x40A0, // Target: 200MHz (fb_div 0xA0 with 0x40 flag)
-                0x02,   // ref_div
-                0x41,   // post_div
-            );
-            let target_pll_cmd = Command::WriteRegister {
-                all: true,
-                chip_address: 0x00,
-                register: bm13xx::protocol::Register::PllDivider(target_pll_config),
-            };
-            self.send_config_command(target_pll_cmd).await?;
-
-            // Longer delay for target frequency to stabilize
-            tokio::time::sleep(Duration::from_millis(300)).await;
-
-            // Set ticket mask for difficulty
-            // Register 0x14: ticket mask (difficulty control)
-            let difficulty_mask = bm13xx::protocol::DifficultyMask::from_difficulty(256);
-            let ticket_mask_cmd = Command::WriteRegister {
-                all: true,
-                chip_address: 0x00,
-                register: bm13xx::protocol::Register::TicketMask(difficulty_mask),
-            };
-            self.send_config_command(ticket_mask_cmd).await?;
-
-            // Additional misc settings from esp-miner
-            // Register 0xB9: Unknown misc settings
-            let misc_b9_cmd = Command::WriteRegister {
-                all: true,
-                chip_address: 0x00,
-                register: bm13xx::protocol::Register::MiscSettings {
-                    raw_value: 0x00004480,
-                },
-            };
-            self.send_config_command(misc_b9_cmd).await?;
-
-            // Register 0x54: Analog mux control (temperature diode)
-            let analog_mux_cmd = Command::WriteRegister {
-                all: true,
-                chip_address: 0x00,
-                register: bm13xx::protocol::Register::AnalogMux {
-                    raw_value: 0x00000002,
-                },
-            };
-            self.send_config_command(analog_mux_cmd).await?;
-
-            // Send misc B9 again (esp-miner does this)
-            let misc_b9_cmd2 = Command::WriteRegister {
-                all: true,
-                chip_address: 0x00,
-                register: bm13xx::protocol::Register::MiscSettings {
-                    raw_value: 0x00004480,
-                },
-            };
-            self.send_config_command(misc_b9_cmd2).await?;
-
-            // Register 0x10: Hash counting register (nonce range)
-            // Use S21 Pro value (0x1EB5) that esp-miner uses for BM1370
-            // This is critical for proper nonce generation and return
-            let hash_count_cmd = Command::WriteRegister {
-                all: true,
-                chip_address: 0x00,
-                register: bm13xx::protocol::Register::NonceRange(
-                    // Use the S21 Pro configuration that esp-miner uses
-                    bm13xx::protocol::NonceRangeConfig::multi_chip(65)
-                ),
-            };
-            self.send_config_command(hash_count_cmd).await?;
+            
+            if i % 10 == 0 || i == frequency_steps.len() - 1 {
+                tracing::trace!("Frequency ramp step {}/{}", i + 1, frequency_steps.len());
+            }
         }
+        
+        tracing::info!("Frequency ramping complete");
+
+        // Step 8: Final Configuration
+        // After frequency ramping is complete
+        
+        // NonceRange = 0xB51E0000 (correct value from reference)
+        let nonce_range_value = 0x0000B51E;  // Raw value from captures
+        let nonce_range_cmd = Command::WriteRegister {
+            all: true,
+            chip_address: 0x00,
+            register: bm13xx::protocol::Register::NonceRange(
+                // Create NonceRangeConfig with the exact value
+                // Note: This might need a custom constructor in the protocol module
+                bm13xx::protocol::NonceRangeConfig::from_raw(nonce_range_value)
+            ),
+        };
+        self.send_config_command(nonce_range_cmd).await?;
+
+        // UartBaud = 0x00023011 (1M baud) - NOW after frequency ramping
+        tracing::info!("Sending baud rate change command to BM1370 for {} baud", Self::TARGET_BAUD_RATE);
+        let baud_cmd = Command::WriteRegister {
+            all: true,
+            chip_address: 0x00,
+            register: bm13xx::protocol::Register::UartBaud(Self::CHIP_BAUD_REGISTER),
+        };
+        self.send_config_command(baud_cmd).await?;
+
+        // Give chip time to process baud rate change
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Change host baud rate to match
+        tracing::info!("Changing host serial port from 115200 to {} baud", Self::TARGET_BAUD_RATE);
+        self.data_control.set_baud_rate(Self::TARGET_BAUD_RATE)
+            .map_err(|e| BoardError::InitializationFailed(
+                format!("Failed to change baud rate: {}", e)
+            ))?;
+
+        // Wait for baud rate change to stabilize
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        tracing::info!("Baud rate change complete, continuing at {} baud", Self::TARGET_BAUD_RATE);
+        
+        // Step 9: Version Mask Re-Send (final)
+        // After all configuration, send version mask once more
+        tracing::debug!("Sending final version mask configuration");
+        let version_cmd_final = Command::WriteRegister {
+            all: true,
+            chip_address: 0x00,
+            register: bm13xx::protocol::Register::VersionMask(
+                bm13xx::protocol::VersionMask::full_rolling(),
+            ),
+        };
+        self.send_config_command(version_cmd_final).await?;
 
         // Create event channel
         let (tx, rx) = tokio::sync::mpsc::channel(100);
@@ -1005,5 +1240,109 @@ inventory::submit! {
         pid: 0x6015,
         name: "Bitaxe Gamma",
         create_fn: |device| Box::pin(create_from_usb(device)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_pll_calculations_match_reference() {
+        // Test cases from the Bitaxe Gamma protocol capture
+        // Format: (freq_mhz, expected_fb_div, expected_ref_div, expected_post_div)
+        // Note: The capture shows bytes [55 AA 51 09 00 08 XX YY ZZ WW CRC]
+        // where XX YY = fb_div (big-endian), ZZ = ref_div, WW = post_div
+        let test_cases = vec![
+            // From the capture document:
+            (62.50,  0x50D2, 0x02, 0x65),  // tx: [55 AA 51 09 00 08 50 D2 02 65 05]
+            (68.75,  0x50E7, 0x02, 0x65),  // tx: [55 AA 51 09 00 08 50 E7 02 65 1C]
+            (75.00,  0x50D2, 0x02, 0x64),  // tx: [55 AA 51 09 00 08 50 D2 02 64 00]
+            (81.25,  0x50E4, 0x02, 0x64),  // tx: [55 AA 51 09 00 08 50 E4 02 64 14]
+            (87.50,  0x50C4, 0x02, 0x63),  // tx: [55 AA 51 09 00 08 50 C4 02 63 18]
+            (93.75,  0x50D2, 0x02, 0x63),  // tx: [55 AA 51 09 00 08 50 D2 02 63 1B]
+            (100.00, 0x50E0, 0x02, 0x63),  // tx: [55 AA 51 09 00 08 50 E0 02 63 00]
+            (525.00, 0x50D2, 0x02, 0x40),  // tx: [55 AA 51 09 00 08 50 D2 02 40 05] (final)
+        ];
+
+        for (freq_mhz, expected_fb, expected_ref, expected_post) in test_cases {
+            let config = BitaxeBoard::calculate_pll_for_frequency(freq_mhz)
+                .unwrap_or_else(|| panic!("Failed to calculate PLL for {} MHz", freq_mhz));
+            
+            // Extract the actual fb_div without flags for comparison
+            let actual_fb_base = config.fb_div & 0xFF;
+            let expected_fb_base = expected_fb & 0xFF;
+            
+            // Check that the base fb_div matches (allowing for different flag bits)
+            assert_eq!(
+                actual_fb_base, expected_fb_base,
+                "FB divider mismatch for {} MHz: expected 0x{:02X}, got 0x{:02X}",
+                freq_mhz, expected_fb_base, actual_fb_base
+            );
+            
+            assert_eq!(
+                config.ref_div, expected_ref,
+                "Ref divider mismatch for {} MHz: expected {}, got {}",
+                freq_mhz, expected_ref, config.ref_div
+            );
+            
+            assert_eq!(
+                config.post_div, expected_post,
+                "Post divider mismatch for {} MHz: expected 0x{:02X}, got 0x{:02X}",
+                freq_mhz, expected_post, config.post_div
+            );
+            
+            // Verify the frequency calculation
+            let post_div1 = ((config.post_div >> 4) & 0xF) + 1;
+            let post_div2 = (config.post_div & 0xF) + 1;
+            let calculated_freq = 25.0 * actual_fb_base as f32 / (config.ref_div * post_div1 * post_div2) as f32;
+            
+            assert!(
+                (calculated_freq - freq_mhz).abs() < 1.0,
+                "Frequency calculation error for {} MHz: calculated {} MHz",
+                freq_mhz, calculated_freq
+            );
+        }
+    }
+    
+    #[test]
+    fn test_frequency_ramp_generation() {
+        // Test that we generate the correct number of steps
+        let steps = BitaxeBoard::generate_frequency_ramp_steps(56.25, 525.0, 6.25);
+        
+        // Should have steps from 56.25 to 525.0 in 6.25 MHz increments
+        // That's (525 - 56.25) / 6.25 + 1 = 75.0 steps
+        assert_eq!(steps.len(), 76, "Expected 76 frequency steps");
+        
+        // Verify first and last frequencies by calculating them back
+        if let Some(first) = steps.first() {
+            let post_div1 = ((first.post_div >> 4) & 0xF) + 1;
+            let post_div2 = (first.post_div & 0xF) + 1;
+            let first_freq = 25.0 * (first.fb_div & 0xFF) as f32 / (first.ref_div * post_div1 * post_div2) as f32;
+            assert!((first_freq - 56.25).abs() < 1.0, "First frequency should be ~56.25 MHz");
+        }
+        
+        if let Some(last) = steps.last() {
+            let post_div1 = ((last.post_div >> 4) & 0xF) + 1;
+            let post_div2 = (last.post_div & 0xF) + 1;
+            let last_freq = 25.0 * (last.fb_div & 0xFF) as f32 / (last.ref_div * post_div1 * post_div2) as f32;
+            assert!((last_freq - 525.0).abs() < 1.0, "Last frequency should be ~525 MHz");
+        }
+    }
+    
+    #[test]
+    fn test_pll_flag_setting() {
+        // Test that the 0x50 flag is set (esp-miner always uses 0x50 in practice)
+        
+        // Low frequency (should use 0x50 flag)
+        let low_freq = BitaxeBoard::calculate_pll_for_frequency(100.0).unwrap();
+        assert_eq!(low_freq.fb_div & 0xF000, 0x5000, "Should have 0x50 flag");
+        
+        // High frequency also uses 0x50 in esp-miner for our frequency range
+        let high_freq = BitaxeBoard::calculate_pll_for_frequency(525.0).unwrap();
+        assert_eq!(high_freq.fb_div & 0xF000, 0x5000, "Should have 0x50 flag");
+        
+        // The 0x40 flag would only be used for very high internal frequencies
+        // which aren't reached in the 56.25-525 MHz range we use
     }
 }
