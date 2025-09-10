@@ -224,6 +224,14 @@ impl NonceRangeConfig {
         };
         Self { bytes }
     }
+
+    /// Create config from raw 32-bit value (little-endian)
+    /// Used for exact configuration from protocol captures
+    pub fn from_raw(value: u32) -> Self {
+        Self {
+            bytes: value.to_le_bytes(),
+        }
+    }
 }
 
 impl From<NonceRangeConfig> for [u8; 4] {
@@ -1388,12 +1396,13 @@ mod command_tests {
     #[test]
     fn write_core_register_sequence() {
         // From Bitaxe capture: TX: 55 AA 51 09 00 3C 80 00 8B 00 12
+        // CoreRegister uses big-endian encoding
         assert_frame_eq(
             Command::WriteRegister {
                 all: true,
                 chip_address: 0x00,
                 register: Register::CoreRegister {
-                    raw_value: 0x008B0080,
+                    raw_value: 0x80008B00,  // Big-endian: produces bytes 80 00 8B 00
                 },
             },
             &[
