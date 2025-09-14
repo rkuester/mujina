@@ -12,8 +12,6 @@ pub struct RawEvent {
     pub event_type: String,
     #[serde(deserialize_with = "deserialize_timestamp")]
     pub start_time: f64,
-    #[serde(deserialize_with = "deserialize_timestamp")]
-    pub duration: f64,
     pub data: Option<String>,
     pub error: Option<String>,
     pub ack: Option<String>,
@@ -191,83 +189,6 @@ impl CaptureReader {
                 },
                 Err(e) => Some(Err(e.into())),
             })
-    }
-}
-
-/// Filter for deduplicating serial events with framing errors
-pub struct SerialDeduplicator {
-    last_ci_events: Vec<(f64, BaudRate, bool)>, // (timestamp, baud_rate, has_error)
-    last_ro_events: Vec<(f64, BaudRate, bool)>,
-}
-
-impl SerialDeduplicator {
-    pub fn new() -> Self {
-        Self {
-            last_ci_events: Vec::new(),
-            last_ro_events: Vec::new(),
-        }
-    }
-
-    /// Check if a serial event should be kept
-    /// Returns false if this is a duplicate with framing error
-    pub fn should_keep(&mut self, event: &SerialEvent) -> bool {
-        println!(
-            "DEBUG: Deduplicator checking {:?} {:?} 0x{:02x} at {:.6} (error: {:?})",
-            event.channel, event.baud_rate, event.data, event.timestamp, event.error
-        );
-        let events = match event.channel {
-            Channel::CI => &mut self.last_ci_events,
-            Channel::RO => &mut self.last_ro_events,
-        };
-
-        let has_error = event.error.is_some();
-        let timestamp = event.timestamp;
-
-        // Check if we have a recent event with the same timestamp
-        let same_time_events: Vec<_> = events
-            .iter()
-            .filter(|(t, _, _)| (*t - timestamp).abs() < 0.000001) // Within 1 microsecond
-            .collect();
-
-        if !same_time_events.is_empty() {
-            println!(
-                "DEBUG: Found {} events at similar timestamp",
-                same_time_events.len()
-            );
-
-            // Check if we have a 115k event at this timestamp
-            let has_115k = same_time_events
-                .iter()
-                .any(|(_, baud, _)| *baud == BaudRate::Baud115200);
-
-            if has_115k && event.baud_rate == BaudRate::Baud1M {
-                println!("DEBUG: Skipping 1M event because we have 115k at same time");
-                return false;
-            }
-
-            // If this is 115k and we have 1M events, remove the 1M events
-            if event.baud_rate == BaudRate::Baud115200 {
-                let had_1m = same_time_events
-                    .iter()
-                    .any(|(_, baud, _)| *baud == BaudRate::Baud1M);
-                if had_1m {
-                    println!("DEBUG: Removing 1M events because this is 115k");
-                    events.retain(|(t, baud, _)| {
-                        (*t - timestamp).abs() >= 0.000001 || *baud == BaudRate::Baud115200
-                    });
-                }
-            }
-        }
-
-        // Add this event to our tracking
-        events.push((timestamp, event.baud_rate, has_error));
-
-        // Keep only recent events (last 1000 to avoid memory growth)
-        if events.len() > 1000 {
-            events.drain(0..500);
-        }
-
-        true
     }
 }
 

@@ -7,8 +7,6 @@
 //! - Use timing data from actual captures to validate assembly logic
 
 use crate::capture::{Channel, SerialEvent};
-use anyhow::Result;
-use std::collections::VecDeque;
 
 /// Direction of serial communication
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -208,49 +206,5 @@ impl FrameAssembler {
     /// Flush any pending frame (call at end of capture)
     pub fn flush(&mut self) -> Option<SerialFrame> {
         self.timeout()
-    }
-}
-
-/// Multi-channel frame assembler
-pub struct MultiChannelAssembler {
-    ci_assembler: FrameAssembler,
-    ro_assembler: FrameAssembler,
-    frames: VecDeque<SerialFrame>,
-}
-
-impl MultiChannelAssembler {
-    pub fn new() -> Self {
-        Self {
-            ci_assembler: FrameAssembler::new(Direction::HostToChip),
-            ro_assembler: FrameAssembler::new(Direction::ChipToHost),
-            frames: VecDeque::new(),
-        }
-    }
-
-    /// Process a serial event
-    pub fn process(&mut self, event: &SerialEvent) {
-        let assembler = match event.channel {
-            Channel::CI => &mut self.ci_assembler,
-            Channel::RO => &mut self.ro_assembler,
-        };
-
-        if let Some(frame) = assembler.process(event) {
-            self.frames.push_back(frame);
-        }
-    }
-
-    /// Get next assembled frame
-    pub fn next_frame(&mut self) -> Option<SerialFrame> {
-        self.frames.pop_front()
-    }
-
-    /// Flush all pending frames
-    pub fn flush(&mut self) {
-        if let Some(frame) = self.ci_assembler.flush() {
-            self.frames.push_back(frame);
-        }
-        if let Some(frame) = self.ro_assembler.flush() {
-            self.frames.push_back(frame);
-        }
     }
 }
