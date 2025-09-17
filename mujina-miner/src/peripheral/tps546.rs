@@ -295,19 +295,19 @@ pub mod protocol {
                         let config = data[0];
                         let mut flags = Vec::new();
                         if config & pmbus::on_off_config::PU != 0 {
-                            flags.push("PU");
+                            flags.push("PowerUp");
                         }
                         if config & pmbus::on_off_config::CMD != 0 {
                             flags.push("CMD");
                         }
                         if config & pmbus::on_off_config::CP != 0 {
-                            flags.push("CP");
+                            flags.push("CONTROL_pin");
                         }
                         if config & pmbus::on_off_config::POLARITY != 0 {
-                            flags.push("POL");
+                            flags.push("Active_high");
                         }
                         if config & pmbus::on_off_config::DELAY != 0 {
-                            flags.push("DELAY");
+                            flags.push("Turn-off_delay");
                         }
 
                         if flags.is_empty() {
