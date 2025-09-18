@@ -12,6 +12,7 @@ default-run = "mujina-minerd"
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 bitcoin = { workspace = true }
+bitflags = { workspace = true }
 bitvec = { workspace = true }
 bytes = { workspace = true }
 crc_all = { workspace = true }
