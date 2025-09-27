@@ -5,6 +5,16 @@ use crate::dissect::{CrcStatus, DissectedFrame, DissectedI2c, FrameContent, I2cD
 use crate::serial::Direction;
 use colored::Colorize;
 
+/// Gray color for hex data output
+const HEX_DATA_GRAY_R: u8 = 128;
+const HEX_DATA_GRAY_G: u8 = 128;
+const HEX_DATA_GRAY_B: u8 = 128;
+
+/// Apply gray color to hex data
+fn gray_hex(text: &str) -> colored::ColoredString {
+    text.truecolor(HEX_DATA_GRAY_R, HEX_DATA_GRAY_G, HEX_DATA_GRAY_B)
+}
+
 /// Output formatter configuration
 #[derive(Debug, Clone)]
 pub struct OutputConfig {
@@ -34,9 +44,22 @@ pub fn format_serial_frame(frame: &DissectedFrame, config: &OutputConfig) -> Str
         BaudRate::Baud1M => "1M",
     };
 
-    let direction_str = match frame.direction {
-        Direction::HostToChip => format!("CI → ASIC {}", baud_str),
-        Direction::ChipToHost => format!("RO ← ASIC {}", baud_str),
+    let direction_str = if config.use_color {
+        match frame.direction {
+            Direction::HostToChip => {
+                let color = get_device_color(&DeviceId::AsicHostToChip);
+                format!("{}", format!("CI → ASIC {}", baud_str).color(color))
+            }
+            Direction::ChipToHost => {
+                let color = get_device_color(&DeviceId::AsicChipToHost);
+                format!("{}", format!("RO ← ASIC {}", baud_str).color(color))
+            }
+        }
+    } else {
+        match frame.direction {
+            Direction::HostToChip => format!("CI → ASIC {}", baud_str),
+            Direction::ChipToHost => format!("RO ← ASIC {}", baud_str),
+        }
     };
 
     let content_str = match &frame.content {
@@ -63,7 +86,7 @@ pub fn format_serial_frame(frame: &DissectedFrame, config: &OutputConfig) -> Str
         let formatted_hex = if config.use_color {
             hex_lines
                 .lines()
-                .map(|line| format!("\n        {}", line.white().dimmed()))
+                .map(|line| format!("\n        {}", gray_hex(line)))
                 .collect::<String>()
         } else {
             hex_lines
@@ -77,30 +100,41 @@ pub fn format_serial_frame(frame: &DissectedFrame, config: &OutputConfig) -> Str
     result
 }
 
-/// Get a consistent color for an I2C address
-fn get_address_color(address: u8) -> colored::Color {
-    // Use a simple hash to map addresses to a fixed set of colors
-    // This ensures the same address always gets the same color
-    const COLORS: &[colored::Color] = &[
-        colored::Color::Green,
-        colored::Color::Yellow,
-        colored::Color::Blue,
-        colored::Color::Magenta,
-        colored::Color::Cyan,
-        colored::Color::Red,
-        colored::Color::BrightGreen,
-        colored::Color::BrightYellow,
-        colored::Color::BrightBlue,
-        colored::Color::BrightMagenta,
-        colored::Color::BrightCyan,
-        colored::Color::BrightRed,
-    ];
+/// Device/direction identifier for consistent coloring
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum DeviceId {
+    I2cAddress(u8),
+    AsicHostToChip,
+    AsicChipToHost,
+}
 
-    // Better hash: mix the bits to avoid clustering similar addresses
-    // Multiply by a prime and XOR the upper bits for better distribution
-    let hash = (address.wrapping_mul(37)) ^ (address >> 4);
-    let index = (hash as usize) % COLORS.len();
-    COLORS[index]
+/// Get a consistent color for any device or ASIC direction
+fn get_device_color(device_id: &DeviceId) -> colored::Color {
+    match device_id {
+        // ASIC directions get two bright, complementary colors
+        DeviceId::AsicHostToChip => colored::Color::BrightCyan, // CI → ASIC
+        DeviceId::AsicChipToHost => colored::Color::BrightYellow, // RO ← ASIC
+
+        // I2C addresses get colors from remaining palette (reserve red for errors, avoid bright/regular pairs)
+        DeviceId::I2cAddress(addr) => {
+            // Distinct colors for I2C devices (avoiding ASIC colors: BrightCyan, BrightYellow)
+            // Only use colors that are clearly distinguishable from each other
+            const I2C_COLORS: &[colored::Color] = &[
+                colored::Color::Green,
+                colored::Color::Blue,
+                colored::Color::Magenta,
+                colored::Color::BrightGreen,
+                colored::Color::BrightBlue,
+                colored::Color::BrightMagenta,
+                colored::Color::BrightRed,
+            ];
+
+            // Hash I2C addresses to the I2C color palette
+            let hash = (addr.wrapping_mul(37)) ^ (addr >> 4);
+            let index = (hash as usize) % I2C_COLORS.len();
+            I2C_COLORS[index]
+        }
+    }
 }
 
 /// Format an I2C operation
@@ -116,7 +150,7 @@ pub fn format_i2c_operation(op: &DissectedI2c, config: &OutputConfig) -> String 
         };
 
         // Apply color based on address for consistency
-        let color = get_address_color(op.address);
+        let color = get_device_color(&DeviceId::I2cAddress(op.address));
         format!("{}", device_name.color(color))
     } else {
         match op.device {
@@ -138,7 +172,19 @@ pub fn format_i2c_operation(op: &DissectedI2c, config: &OutputConfig) -> String 
     }
 
     if config.show_raw_hex && !op.raw_data.is_empty() {
-        result.push_str(&format!(" [{}]", format_hex(&op.raw_data)));
+        let hex_lines = format_i2c_transaction(&op.raw_data, op.address);
+        let formatted_hex = if config.use_color {
+            hex_lines
+                .lines()
+                .map(|line| format!("\n        {}", gray_hex(line)))
+                .collect::<String>()
+        } else {
+            hex_lines
+                .lines()
+                .map(|line| format!("\n        {}", line))
+                .collect::<String>()
+        };
+        result.push_str(&formatted_hex);
     }
 
     result
@@ -182,6 +228,53 @@ fn format_hex_multiline(data: &[u8]) -> String {
         lines.push(hex_line);
     }
     lines.join("\n")
+}
+
+/// Format I2C transaction with readable address interpretation
+fn format_i2c_transaction(data: &[u8], expected_address: u8) -> String {
+    if data.is_empty() {
+        return String::new();
+    }
+
+    let mut result = Vec::new();
+    let mut i = 0;
+
+    while i < data.len() {
+        let byte = data[i];
+        let address = byte >> 1;
+        let is_read = (byte & 1) != 0;
+
+        // Check if this looks like an I2C address byte
+        if address == expected_address {
+            result.push(format!("{:02x}", address));
+            i += 1;
+
+            // Collect following data bytes until next potential address byte
+            let mut data_bytes = Vec::new();
+            while i < data.len() {
+                let next_byte = data[i];
+                let next_address = next_byte >> 1;
+
+                // If this could be another address byte for the same device, break
+                if next_address == expected_address && i < data.len() - 1 {
+                    break;
+                }
+
+                data_bytes.push(format!("{:02x}", next_byte));
+                i += 1;
+            }
+
+            if !data_bytes.is_empty() {
+                result.push(data_bytes.join(" "));
+            }
+        } else {
+            // Not an address byte we recognize, just show as hex
+            result.push(format!("{:02x}", byte));
+            i += 1;
+        }
+    }
+
+    result.join(" ")
 }
 
 /// Event type for unified output

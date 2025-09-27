@@ -211,12 +211,31 @@ pub fn dissect_i2c_operation_with_context(
         }
     };
 
-    let raw_data = op
-        .write_data
-        .as_ref()
-        .or(op.read_data.as_ref())
-        .cloned()
-        .unwrap_or_default();
+    // Build complete raw transaction bytes including I2C address
+    let mut raw_data = Vec::new();
+
+    // Handle write operations (including register select operations)
+    if op.write_data.is_some() || (op.register.is_some() && op.read_data.is_none()) {
+        raw_data.push((op.address << 1) | 0); // Address + Write bit
+        if let Some(reg) = op.register {
+            raw_data.push(reg); // Register byte
+        }
+        if let Some(write_data) = &op.write_data {
+            raw_data.extend_from_slice(write_data);
+        }
+    }
+
+    // Add address byte for read operation (if this is a read)
+    if let Some(read_data) = &op.read_data {
+        // If we had a write phase, this is a restart read
+        if op.write_data.is_some() || op.register.is_some() {
+            raw_data.push((op.address << 1) | 1); // Address + Read bit (restart)
+        } else {
+            // Direct read without register - just address + read bit
+            raw_data.push((op.address << 1) | 1); // Address + Read bit
+        }
+        raw_data.extend_from_slice(read_data);
+    }
 
     DissectedI2c {
         timestamp: op.start_time,
