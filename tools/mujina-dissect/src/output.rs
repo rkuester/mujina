@@ -65,14 +65,6 @@ pub fn format_serial_frame(frame: &DissectedFrame, config: &OutputConfig) -> Str
     let content_str = match &frame.content {
         FrameContent::Command(cmd) => cmd.clone(),
         FrameContent::Response(resp) => resp.clone(),
-        FrameContent::Unknown(msg) => msg.clone(),
-        FrameContent::Invalid(msg) => {
-            if config.use_color {
-                format!("{}", msg.red())
-            } else {
-                msg.clone()
-            }
-        }
     };
 
     let mut result = format!("{} {}: {}", timestamp, direction_str, content_str);
@@ -214,13 +206,6 @@ fn format_timestamp(timestamp: f64, config: &OutputConfig) -> String {
     }
 }
 
-/// Format hex bytes
-fn format_hex(data: &[u8]) -> String {
-    data.iter()
-        .map(|b| format!("{:02x}", b))
-        .collect::<Vec<_>>()
-        .join(" ")
-}
 
 /// Format hex data with line wrapping at 16 bytes per line
 fn format_hex_multiline(data: &[u8]) -> String {
@@ -252,7 +237,7 @@ fn format_i2c_transaction(data: &[u8], expected_address: u8) -> String {
     while i < data.len() {
         let byte = data[i];
         let address = byte >> 1;
-        let is_read = (byte & 1) != 0;
+        let _is_read = (byte & 1) != 0;
 
         // Check if this looks like an I2C address byte
         if address == expected_address {

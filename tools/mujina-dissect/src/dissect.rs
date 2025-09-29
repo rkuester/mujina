@@ -10,7 +10,6 @@ use crate::capture::BaudRate;
 use crate::i2c::I2cOperation;
 use crate::serial::{DecodedFrame, Direction};
 use colored::Colorize;
-use mujina_miner::asic::bm13xx::protocol::{Command, Response};
 use mujina_miner::peripheral::{emc2101, pmbus};
 use std::collections::HashMap;
 use std::fmt;
@@ -31,15 +30,12 @@ pub struct DissectedFrame {
 pub enum FrameContent {
     Command(String),
     Response(String),
-    Unknown(String),
-    Invalid(String),
 }
 
 /// CRC validation status
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CrcStatus {
     Valid,
-    Invalid,
     NotChecked,
 }
 
@@ -47,7 +43,6 @@ impl fmt::Display for CrcStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             CrcStatus::Valid => write!(f, "{}", "CRC OK".green()),
-            CrcStatus::Invalid => write!(f, "{}", "CRC FAIL".red()),
             CrcStatus::NotChecked => write!(f, ""),
         }
     }
@@ -72,9 +67,6 @@ pub fn dissect_decoded_frame(frame: &DecodedFrame) -> DissectedFrame {
                 CrcStatus::Valid,
             )
         }
-        DecodedFrame::Error { error, .. } => {
-            (FrameContent::Invalid(error.clone()), CrcStatus::NotChecked)
-        }
     };
 
     DissectedFrame {
@@ -84,7 +76,6 @@ pub fn dissect_decoded_frame(frame: &DecodedFrame) -> DissectedFrame {
         raw_data: match frame {
             DecodedFrame::Command { raw_bytes, .. } => raw_bytes.clone(),
             DecodedFrame::Response { raw_bytes, .. } => raw_bytes.clone(),
-            DecodedFrame::Error { raw_bytes, .. } => raw_bytes.clone(),
         },
         content,
         crc_status,

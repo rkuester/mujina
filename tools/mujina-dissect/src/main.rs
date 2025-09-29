@@ -130,7 +130,7 @@ fn main() -> Result<()> {
                                         .unwrap_or(serial_event.timestamp),
                                     command,
                                     raw_bytes,
-                                    has_errors: false,
+                                    _has_errors: false,
                                     baud_rate: serial_event.baud_rate,
                                 };
                                 decoded_frames.push((frame, serial_event.baud_rate));
@@ -152,7 +152,7 @@ fn main() -> Result<()> {
                                         .unwrap_or(serial_event.timestamp),
                                     command,
                                     raw_bytes,
-                                    has_errors: false,
+                                    _has_errors: false,
                                     baud_rate: serial_event.baud_rate,
                                 };
                                 decoded_frames.push((frame, serial_event.baud_rate));
@@ -174,7 +174,7 @@ fn main() -> Result<()> {
                                         .unwrap_or(serial_event.timestamp),
                                     response,
                                     raw_bytes,
-                                    has_errors: false,
+                                    _has_errors: false,
                                     baud_rate: serial_event.baud_rate,
                                 };
                                 decoded_frames.push((frame, serial_event.baud_rate));
@@ -196,7 +196,7 @@ fn main() -> Result<()> {
                                         .unwrap_or(serial_event.timestamp),
                                     response,
                                     raw_bytes,
-                                    has_errors: false,
+                                    _has_errors: false,
                                     baud_rate: serial_event.baud_rate,
                                 };
                                 decoded_frames.push((frame, serial_event.baud_rate));

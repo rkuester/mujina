@@ -46,9 +46,9 @@ pub enum ParsedItem {
         timestamps: Vec<f64>,
     },
     InvalidBytes {
-        raw_bytes: Vec<u8>,
-        timestamps: Vec<f64>,
-        reason: String,
+        _raw_bytes: Vec<u8>,
+        _timestamps: Vec<f64>,
+        _reason: String,
     },
 }
 
@@ -59,20 +59,14 @@ pub enum DecodedFrame {
         timestamp: f64,
         command: Command,
         raw_bytes: Vec<u8>,
-        has_errors: bool,
+        _has_errors: bool,
         baud_rate: BaudRate,
     },
     Response {
         timestamp: f64,
         response: Response,
         raw_bytes: Vec<u8>,
-        has_errors: bool,
-        baud_rate: BaudRate,
-    },
-    Error {
-        timestamp: f64,
-        error: String,
-        raw_bytes: Vec<u8>,
+        _has_errors: bool,
         baud_rate: BaudRate,
     },
 }
@@ -161,9 +155,9 @@ impl CommandStreamingParser {
                 timestamps: frame_timestamps,
             }),
             Err(_) => Some(ParsedItem::InvalidBytes {
-                raw_bytes: frame_bytes,
-                timestamps: frame_timestamps,
-                reason: "crc_failed".to_string(),
+                _raw_bytes: frame_bytes,
+                _timestamps: frame_timestamps,
+                _reason: "crc_failed".to_string(),
             }),
         }
     }
@@ -187,9 +181,9 @@ impl CommandStreamingParser {
 
         let (bytes, timestamps): (Vec<u8>, Vec<f64>) = self.invalid_accumulator.drain(..).unzip();
         Some(ParsedItem::InvalidBytes {
-            raw_bytes: bytes,
-            timestamps,
-            reason: "invalid_preamble".to_string(),
+            _raw_bytes: bytes,
+            _timestamps: timestamps,
+            _reason: "invalid_preamble".to_string(),
         })
     }
 }
@@ -301,9 +295,9 @@ impl ResponseStreamingParser {
 
         let (bytes, timestamps): (Vec<u8>, Vec<f64>) = self.invalid_accumulator.drain(..).unzip();
         Some(ParsedItem::InvalidBytes {
-            raw_bytes: bytes,
-            timestamps,
-            reason: "invalid_response".to_string(),
+            _raw_bytes: bytes,
+            _timestamps: timestamps,
+            _reason: "invalid_response".to_string(),
         })
     }
 }
@@ -429,7 +423,6 @@ impl DecodedFrame {
         match self {
             DecodedFrame::Command { timestamp, .. } => *timestamp,
             DecodedFrame::Response { timestamp, .. } => *timestamp,
-            DecodedFrame::Error { timestamp, .. } => *timestamp,
         }
     }
 
@@ -437,7 +430,6 @@ impl DecodedFrame {
         match self {
             DecodedFrame::Command { .. } => Direction::HostToChip,
             DecodedFrame::Response { .. } => Direction::ChipToHost,
-            DecodedFrame::Error { .. } => Direction::HostToChip, // Default, could be either
         }
     }
 
@@ -445,7 +437,6 @@ impl DecodedFrame {
         match self {
             DecodedFrame::Command { baud_rate, .. } => *baud_rate,
             DecodedFrame::Response { baud_rate, .. } => *baud_rate,
-            DecodedFrame::Error { baud_rate, .. } => *baud_rate,
         }
     }
 }
