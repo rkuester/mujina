@@ -163,20 +163,18 @@ pub mod protocol {
             } else {
                 format!("⟶ READ {}", reg_name)
             }
-        } else {
-            if let Some(data) = data {
-                if data.len() == 1 {
-                    let decoded = match reg {
-                        regs::FAN_SETTING | regs::FAN_MIN_DRIVE => decode_pwm_percent(data[0]),
-                        _ => format!("0x{:02x}", data[0]),
-                    };
-                    format!("⟵ WRITE {}={}", reg_name, decoded)
-                } else {
-                    format!("⟵ WRITE {}={:02x?}", reg_name, data)
-                }
+        } else if let Some(data) = data {
+            if data.len() == 1 {
+                let decoded = match reg {
+                    regs::FAN_SETTING | regs::FAN_MIN_DRIVE => decode_pwm_percent(data[0]),
+                    _ => format!("0x{:02x}", data[0]),
+                };
+                format!("⟵ WRITE {}={}", reg_name, decoded)
             } else {
-                format!("⟵ WRITE REG[0x{:02x}]", reg)
+                format!("⟵ WRITE {}={:02x?}", reg_name, data)
             }
+        } else {
+            format!("⟵ WRITE REG[0x{:02x}]", reg)
         }
     }
 }

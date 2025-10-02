@@ -120,6 +120,7 @@ impl PllConfig {
     /// Automatically calculates the VCO control flag based on frequency:
     /// - 0x40 if VCO frequency < 2400 MHz
     /// - 0x50 if VCO frequency >= 2400 MHz
+    ///
     /// where VCO frequency = fb_div * 25.0 / ref_div
     pub fn new(fb_div: u8, ref_div: u8, post_div: u8) -> Self {
         // Calculate VCO frequency to determine flag
@@ -360,7 +361,7 @@ impl ReportingInterval {
     /// ```
     pub fn from_rate(hashrate: Hashrate, rate: ReportingRate) -> Self {
         let total_bits = (hashrate.log2() - rate.nonces_per_sec_value().log2()).ceil() as u8;
-        Self::from_exponent(total_bits.max(32).min(56))
+        Self::from_exponent(total_bits.clamp(32, 56))
     }
 
     pub const fn exponent(&self) -> u8 {
@@ -2331,6 +2332,12 @@ mod ticket_mask_tests {
 /// Encodes high-level operations into chip-specific commands and
 /// decodes chip responses into meaningful results.
 pub struct BM13xxProtocol {}
+
+impl Default for BM13xxProtocol {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl BM13xxProtocol {
     /// Create a new protocol instance.

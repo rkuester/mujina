@@ -104,7 +104,7 @@ impl Mul<u64> for U256 {
         // Multiply low 128 bits
         // Split into high and low 64-bit parts to handle carry
         let low_low = (self.low as u64) as u128 * rhs_u128;
-        let low_high = (self.low >> 64) as u128 * rhs_u128;
+        let low_high = (self.low >> 64) * rhs_u128;
 
         // Add them together with proper shifting
         let low_result = low_low + (low_high << 64);
@@ -112,7 +112,7 @@ impl Mul<u64> for U256 {
 
         // Multiply high 128 bits and add carry from low
         let high_low = (self.high as u64) as u128 * rhs_u128;
-        let high_high = (self.high >> 64) as u128 * rhs_u128;
+        let high_high = (self.high >> 64) * rhs_u128;
 
         let high_result = high_low + (high_high << 64) + (low_carry >> 64);
 

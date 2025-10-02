@@ -52,7 +52,7 @@ impl VoutMode {
     pub fn is_tps546_format(&self) -> bool {
         let mode_field = (self.0 >> 5) & 0x03; // 2-bit mode for TPS546
         let exp = self.exponent();
-        mode_field == 0 && exp >= -12 && exp <= -4
+        mode_field == 0 && (-12..=-4).contains(&exp)
     }
 
     /// Get the REL field for TPS546 (bit 7)

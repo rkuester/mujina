@@ -1189,7 +1189,7 @@ impl StatusDecoder {
 
         // TPS546D24A pattern: MODE field is 2 bits (6:5), only supports 00b=linear
         // and has REL field in bit 7, with exponent range -4 to -12
-        if mode_field_tps546 == 0b00 && exp_signed >= -12 && exp_signed <= -4 {
+        if mode_field_tps546 == 0b00 && (-12..=-4).contains(&exp_signed) {
             let format_type = if rel_field == 1 {
                 "relative"
             } else {
@@ -1203,7 +1203,7 @@ impl StatusDecoder {
                 0b000 => format!("Linear format, exponent {}", exp_signed),
                 0b001 => format!("VID format, exponent {}", exp_signed),
                 0b010 => format!("Direct format, exponent {}", exp_signed),
-                0b011 => format!("IEEE754 half precision"),
+                0b011 => "IEEE754 half precision".to_string(),
                 _ => format!("reserved mode {} (0x{:02x})", mode, value),
             }
         }
@@ -1399,14 +1399,14 @@ pub mod linear16 {
 
     /// Convert ULINEAR16 format to floating point
     pub fn to_float(value: u16, vout_mode: u8) -> f32 {
-        let exp_raw = (vout_mode & 0x1F) as u8;
+        let exp_raw = vout_mode & 0x1F;
         let exponent = extract_5bit_exponent(exp_raw) as i32;
         value as f32 * 2.0_f32.powi(exponent)
     }
 
     /// Convert floating point to ULINEAR16 format
     pub fn from_float(value: f32, vout_mode: u8) -> Result<u16, PMBusError> {
-        let exp_raw = (vout_mode & 0x1F) as u8;
+        let exp_raw = vout_mode & 0x1F;
         let exponent = extract_5bit_exponent(exp_raw) as i32;
 
         let mantissa = (value / 2.0_f32.powi(exponent)).round();
