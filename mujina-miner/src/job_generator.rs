@@ -298,10 +298,26 @@ fn serialize_header(header: &BlockHeader) -> [u8; 80] {
 }
 
 /// Verify that a nonce produces a valid hash for the given job
-pub fn verify_nonce(job: &MiningJob, nonce: u32) -> Result<(BlockHash, bool), String> {
-    // Update header with nonce
+///
+/// When chips use version rolling, they may modify the lower 16 bits of the
+/// version field (bits 16-31 of the 32-bit version). The `rolled_version`
+/// parameter contains these bits as returned by the chip.
+pub fn verify_nonce(
+    job: &MiningJob,
+    nonce: u32,
+    rolled_version: u16,
+) -> Result<(BlockHash, bool), String> {
+    // Update header with nonce and version
     let mut header_bytes = job.header;
     header_bytes[76..80].copy_from_slice(&nonce.to_le_bytes());
+
+    // Apply version rolling: replace bits 16-31 of the version field
+    // The version field is at bytes 0-3 (little-endian)
+    let original_version = u32::from_le_bytes(header_bytes[0..4].try_into().unwrap());
+
+    // Clear bits 16-31 and apply the rolled version
+    let new_version = (original_version & 0x0000_FFFF) | ((rolled_version as u32) << 16);
+    header_bytes[0..4].copy_from_slice(&new_version.to_le_bytes());
 
     // Calculate double SHA256 (Bitcoin block hash)
     let hash = sha256d::Hash::hash(&header_bytes);
@@ -320,6 +336,7 @@ pub fn verify_nonce(job: &MiningJob, nonce: u32) -> Result<(BlockHash, bool), St
         info!(
             job_id = job.job_id,
             nonce,
+            version = rolled_version,
             hash = format!("{:x}", block_hash),
             "Found valid nonce!"
         );
@@ -417,7 +434,8 @@ mod tests {
         let (job, known_nonce) = JobGenerator::known_good_job();
 
         // Verify the known good nonce produces a valid hash
-        let (hash, valid) = verify_nonce(&job, known_nonce).unwrap();
+        // Genesis block doesn't use version rolling, so version bits are 0
+        let (hash, valid) = verify_nonce(&job, known_nonce, 0).unwrap();
         assert!(valid, "Known good nonce should produce valid hash");
 
         // The hash should meet difficulty 1 target

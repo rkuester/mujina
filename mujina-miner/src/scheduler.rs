@@ -89,7 +89,7 @@ pub async fn task(running: CancellationToken, mut board_rx: mpsc::Receiver<Box<d
 
                         // Verify the nonce
                         if let Some(job) = active_jobs.get(&nonce_result.job_id) {
-                            match verify_nonce(job, nonce_result.nonce) {
+                            match verify_nonce(job, nonce_result.nonce, nonce_result.version) {
                                 Ok((block_hash, valid)) => {
                                     if valid {
                                         stats.valid_nonces += 1;

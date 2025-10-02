@@ -374,6 +374,7 @@ impl BitaxeBoard {
                                 let nonce_result = crate::asic::NonceResult {
                                     job_id: job_id as u64,
                                     nonce,
+                                    version,
                                     hash: [0; 32], // TODO: Calculate actual hash if needed
                                 };
 
