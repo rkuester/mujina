@@ -50,7 +50,7 @@ pub async fn task(running: CancellationToken, mut board_rx: mpsc::Receiver<Box<d
     };
 
     // Create job generator for testing (using difficulty 1 for easy verification)
-    let difficulty = 1.0;
+    let difficulty = 1;
     let mut job_generator = JobGenerator::new(difficulty);
     info!("Created job generator with difficulty {}", difficulty);
 
@@ -59,7 +59,7 @@ pub async fn task(running: CancellationToken, mut board_rx: mpsc::Receiver<Box<d
 
     // Track mining statistics
     let mut stats = MiningStats {
-        difficulty,
+        difficulty: difficulty as f64,
         ..Default::default()
     };
 
