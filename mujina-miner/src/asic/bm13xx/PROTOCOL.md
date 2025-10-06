@@ -15,6 +15,7 @@ progresses and we gain experience with multi-chip systems.
 - ESP-miner BM1370 implementation
 - CGMiner driver implementations
 - Emberone-miner BM1362 implementation
+- BM1397 documentation: https://github.com/skot/BM1397
 - Serial captures from production hardware:
   - Bitaxe Gamma (single BM1370 chip)
   - Antminer S21 Pro (65x BM1370 chips)
