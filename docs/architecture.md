@@ -38,8 +38,9 @@ src/
 ├── asic/             # Mining ASIC drivers
 ├── board_manager.rs  # Board lifecycle and hotplug management
 ├── scheduler.rs      # Work scheduling and distribution
-├── job_generator.rs  # Local job generation (testing/solo)
-├── pool/             # Mining pool connectivity
+├── job_generator.rs  # Local job generation (testing/solo) [deprecated]
+├── pool/             # Mining pool connectivity [deprecated]
+├── job_source/       # Unified mining job sources (pools, solo, testing)
 ├── api/              # HTTP API and WebSocket
 ├── api_client/       # Shared API client library
 │   ├── mod.rs        # Client implementation
@@ -315,27 +316,32 @@ Manages board lifecycle and hotplug events:
 - Maintains active board registry
 - Routes boards to/from scheduler
 
-#### `pool/`
+#### `job_source/`
+Unified interface for all mining job sources:
+- `traits.rs` - `JobSource` trait for all sources
+- `stratum_v1.rs` - Stratum v1 pool client
+- `stratum_v2.rs` - Stratum v2 pool client (next-gen protocol)
+- `solo.rs` - Direct Bitcoin node connection for solo mining
+- `dummy.rs` - Synthetic job generator for power/thermal load management
+- Provides consistent interface for scheduler regardless of job origin
+
+#### `pool/` (Deprecated - Moving to job_source)
 Mining pool client implementations:
-- `traits.rs` - `PoolClient` trait
-- `stratum_v1.rs` - Stratum v1 protocol (most common)
-- `stratum_v2.rs` - Stratum v2 protocol (future)
-- `manager.rs` - Pool failover and switching logic
-- Handles: work fetching, share submission, difficulty adjustments
+- Being replaced by `job_source/stratum_v1` and `job_source/stratum_v2`
+- Retained temporarily for backward compatibility
 
 #### `scheduler.rs`
 Orchestrates the mining operation:
-- Receives work from pools
+- Receives work from any `JobSource` implementation
 - Distributes work to boards/chips
 - Collects and routes shares
 - Implements work scheduling strategies
 - Manages board lifecycle
 
-#### `job_generator.rs`
+#### `job_generator.rs` (Deprecated - Moving to job_source)
 Local job generation for testing and solo mining:
-- Generates valid block templates
-- Updates timestamp/nonce fields
-- Useful for hardware testing without pools
+- Being replaced by `job_source/dummy` and `job_source/solo`
+- Retained temporarily for backward compatibility
 
 ### API and Observability
 
@@ -357,7 +363,9 @@ Structured logging and observability:
 ## Data Flow
 
 ```
-Mining Pool <--[Stratum]--> pool::PoolClient
+Mining Pool <--[Stratum]--> job_source::StratumV1
+Bitcoin Node <--[RPC]-----> job_source::Solo
+Dummy Work Generator -----> job_source::Dummy
                                    |
                                    v
                             scheduler::Scheduler
