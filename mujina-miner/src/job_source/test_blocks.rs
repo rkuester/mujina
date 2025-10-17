@@ -195,11 +195,25 @@ pub mod block_881423 {
         &COINBASE_TX[62..]
     }
 
-    /// Merkle branches
+    /// Extranonce1 as Extranonce2 type
+    pub static EXTRANONCE1: LazyLock<crate::job_source::Extranonce2> = LazyLock::new(|| {
+        let bytes = extranonce1_bytes();
+        let value = u32::from_le_bytes(bytes.try_into().unwrap());
+        crate::job_source::Extranonce2::new(value as u64, bytes.len() as u8).unwrap()
+    });
+
+    /// Extranonce2 as Extranonce2 type
+    pub static EXTRANONCE2: LazyLock<crate::job_source::Extranonce2> = LazyLock::new(|| {
+        let bytes = extranonce2_bytes();
+        let value = u32::from_le_bytes(bytes.try_into().unwrap());
+        crate::job_source::Extranonce2::new(value as u64, bytes.len() as u8).unwrap()
+    });
+
+    /// Merkle branches as raw byte arrays
     ///
     /// These are the sibling hashes needed to compute the merkle root from the coinbase
     /// transaction hash.
-    pub const MERKLE_BRANCHES: &[[u8; 32]] = &[
+    pub const MERKLE_BRANCHES_BYTES: [[u8; 32]; 11] = [
         [
             0x42, 0x82, 0x35, 0x7a, 0xb0, 0xa2, 0xf4, 0xe8, 0xe5, 0x62, 0xc8, 0xc5, 0xea, 0xe1,
             0xd6, 0x3b, 0x55, 0x90, 0x68, 0xf9, 0x07, 0x23, 0x74, 0xb7, 0x2e, 0x26, 0xb8, 0x8a,
@@ -256,6 +270,14 @@ pub mod block_881423 {
             0xe3, 0xad, 0x6e, 0x3f,
         ],
     ];
+
+    /// Merkle branches as TxMerkleNode types
+    pub static MERKLE_BRANCHES: LazyLock<Vec<TxMerkleNode>> = LazyLock::new(|| {
+        MERKLE_BRANCHES_BYTES
+            .iter()
+            .map(|bytes| TxMerkleNode::from_byte_array(*bytes))
+            .collect()
+    });
 
     #[cfg(test)]
     mod tests {
@@ -346,7 +368,7 @@ pub mod block_881423 {
             let mut current_hash = coinbase_txid.to_byte_array();
 
             // Apply each merkle branch
-            for branch in MERKLE_BRANCHES.iter() {
+            for branch in MERKLE_BRANCHES_BYTES.iter() {
                 let mut combined = Vec::new();
                 combined.extend_from_slice(&current_hash);
                 combined.extend_from_slice(branch);

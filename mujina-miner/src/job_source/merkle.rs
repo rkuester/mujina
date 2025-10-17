@@ -1,8 +1,12 @@
 //! Merkle root specification for mining jobs.
 
+use anyhow::Result;
+use bitcoin::consensus::deserialize;
 use bitcoin::hash_types::TxMerkleNode;
+use bitcoin::hashes::{sha256d, Hash};
+use bitcoin::Transaction;
 
-use super::extranonce2::Extranonce2Range;
+use super::extranonce2::{Extranonce2, Extranonce2Range};
 
 /// Specifies how to obtain the merkle root for a mining job.
 ///
@@ -59,4 +63,71 @@ pub struct MerkleRootTemplate {
     /// After hashing the coinbase transaction, these branches are used to climb
     /// the merkle tree to compute the final merkle root for the block header.
     pub merkle_branches: Vec<TxMerkleNode>,
+}
+
+impl MerkleRootTemplate {
+    /// Compute merkle root for a specific extranonce2 value.
+    ///
+    /// Builds the complete coinbase transaction by concatenating parts with the
+    /// given extranonce2, computes its txid, then climbs the merkle tree using
+    /// the branches to produce the final merkle root.
+    ///
+    /// This is a pure function - it doesn't modify the template. Callers manage
+    /// extranonce2 iteration externally via `Extranonce2Iter`.
+    pub fn compute_merkle_root(&self, extranonce2: &Extranonce2) -> Result<TxMerkleNode> {
+        // Build complete coinbase transaction
+        let mut coinbase_bytes = Vec::new();
+        coinbase_bytes.extend_from_slice(&self.coinbase1);
+        coinbase_bytes.extend_from_slice(&self.extranonce1);
+        extranonce2.extend_vec(&mut coinbase_bytes);
+        coinbase_bytes.extend_from_slice(&self.coinbase2);
+
+        // Parse and compute coinbase txid
+        let coinbase_tx: Transaction = deserialize(&coinbase_bytes)?;
+        let mut current_hash = coinbase_tx.compute_txid().to_byte_array();
+
+        // Climb the merkle tree
+        for branch in &self.merkle_branches {
+            let mut combined = Vec::new();
+            combined.extend_from_slice(&current_hash);
+            combined.extend_from_slice(branch.as_byte_array());
+
+            let parent_hash = sha256d::Hash::hash(&combined);
+            current_hash = parent_hash.to_byte_array();
+        }
+
+        Ok(TxMerkleNode::from_byte_array(current_hash))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::job_source::test_blocks::block_881423;
+
+    #[test]
+    fn test_compute_merkle_root_with_block_881423() {
+        let extranonce2 = *block_881423::EXTRANONCE2;
+
+        // Construct a template from golden values
+        let template = MerkleRootTemplate {
+            coinbase1: block_881423::coinbase1_bytes().to_vec(),
+            extranonce1: block_881423::extranonce1_bytes().to_vec(),
+            extranonce2_range: Extranonce2Range::new(extranonce2.size()).unwrap(),
+            coinbase2: block_881423::coinbase2_bytes().to_vec(),
+            merkle_branches: block_881423::MERKLE_BRANCHES.clone(),
+        };
+
+        // Compute merkle root
+        let computed_merkle_root = template
+            .compute_merkle_root(&extranonce2)
+            .expect("merkle root computation should succeed");
+
+        // Verify it matches the known merkle root
+        assert_eq!(
+            computed_merkle_root,
+            *block_881423::MERKLE_ROOT,
+            "Computed merkle root doesn't match block 881,423"
+        );
+    }
 }

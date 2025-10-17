@@ -111,11 +111,14 @@ impl fmt::Display for Extranonce2 {
 /// distributing work between boards or chip chains.
 ///
 /// Call `.iter()` to create an `Extranonce2Iter` for generating values.
+///
+/// Can be constructed with struct literals or via `new()` / `new_range()` for
+/// validation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Extranonce2Range {
-    min: u64,
-    max: u64,
-    size: u8,
+    pub min: u64,
+    pub max: u64,
+    pub size: u8,
 }
 
 impl Extranonce2Range {

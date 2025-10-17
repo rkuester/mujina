@@ -7,8 +7,6 @@
 //! of the complete mining stack.
 
 use anyhow::Result;
-use bitcoin::hash_types::TxMerkleNode;
-use bitcoin::hashes::Hash;
 use tokio::sync::mpsc;
 use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
@@ -68,11 +66,8 @@ impl DummySource {
             4,                               // 4 bytes
         )?;
 
-        // Convert merkle branches from byte arrays to TxMerkleNode
-        let merkle_branches: Vec<TxMerkleNode> = block_881423::MERKLE_BRANCHES
-            .iter()
-            .map(|bytes| TxMerkleNode::from_byte_array(*bytes))
-            .collect();
+        // Get merkle branches as typed TxMerkleNode
+        let merkle_branches = block_881423::MERKLE_BRANCHES.clone();
 
         let job_template = JobTemplate {
             id: "dummy-0".into(),
@@ -245,32 +240,10 @@ mod tests {
         // Get the winning extranonce2 value (first in our range)
         let extranonce2 = merkle_template.extranonce2_range.iter().next().unwrap();
 
-        // Build the complete coinbase transaction
-        let mut coinbase_bytes = Vec::new();
-        coinbase_bytes.extend_from_slice(&merkle_template.coinbase1);
-        coinbase_bytes.extend_from_slice(&merkle_template.extranonce1);
-        extranonce2.extend_vec(&mut coinbase_bytes);
-        coinbase_bytes.extend_from_slice(&merkle_template.coinbase2);
-
-        // Parse and compute coinbase txid
-        use bitcoin::consensus::deserialize;
-        use bitcoin::Transaction;
-        let coinbase_tx: Transaction =
-            deserialize(&coinbase_bytes).expect("valid coinbase transaction");
-        let mut current_hash = coinbase_tx.compute_txid().to_byte_array();
-
-        // Climb the merkle tree
-        for branch in &merkle_template.merkle_branches {
-            let mut combined = Vec::new();
-            combined.extend_from_slice(&current_hash);
-            combined.extend_from_slice(branch.as_byte_array());
-
-            use bitcoin::hashes::sha256d;
-            let parent_hash = sha256d::Hash::hash(&combined);
-            current_hash = parent_hash.to_byte_array();
-        }
-
-        let computed_merkle_root = TxMerkleNode::from_byte_array(current_hash);
+        // Compute merkle root using the template
+        let computed_merkle_root = merkle_template
+            .compute_merkle_root(&extranonce2)
+            .expect("valid merkle root computation");
 
         // Build block header with winning nonce and version
         use bitcoin::block::Header as BlockHeader;
