@@ -396,6 +396,34 @@ USB Device ──> transport ──> BoardConnected Event ──> backplane
                                               Scheduler talks directly to Board
 ```
 
+## Share Processing Flow
+
+Shares flow through three filtering stages from hardware to pool:
+
+1. **Chip Hardware Target**: ASICs are configured with a low difficulty target
+   (e.g., diff 100-1000) to generate frequent shares for health monitoring.
+   At diff 100, a 500 GH/s chip produces ~1 share/second.
+
+2. **Thread Processing**: HashThreads receive ALL chip shares and compute the
+   hash for each one (required to determine what difficulty it meets). Since
+   the hash computation cost is already paid, threads forward all shares to
+   the scheduler rather than filtering them. This keeps threads simple and
+   gives the scheduler ground truth for per-thread hashrate measurement.
+
+3. **Scheduler Filtering**: The scheduler filters shares against the job target
+   before forwarding to the JobSource. Only pool-worthy shares are submitted.
+   The scheduler uses all shares for internal statistics and health monitoring.
+
+**Message Volume**: Even at aggressive chip targets, message volume is
+manageable. A 12-chip board at diff 100 produces ~10-15 shares/second,
+well within mpsc channel capacity.
+
+**Design Rationale**: Forwarding all shares centralizes filtering logic in the
+scheduler, provides accurate per-thread monitoring, and simplifies thread
+implementation. The alternative (filtering in threads) would require duplicating
+target comparison logic and prevent the scheduler from measuring actual hardware
+performance.
+
 ## Async Patterns
 
 All I/O operations are async using Tokio:

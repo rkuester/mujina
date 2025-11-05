@@ -1,6 +1,19 @@
 //! The scheduler module manages the distribution of mining jobs to hash boards
 //! and ASIC chips.
 //!
+//! # Share Filtering
+//!
+//! The scheduler receives ALL shares from HashThreads and performs final
+//! filtering before forwarding to JobSources:
+//!
+//! - HashThreads forward all chip shares (hash already computed)
+//! - Scheduler filters by job target (only pool-worthy shares submitted)
+//! - Scheduler uses all shares for per-thread hashrate measurement
+//! - Scheduler tracks chip health across all threads
+//!
+//! This centralized filtering provides accurate monitoring while keeping
+//! thread implementations simple.
+//!
 //! This is a work-in-progress. It's currently the main and initial place where
 //! functionality is added, after which the functionality is refactored out to
 //! where it belongs.
@@ -45,9 +58,8 @@ pub async fn task(
         .into_iter()
         .next()
         .expect("Should have at least one thread");
-    let thread_id = thread.id();
 
-    info!("Using hash thread {:?}", thread_id);
+    info!("Received hash thread from backplane");
 
     // Get the event receiver from the thread
     let mut event_rx = match thread.take_event_receiver() {
@@ -137,16 +149,7 @@ pub async fn task(
     info!("Mining session complete");
     stats.log_summary();
 
-    // Graceful shutdown sequence
-    info!("Starting graceful shutdown...");
-
-    // Shutdown the hash thread
-    info!("Shutting down hash thread");
-    if let Err(e) = thread.shutdown().await {
-        error!("Failed to shutdown thread properly: {}", e);
-    }
-
-    info!("Thread shutdown complete");
+    info!("Scheduler shutdown complete");
     trace!("Scheduler task stopped.");
 }
 

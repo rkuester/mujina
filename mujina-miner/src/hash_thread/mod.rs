@@ -5,89 +5,29 @@
 //! without needing to know about the underlying hardware topology (single chip,
 //! chip chain, engine groups, etc.).
 //!
-//! HashThreads are autonomous actors that self-manage their hardware, filter
-//! shares, and report events back to the scheduler.
+//! # Share Processing
+//!
+//! HashThreads forward ALL shares from chips to the scheduler:
+//!
+//! 1. Chips are configured with low difficulty targets (e.g., diff 100-1000)
+//!    for frequent health signals
+//! 2. Thread computes hash for every chip share (required to determine
+//!    what difficulty it meets)
+//! 3. Thread forwards all shares via ShareFound events (since hash is already
+//!    computed, filtering is trivial)
+//! 4. Scheduler performs final filtering against job target
+//!
+//! This design keeps thread implementation simple, provides scheduler with
+//! ground truth for per-thread hashrate, and centralizes filtering logic.
+//! Message volume is manageable: ~1-2 shares/sec per chip at typical targets.
 
 pub mod bm13xx;
 pub mod task;
 
 use async_trait::async_trait;
-use std::hash::{Hash, Hasher};
-use std::sync::Arc;
 use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
 
 use task::{HashTask, Share};
-
-/// Thread removal signal sent via watch channel.
-///
-/// Boards monitor hardware and send removal signals to threads when they need
-/// to shut down. The signal starts as `Running` and changes to a specific
-/// removal reason when shutdown is needed.
-#[derive(Clone, Debug, PartialEq)]
-pub enum ThreadRemovalSignal {
-    /// Thread should continue running normally
-    Running,
-
-    /// Remove: Board was unplugged from USB
-    BoardDisconnected,
-
-    /// Remove: Board detected hardware fault (overheating, power issue, etc.)
-    HardwareFault { description: String },
-
-    /// Remove: User requested board disable via API
-    UserRequested,
-
-    /// Remove: Graceful system shutdown
-    Shutdown,
-}
-
-/// HashThread identity based on Tokio task ID.
-///
-/// Each HashThread runs as an independent Tokio task. The thread's identity
-/// is derived from its task ID, providing:
-/// - Natural uniqueness (task IDs are unique while task is alive)
-/// - Cheap cloning (Arc-wrapped for sharing)
-/// - HashMap compatibility (implements Hash + Eq)
-/// - No central registry needed
-///
-/// Note: Task IDs may be recycled after a task exits and all handles are dropped.
-/// This is acceptable since we remove threads from the scheduler's registry when
-/// they go offline.
-#[derive(Clone)]
-pub struct ThreadId(Arc<tokio::task::Id>);
-
-impl ThreadId {
-    /// Create ThreadId from a Tokio task handle
-    ///
-    /// This is the canonical way to create a ThreadId - from the task that
-    /// will run the thread's actor loop.
-    pub(crate) fn from_task<T>(handle: &JoinHandle<T>) -> Self {
-        Self(Arc::new(handle.id()))
-    }
-}
-
-/// Identity based on task ID equality
-impl PartialEq for ThreadId {
-    fn eq(&self, other: &Self) -> bool {
-        *self.0 == *other.0
-    }
-}
-
-impl Eq for ThreadId {}
-
-/// Hash based on task ID
-impl Hash for ThreadId {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.0.hash(state);
-    }
-}
-
-impl std::fmt::Debug for ThreadId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "ThreadId({:?})", self.0)
-    }
-}
 
 /// HashThread capabilities reported to scheduler for work assignment decisions.
 #[derive(Debug, Clone)]
@@ -175,15 +115,10 @@ pub enum HashThreadError {
 /// needing to know about the underlying hardware topology.
 ///
 /// Threads are autonomous actors that:
-/// - Monitor their hardware
-/// - Filter shares by pool target
-/// - Self-tune chip targets
+/// - Operate their hardware
 /// - Report events asynchronously
 #[async_trait]
 pub trait HashThread: Send {
-    /// Get unique thread identifier
-    fn id(&self) -> ThreadId;
-
     /// Get thread capabilities for scheduling decisions
     fn capabilities(&self) -> &HashThreadCapabilities;
 
@@ -230,130 +165,4 @@ pub trait HashThread: Send {
     /// This is cached and may be slightly stale (updated periodically by
     /// thread's status updates).
     fn status(&self) -> HashThreadStatus;
-
-    /// Shutdown the thread gracefully
-    ///
-    /// Waits for the thread's actor task to exit. Thread will send GoingOffline
-    /// event before shutting down.
-    async fn shutdown(&mut self) -> std::result::Result<(), HashThreadError>;
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::collections::{HashMap, HashSet};
-
-    // Helper to create test thread IDs from dummy tasks
-    fn make_test_id() -> ThreadId {
-        let handle = tokio::spawn(async {});
-        ThreadId::from_task(&handle)
-    }
-
-    #[tokio::test]
-    async fn test_thread_id_equality_same_task() {
-        let id1 = make_test_id();
-        let id2 = id1.clone();
-
-        assert_eq!(id1, id2, "Cloned ThreadIds should be equal");
-    }
-
-    #[tokio::test]
-    async fn test_thread_id_inequality_different_tasks() {
-        let id1 = make_test_id();
-        let id2 = make_test_id();
-
-        assert_ne!(
-            id1, id2,
-            "Different ThreadIds (from different tasks) should not be equal"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_thread_id_hash_consistency() {
-        use std::collections::hash_map::DefaultHasher;
-
-        let id = make_test_id();
-        let id_clone = id.clone();
-
-        let mut hasher1 = DefaultHasher::new();
-        id.hash(&mut hasher1);
-        let hash1 = hasher1.finish();
-
-        let mut hasher2 = DefaultHasher::new();
-        id_clone.hash(&mut hasher2);
-        let hash2 = hasher2.finish();
-
-        assert_eq!(hash1, hash2, "Same ThreadId should hash consistently");
-    }
-
-    #[tokio::test]
-    async fn test_thread_id_different_hashes() {
-        use std::collections::hash_map::DefaultHasher;
-
-        let id1 = make_test_id();
-        let id2 = make_test_id();
-
-        let mut hasher1 = DefaultHasher::new();
-        id1.hash(&mut hasher1);
-        let hash1 = hasher1.finish();
-
-        let mut hasher2 = DefaultHasher::new();
-        id2.hash(&mut hasher2);
-        let hash2 = hasher2.finish();
-
-        // Tokio task IDs are distinct, so hashes should be different
-        assert_ne!(
-            hash1, hash2,
-            "Different ThreadIds should have different hashes"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_thread_id_in_hashmap() {
-        let id1 = make_test_id();
-        let id2 = make_test_id();
-        let id3 = id1.clone();
-
-        let mut map = HashMap::new();
-        map.insert(id1.clone(), "thread1");
-        map.insert(id2.clone(), "thread2");
-
-        assert_eq!(map.get(&id1), Some(&"thread1"));
-        assert_eq!(map.get(&id2), Some(&"thread2"));
-        assert_eq!(
-            map.get(&id3),
-            Some(&"thread1"),
-            "Cloned ID should map to same value"
-        );
-        assert_eq!(map.len(), 2, "Should only have two entries");
-    }
-
-    #[tokio::test]
-    async fn test_thread_id_in_hashset() {
-        let id1 = make_test_id();
-        let id2 = make_test_id();
-        let id3 = id1.clone();
-
-        let mut set = HashSet::new();
-        set.insert(id1.clone());
-        set.insert(id2.clone());
-        set.insert(id3); // Clone of id1
-
-        assert_eq!(set.len(), 2, "Set should contain only unique IDs");
-        assert!(set.contains(&id1));
-        assert!(set.contains(&id2));
-    }
-
-    #[tokio::test]
-    async fn test_thread_id_debug_format() {
-        let id = make_test_id();
-        let debug_str = format!("{:?}", id);
-
-        // Should show Tokio task ID
-        assert!(
-            debug_str.starts_with("ThreadId(Id("),
-            "Debug format should show Tokio task ID: {}",
-            debug_str
-        );
-    }
 }
