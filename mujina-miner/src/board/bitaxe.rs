@@ -36,7 +36,10 @@ use crate::{
     transport::serial::{SerialControl, SerialReader, SerialStream, SerialWriter},
 };
 
-use super::{Board, BoardError, BoardEvent, BoardInfo, JobCompleteReason};
+use super::{
+    pattern::{Match, StringMatch},
+    Board, BoardError, BoardEvent, BoardInfo, JobCompleteReason,
+};
 
 /// Thread removal signal sent via watch channel from board to thread.
 ///
@@ -1342,8 +1345,13 @@ async fn create_from_usb(
 // Register this board type with the inventory system
 inventory::submit! {
     crate::board::BoardDescriptor {
-        vid: 0x0403,
-        pid: 0x6015,
+        pattern: crate::board::pattern::BoardPattern {
+            vid: Match::Any,
+            pid: Match::Any,
+            manufacturer: Match::Specific(StringMatch::Exact("OSMU")),
+            product: Match::Specific(StringMatch::Exact("Bitaxe")),
+            serial_pattern: Match::Any,
+        },
         name: "Bitaxe Gamma",
         create_fn: |device| Box::pin(create_from_usb(device)),
     }
