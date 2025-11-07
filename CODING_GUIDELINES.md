@@ -174,9 +174,9 @@ async fn board_loop(
 
 Use appropriate log levels consistently:
 
-- **trace**: Very detailed information for debugging specific issues
-- **debug**: Information useful during development
-- **info**: Normal operational messages
+- **trace**: Step-by-step execution detail
+- **debug**: Logical stages and summaries
+- **info**: Final outcomes and important state changes
 - **warn**: Unexpected but recoverable situations
 - **error**: Error conditions that prevent operation
 
@@ -187,6 +187,37 @@ info!(board = %board.name(), "Board connected");
 warn!(temp_c = %temp, threshold = %TEMP_WARN, "Chip temperature high");
 error!(error = %err, "Failed to initialize board");
 ```
+
+### Trace vs Debug [L.trace-debug](#L.trace-debug)
+
+Choose between trace and debug based on granularity:
+
+**Trace** shows step-by-step execution detail:
+- Individual operations within an algorithm
+- Raw values being examined or transformed
+- Inner loop iterations
+- Byte-level protocol data
+
+```rust
+trace!(vid = %format!("{:04x}", vid), "Extracting VID from device");
+trace!(pattern = "Bitaxe", matched = false, "Pattern did not match");
+trace!(register = 0x08, value = 0x1234, "Writing register");
+```
+
+**Debug** shows logical stages and summaries:
+- Phase boundaries (starting/completing operations)
+- Aggregated results and counts
+- Decision points and match results
+- State transitions
+
+```rust
+debug!("Starting USB device enumeration");
+debug!(device_count = 5, "Enumeration complete");
+debug!(board = "Bitaxe", specificity = 40, "Pattern matched");
+debug!(chips = 1, "Chip discovery complete");
+```
+
+Use trace for "I'm doing X now", debug for "Phase X started/completed with Y results".
 
 ### Structured Logging [L.structured](#L.structured)
 

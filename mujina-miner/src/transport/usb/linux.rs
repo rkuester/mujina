@@ -100,12 +100,12 @@ impl LinuxUdevDiscovery {
             .map(|s| s.to_string());
 
         trace!(
-            "Extracted device properties: VID={:04x}, PID={:04x}, serial={:?}, manufacturer={:?}, product={:?}",
-            vid,
-            pid,
-            serial_number,
-            manufacturer,
-            product
+            vid = %format!("{:04x}", vid),
+            pid = %format!("{:04x}", pid),
+            serial = ?serial_number,
+            manufacturer = ?manufacturer,
+            product = ?product,
+            "Extracted device properties"
         );
 
         Ok(DeviceProperties {
@@ -159,7 +159,7 @@ impl LinuxUdevDiscovery {
                 // Get the device node (e.g., /dev/ttyACM0)
                 if let Some(devnode) = tty_device.devnode() {
                     if let Some(path_str) = devnode.to_str() {
-                        trace!("Found serial port: {}", path_str);
+                        trace!(port = path_str, "Found serial port");
                         ports.push(path_str.to_string());
                     }
                 }
@@ -170,11 +170,7 @@ impl LinuxUdevDiscovery {
         // This ensures /dev/ttyACM0 comes before /dev/ttyACM1
         ports.sort();
 
-        debug!(
-            "Found {} serial port(s) for device: {:?}",
-            ports.len(),
-            ports
-        );
+        trace!(port_count = ports.len(), ports = ?ports, "Serial port discovery complete");
 
         Ok(ports)
     }
@@ -210,7 +206,7 @@ impl LinuxUdevDiscovery {
 
     /// Enumerate currently connected USB devices.
     fn enumerate_devices(&self) -> Result<Vec<UsbDeviceInfo>> {
-        info!("Enumerating USB devices");
+        debug!("Starting USB device enumeration");
 
         // Create enumerator for USB devices
         let mut enumerator = udev::Enumerator::new().map_err(|e| {
@@ -237,26 +233,24 @@ impl LinuxUdevDiscovery {
             // Try to build device info, skip devices that fail
             match self.build_device_info(&device) {
                 Ok(info) => {
-                    info!(
-                        "Enumerated USB device: {:04x}:{:04x} at {} ({} serial ports)",
-                        info.vid,
-                        info.pid,
-                        info.device_path,
-                        info.serial_ports.len()
+                    trace!(
+                        vid = %format!("{:04x}", info.vid),
+                        pid = %format!("{:04x}", info.pid),
+                        manufacturer = ?info.manufacturer,
+                        product = ?info.product,
+                        serial_ports = info.serial_ports.len(),
+                        "Enumerated USB device"
                     );
                     devices.push(info);
                 }
                 Err(e) => {
                     // Log but continue - some USB devices may not have complete info
-                    debug!("Skipping device due to error: {}", e);
+                    trace!(error = %e, "Skipping device");
                 }
             }
         }
 
-        info!(
-            "Enumeration complete: found {} USB device(s)",
-            devices.len()
-        );
+        debug!(device_count = devices.len(), "USB enumeration complete");
         Ok(devices)
     }
 }
@@ -302,16 +296,21 @@ impl super::UsbDiscoveryImpl for LinuxUdevDiscovery {
 
             // Create async udev monitor using tokio-udev
             let builder = tokio_udev::MonitorBuilder::new()
-                .map_err(|e| crate::error::Error::Other(format!("Failed to create monitor: {}", e)))?
+                .map_err(|e| {
+                    crate::error::Error::Other(format!("Failed to create monitor: {}", e))
+                })?
                 .match_subsystem("usb")
-                .map_err(|e| crate::error::Error::Other(format!("Failed to filter monitor: {}", e)))?;
+                .map_err(|e| {
+                    crate::error::Error::Other(format!("Failed to filter monitor: {}", e))
+                })?;
 
             let socket = builder
                 .listen()
                 .map_err(|e| crate::error::Error::Other(format!("Failed to listen: {}", e)))?;
 
-            let mut monitor = tokio_udev::AsyncMonitorSocket::new(socket)
-                .map_err(|e| crate::error::Error::Other(format!("Failed to create async socket: {}", e)))?;
+            let mut monitor = tokio_udev::AsyncMonitorSocket::new(socket).map_err(|e| {
+                crate::error::Error::Other(format!("Failed to create async socket: {}", e))
+            })?;
 
             info!("USB monitor created, entering event loop");
 
@@ -343,18 +342,19 @@ impl super::UsbDiscoveryImpl for LinuxUdevDiscovery {
                                     continue;
                                 }
 
-                                debug!("USB device added: {:?}", device.syspath());
-
                                 match self.build_device_info(&device) {
                                     Ok(device_info) => {
-                                        info!(
-                                            "USB device connected: {:04x}:{:04x} at {}",
-                                            device_info.vid, device_info.pid, device_info.device_path
+                                        debug!(
+                                            vid = %format!("{:04x}", device_info.vid),
+                                            pid = %format!("{:04x}", device_info.pid),
+                                            manufacturer = ?device_info.manufacturer,
+                                            product = ?device_info.product,
+                                            "USB device added"
                                         );
                                         Some(UsbEvent::UsbDeviceConnected(device_info))
                                     }
                                     Err(e) => {
-                                        debug!("Failed to build device info for added device: {}", e);
+                                        trace!(error = %e, "Failed to build device info");
                                         None
                                     }
                                 }
@@ -362,7 +362,7 @@ impl super::UsbDiscoveryImpl for LinuxUdevDiscovery {
 
                             tokio_udev::EventType::Remove => {
                                 if let Some(syspath) = device.syspath().to_str() {
-                                    debug!("USB device removed: {}", syspath);
+                                    debug!(device_path = syspath, "USB device removed");
                                     Some(UsbEvent::UsbDeviceDisconnected {
                                         device_path: syspath.to_string(),
                                     })
@@ -373,7 +373,7 @@ impl super::UsbDiscoveryImpl for LinuxUdevDiscovery {
 
                             _ => {
                                 // Ignore other event types (change, bind, unbind, etc.)
-                                trace!("Ignoring event type: {:?}", event.event_type());
+                                trace!(event_type = ?event.event_type(), "Ignoring USB event");
                                 None
                             }
                         };

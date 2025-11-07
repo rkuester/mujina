@@ -9,6 +9,7 @@ use crate::{
     board::{Board, BoardDescriptor},
     error::Result,
     hash_thread::HashThread,
+    tracing::prelude::*,
     transport::{usb::TransportEvent as UsbTransportEvent, TransportEvent, UsbDeviceInfo},
 };
 use std::collections::HashMap;
@@ -40,10 +41,10 @@ impl BoardRegistry {
             ))
         })?;
 
-        tracing::info!(
-            "Creating {} board from USB device (pattern specificity: {})",
-            desc.name,
-            desc.pattern.specificity()
+        tracing::debug!(
+            board = desc.name,
+            specificity = desc.pattern.specificity(),
+            "Pattern matched, creating board"
         );
         (desc.create_fn)(device).await
     }
@@ -96,7 +97,6 @@ impl Backplane {
             UsbTransportEvent::UsbDeviceConnected(device_info) => {
                 let vid = device_info.vid;
                 let pid = device_info.pid;
-                tracing::info!("USB device connected: {:04x}:{:04x}", vid, pid);
 
                 // Try to create a board from this USB device
                 match self.registry.create_board(device_info).await {
@@ -107,51 +107,61 @@ impl Backplane {
                             .clone()
                             .unwrap_or_else(|| "unknown".to_string());
 
-                        tracing::info!("Created {} board (serial: {})", board_info.model, board_id);
+                        debug!(
+                            board = %board_info.model,
+                            serial = %board_id,
+                            "Board created, initializing hash threads"
+                        );
 
                         // Create hash threads from the board
                         match board.create_hash_threads().await {
                             Ok(threads) => {
-                                tracing::info!(
-                                    "Created {} hash thread(s) from board {}",
-                                    threads.len(),
-                                    board_id
-                                );
+                                let thread_count = threads.len();
 
                                 // Store board for lifecycle management
                                 self.boards.insert(board_id.clone(), board);
 
                                 // Send threads to scheduler
                                 if let Err(e) = self.scheduler_tx.send(threads).await {
-                                    tracing::error!("Failed to send threads to scheduler: {}", e);
+                                    tracing::error!(
+                                        board = %board_info.model,
+                                        error = %e,
+                                        "Failed to send threads to scheduler"
+                                    );
                                 } else {
-                                    tracing::info!(
-                                        "Threads from board {} sent to scheduler",
-                                        board_id
+                                    // Single consolidated info message - board is ready
+                                    info!(
+                                        board = %board_info.model,
+                                        serial = %board_id,
+                                        threads = thread_count,
+                                        vid = %format!("{:04x}", vid),
+                                        pid = %format!("{:04x}", pid),
+                                        "Board ready"
                                     );
                                 }
                             }
                             Err(e) => {
                                 tracing::error!(
-                                    "Failed to create hash threads from board {}: {}",
-                                    board_id,
-                                    e
+                                    board = %board_info.model,
+                                    serial = %board_id,
+                                    error = %e,
+                                    "Failed to create hash threads"
                                 );
                             }
                         }
                     }
                     Err(e) => {
-                        tracing::warn!(
-                            "Failed to create board for device {:04x}:{:04x}: {}",
-                            vid,
-                            pid,
-                            e
+                        debug!(
+                            vid = %format!("{:04x}", vid),
+                            pid = %format!("{:04x}", pid),
+                            error = %e,
+                            "No board match for USB device"
                         );
                     }
                 }
             }
             UsbTransportEvent::UsbDeviceDisconnected { device_path } => {
-                tracing::info!("USB device disconnected: {}", device_path);
+                debug!(device_path = %device_path, "USB device disconnected");
 
                 // Find and shutdown the board
                 // Note: Current design uses serial number as key, but we get device_path
@@ -160,9 +170,25 @@ impl Backplane {
                 let board_ids: Vec<String> = self.boards.keys().cloned().collect();
                 for board_id in board_ids {
                     if let Some(mut board) = self.boards.remove(&board_id) {
-                        tracing::info!("Shutting down board {}", board_id);
-                        if let Err(e) = board.shutdown().await {
-                            tracing::error!("Failed to shutdown board {}: {}", board_id, e);
+                        let model = board.board_info().model;
+                        debug!(board = %model, serial = %board_id, "Shutting down board");
+
+                        match board.shutdown().await {
+                            Ok(()) => {
+                                info!(
+                                    board = %model,
+                                    serial = %board_id,
+                                    "Board disconnected"
+                                );
+                            }
+                            Err(e) => {
+                                tracing::error!(
+                                    board = %model,
+                                    serial = %board_id,
+                                    error = %e,
+                                    "Failed to shutdown board"
+                                );
+                            }
                         }
                         // Don't re-insert - board is removed
                         break; // For now, assume one board per device
