@@ -10,11 +10,12 @@
 //! - **macOS**: Stub implementation (IOKit support planned for future)
 
 use crate::{error::Result, tracing::prelude::*};
+use std::sync::OnceLock;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 /// Information about a discovered USB device.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct UsbDeviceInfo {
     /// USB vendor ID
     pub vid: u16,
@@ -28,10 +29,61 @@ pub struct UsbDeviceInfo {
     pub product: Option<String>,
     /// USB device path (e.g., "/sys/bus/usb/devices/1-1.2")
     pub device_path: String,
-    /// Serial port device nodes associated with this USB device
-    /// (e.g., ["/dev/ttyACM0", "/dev/ttyACM1"])
-    pub serial_ports: Vec<String>,
+    /// Serial port device nodes associated with this USB device.
+    /// Lazily populated on first access via serial_ports() method.
+    /// Stores a Result so we can cache both success and failure.
+    serial_ports: OnceLock<Result<Vec<String>>>,
     // Future: other interfaces like HID, mass storage, etc.
+}
+
+impl UsbDeviceInfo {
+    /// Get serial ports associated with this USB device.
+    ///
+    /// Scans for serial port device nodes (e.g., /dev/ttyACM0, /dev/ttyUSB0)
+    /// on first call and caches the result. Returns cached value on subsequent calls.
+    ///
+    /// This lazy approach avoids expensive serial port enumeration for devices
+    /// that won't be used (USB hubs, keyboards, etc.), only scanning when a board
+    /// implementation actually needs the serial ports.
+    pub fn serial_ports(&self) -> Result<&[String]> {
+        self.serial_ports
+            .get_or_init(|| {
+                #[cfg(target_os = "linux")]
+                {
+                    linux::find_serial_ports_for_device(&self.device_path)
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    Ok(vec![])
+                }
+            })
+            .as_ref()
+            .map(|v| v.as_slice())
+            .map_err(|e| crate::error::Error::Other(e.to_string()))
+    }
+
+    /// Create a UsbDeviceInfo for testing purposes.
+    ///
+    /// Serial ports are not scanned and will be empty when accessed.
+    #[cfg(test)]
+    pub fn new_for_test(
+        vid: u16,
+        pid: u16,
+        serial_number: Option<String>,
+        manufacturer: Option<String>,
+        product: Option<String>,
+        device_path: String,
+    ) -> Self {
+        Self {
+            vid,
+            pid,
+            serial_number,
+            manufacturer,
+            product,
+            device_path,
+            serial_ports: OnceLock::new(),
+        }
+    }
 }
 
 /// Transport event emitted when devices are discovered or disconnected.
@@ -96,13 +148,11 @@ impl UsbTransport {
                 if let Err(e) = discovery.monitor_blocking(event_tx, shutdown) {
                     error!("USB monitoring failed: {}", e);
                 }
-                trace!("USB monitoring thread exiting");
             })
             .map_err(|e| {
                 crate::error::Error::Other(format!("Failed to spawn USB monitor thread: {}", e))
             })?;
 
-        trace!("USB discovery thread spawned");
         Ok(())
     }
 }

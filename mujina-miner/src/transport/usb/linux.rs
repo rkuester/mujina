@@ -45,6 +45,61 @@ struct DeviceProperties {
     product: Option<String>,
 }
 
+/// Find serial port devices (tty) associated with a USB device.
+///
+/// Takes a USB device sysfs path (e.g., "/sys/devices/pci0000:00/...") and
+/// returns serial port device nodes (e.g., ["/dev/ttyACM0", "/dev/ttyACM1"]).
+/// Ports are sorted by device node name for consistent ordering.
+///
+/// This is a public function so UsbDeviceInfo can lazily scan for serial ports
+/// without needing access to the original udev::Device reference.
+pub(super) fn find_serial_ports_for_device(device_path: &str) -> Result<Vec<String>> {
+    let mut ports = Vec::new();
+
+    // Create an enumerator to find tty devices
+    let mut enumerator = udev::Enumerator::new()
+        .map_err(|e| crate::error::Error::Other(format!("Failed to create enumerator: {}", e)))?;
+
+    // Look for tty subsystem devices
+    enumerator
+        .match_subsystem("tty")
+        .map_err(|e| crate::error::Error::Other(format!("Failed to filter by subsystem: {}", e)))?;
+
+    // Scan all tty devices and check if they're children of our USB device
+    for tty_device in enumerator
+        .scan_devices()
+        .map_err(|e| crate::error::Error::Other(format!("Failed to scan devices: {}", e)))?
+    {
+        // Check if this tty device is a descendant of our USB device
+        // by walking up the parent chain
+        let mut current = Some(tty_device.clone());
+        let mut is_child = false;
+
+        while let Some(dev) = current {
+            if dev.syspath().to_str() == Some(device_path) {
+                is_child = true;
+                break;
+            }
+            current = dev.parent();
+        }
+
+        if is_child {
+            // Get the device node (e.g., /dev/ttyACM0)
+            if let Some(devnode) = tty_device.devnode() {
+                if let Some(path_str) = devnode.to_str() {
+                    ports.push(path_str.to_string());
+                }
+            }
+        }
+    }
+
+    // Sort ports by name for consistent ordering
+    // This ensures /dev/ttyACM0 comes before /dev/ttyACM1
+    ports.sort();
+
+    Ok(ports)
+}
+
 /// Linux udev-based USB discovery implementation.
 pub struct LinuxUdevDiscovery {
     // Future: Add state fields if needed for monitoring
@@ -85,28 +140,19 @@ impl LinuxUdevDiscovery {
         let serial_number = device
             .attribute_value("serial")
             .and_then(|v| v.to_str())
-            .map(|s| s.to_string());
+            .map(|s| s.trim().to_string());
 
-        // Extract manufacturer string (optional)
+        // Extract manufacturer string (optional, trim trailing whitespace)
         let manufacturer = device
             .attribute_value("manufacturer")
             .and_then(|v| v.to_str())
-            .map(|s| s.to_string());
+            .map(|s| s.trim().to_string());
 
-        // Extract product string (optional)
+        // Extract product string (optional, trim trailing whitespace)
         let product = device
             .attribute_value("product")
             .and_then(|v| v.to_str())
-            .map(|s| s.to_string());
-
-        trace!(
-            vid = %format!("{:04x}", vid),
-            pid = %format!("{:04x}", pid),
-            serial = ?serial_number,
-            manufacturer = ?manufacturer,
-            product = ?product,
-            "Extracted device properties"
-        );
+            .map(|s| s.trim().to_string());
 
         Ok(DeviceProperties {
             vid,
@@ -117,68 +163,11 @@ impl LinuxUdevDiscovery {
         })
     }
 
-    /// Find serial port devices (tty) associated with this USB device.
-    ///
-    /// Returns an ordered list of device paths (e.g., ["/dev/ttyACM0", "/dev/ttyACM1"]).
-    /// Ports are sorted by device node name for consistent ordering.
-    fn find_serial_ports(&self, device: &udev::Device) -> Result<Vec<String>> {
-        let mut ports = Vec::new();
-
-        // Get the device syspath for matching children
-        let device_syspath = device.syspath();
-
-        // Create an enumerator to find tty devices
-        let mut enumerator = udev::Enumerator::new().map_err(|e| {
-            crate::error::Error::Other(format!("Failed to create enumerator: {}", e))
-        })?;
-
-        // Look for tty subsystem devices
-        enumerator.match_subsystem("tty").map_err(|e| {
-            crate::error::Error::Other(format!("Failed to filter by subsystem: {}", e))
-        })?;
-
-        // Scan all tty devices and check if they're children of our USB device
-        for tty_device in enumerator
-            .scan_devices()
-            .map_err(|e| crate::error::Error::Other(format!("Failed to scan devices: {}", e)))?
-        {
-            // Check if this tty device is a descendant of our USB device
-            // by walking up the parent chain
-            let mut current = Some(tty_device.clone());
-            let mut is_child = false;
-
-            while let Some(dev) = current {
-                if dev.syspath() == device_syspath {
-                    is_child = true;
-                    break;
-                }
-                current = dev.parent();
-            }
-
-            if is_child {
-                // Get the device node (e.g., /dev/ttyACM0)
-                if let Some(devnode) = tty_device.devnode() {
-                    if let Some(path_str) = devnode.to_str() {
-                        trace!(port = path_str, "Found serial port");
-                        ports.push(path_str.to_string());
-                    }
-                }
-            }
-        }
-
-        // Sort ports by name for consistent ordering
-        // This ensures /dev/ttyACM0 comes before /dev/ttyACM1
-        ports.sort();
-
-        trace!(port_count = ports.len(), ports = ?ports, "Serial port discovery complete");
-
-        Ok(ports)
-    }
-
     /// Build a UsbDeviceInfo from a udev device.
     ///
-    /// Combines device properties and associated serial ports into a single
-    /// structure that can be sent to the backplane.
+    /// Extracts basic device properties but does NOT scan for serial ports.
+    /// Serial ports are discovered lazily when UsbDeviceInfo::serial_ports()
+    /// is called, avoiding expensive enumeration for devices that won't be used.
     fn build_device_info(&self, device: &udev::Device) -> Result<UsbDeviceInfo> {
         // Extract basic device properties
         let props = self.extract_device_properties(device)?;
@@ -190,9 +179,6 @@ impl LinuxUdevDiscovery {
             .ok_or_else(|| crate::error::Error::Other("Invalid device path".to_string()))?
             .to_string();
 
-        // Find associated serial ports
-        let serial_ports = self.find_serial_ports(device)?;
-
         Ok(UsbDeviceInfo {
             vid: props.vid,
             pid: props.pid,
@@ -200,14 +186,12 @@ impl LinuxUdevDiscovery {
             manufacturer: props.manufacturer,
             product: props.product,
             device_path,
-            serial_ports,
+            serial_ports: std::sync::OnceLock::new(),
         })
     }
 
     /// Enumerate currently connected USB devices.
     fn enumerate_devices(&self) -> Result<Vec<UsbDeviceInfo>> {
-        debug!("Starting USB device enumeration");
-
         // Create enumerator for USB devices
         let mut enumerator = udev::Enumerator::new().map_err(|e| {
             crate::error::Error::Other(format!("Failed to create enumerator: {}", e))
@@ -232,17 +216,7 @@ impl LinuxUdevDiscovery {
 
             // Try to build device info, skip devices that fail
             match self.build_device_info(&device) {
-                Ok(info) => {
-                    trace!(
-                        vid = %format!("{:04x}", info.vid),
-                        pid = %format!("{:04x}", info.pid),
-                        manufacturer = ?info.manufacturer,
-                        product = ?info.product,
-                        serial_ports = info.serial_ports.len(),
-                        "Enumerated USB device"
-                    );
-                    devices.push(info);
-                }
+                Ok(info) => devices.push(info),
                 Err(e) => {
                     // Log but continue - some USB devices may not have complete info
                     trace!(error = %e, "Skipping device");
@@ -250,7 +224,6 @@ impl LinuxUdevDiscovery {
             }
         }
 
-        debug!(device_count = devices.len(), "USB enumeration complete");
         Ok(devices)
     }
 }
@@ -261,8 +234,6 @@ impl super::UsbDiscoveryImpl for LinuxUdevDiscovery {
         event_tx: mpsc::Sender<crate::transport::TransportEvent>,
         shutdown: CancellationToken,
     ) -> Result<()> {
-        debug!("Starting USB monitoring in dedicated thread");
-
         // Create a single-threaded Tokio runtime for this thread.
         //
         // Why do this? The udev types are !Send (contain raw C pointers), so they
@@ -281,7 +252,6 @@ impl super::UsbDiscoveryImpl for LinuxUdevDiscovery {
         // Run the async monitoring loop on this thread's runtime
         runtime.block_on(async {
             // Initial enumeration - send Connected events for existing devices
-            debug!("Performing initial USB device enumeration");
             for device_info in self.enumerate_devices()? {
                 let usb_event = UsbEvent::UsbDeviceConnected(device_info);
                 let transport_event = TransportEvent::Usb(usb_event);
@@ -291,8 +261,6 @@ impl super::UsbDiscoveryImpl for LinuxUdevDiscovery {
                     return Ok(());
                 }
             }
-
-            debug!("Initial enumeration complete, creating async monitor");
 
             // Create async udev monitor using tokio-udev
             let builder = tokio_udev::MonitorBuilder::new()
@@ -311,8 +279,6 @@ impl super::UsbDiscoveryImpl for LinuxUdevDiscovery {
             let mut monitor = tokio_udev::AsyncMonitorSocket::new(socket).map_err(|e| {
                 crate::error::Error::Other(format!("Failed to create async socket: {}", e))
             })?;
-
-            debug!("USB monitor created, entering event loop");
 
             // Event loop using tokio::select! to wait on both events and shutdown
             // This is clean, safe async code with no manual polling required
@@ -362,7 +328,6 @@ impl super::UsbDiscoveryImpl for LinuxUdevDiscovery {
 
                             tokio_udev::EventType::Remove => {
                                 if let Some(syspath) = device.syspath().to_str() {
-                                    debug!(device_path = syspath, "USB device removed");
                                     Some(UsbEvent::UsbDeviceDisconnected {
                                         device_path: syspath.to_string(),
                                     })
@@ -371,11 +336,8 @@ impl super::UsbDiscoveryImpl for LinuxUdevDiscovery {
                                 }
                             }
 
-                            _ => {
-                                // Ignore other event types (change, bind, unbind, etc.)
-                                trace!(event_type = ?event.event_type(), "Ignoring USB event");
-                                None
-                            }
+                            // Ignore other event types (change, bind, unbind, etc.)
+                            _ => None,
                         };
 
                         // Send the event if we built one
@@ -390,7 +352,6 @@ impl super::UsbDiscoveryImpl for LinuxUdevDiscovery {
 
                     // Wait for shutdown signal
                     _ = shutdown.cancelled() => {
-                        debug!("Shutdown requested, exiting USB monitor");
                         return Ok(());
                     }
                 }

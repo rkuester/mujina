@@ -238,7 +238,7 @@ impl BitaxeBoard {
             })?;
 
         // Set reset high (inactive)
-        tracing::debug!(
+        debug!(
             "De-asserting ASIC reset (GPIO {} = high)",
             Self::ASIC_RESET_PIN
         );
@@ -262,10 +262,6 @@ impl BitaxeBoard {
             })?;
 
         // Hold reset low (active)
-        tracing::debug!(
-            "Holding ASIC in reset (GPIO {} = low)",
-            Self::ASIC_RESET_PIN
-        );
         reset_pin
             .write(PinValue::Low)
             .await
@@ -330,7 +326,7 @@ impl BitaxeBoard {
                             register: bm13xx::Register::ChipId { chip_type, core_count, address }
                         })) => {
                             let chip_id = chip_type.id_bytes();
-                            tracing::info!("Discovered chip {:?} ({:02x}{:02x}) at address {address}",
+                            info!("Discovered chip {:?} ({:02x}{:02x}) at address {address}",
                                          chip_type, chip_id[0], chip_id[1]);
 
                             let chip_info = ChipInfo {
@@ -343,10 +339,10 @@ impl BitaxeBoard {
                             self.chip_infos.push(chip_info);
                         }
                         Some(Ok(_)) => {
-                            tracing::warn!("Unexpected response during chip discovery");
+                            warn!("Unexpected response during chip discovery");
                         }
                         Some(Err(e)) => {
-                            tracing::error!("Error during chip discovery: {e}");
+                            error!("Error during chip discovery: {e}");
                         }
                         None => break,
                     }
@@ -390,7 +386,7 @@ impl BitaxeBoard {
     /// Spawn a task to monitor chip responses and emit events
     fn spawn_event_monitor(&mut self) {
         let Some(event_tx) = self.event_tx.clone() else {
-            tracing::error!("Cannot spawn event monitor without event channel");
+            error!("Cannot spawn event monitor without event channel");
             return;
         };
 
@@ -434,11 +430,11 @@ impl BitaxeBoard {
                                     .await
                                     .is_err()
                                 {
-                                    tracing::error!("Failed to send nonce event, receiver dropped");
+                                    error!("Failed to send nonce event, receiver dropped");
                                     break;
                                 }
 
-                                tracing::debug!(
+                                debug!(
                                     "Nonce found: job_id={}, nonce=0x{:08x}, core={}, version=0x{:04x}",
                                     job_id, nonce, core_id, version
                                 );
@@ -448,16 +444,12 @@ impl BitaxeBoard {
                                 register,
                             } => {
                                 // Log register reads but don't emit events for them
-                                tracing::trace!(
-                                    "Register read from chip {}: {:?}",
-                                    chip_address,
-                                    register
-                                );
+                                trace!("Register read from chip {}: {:?}", chip_address, register);
                             }
                         }
                     }
                     Some(Err(e)) => {
-                        tracing::error!("Error decoding response: {}", e);
+                        error!("Error decoding response: {}", e);
 
                         // Send chip error event
                         if event_tx
@@ -472,13 +464,13 @@ impl BitaxeBoard {
                         }
                     }
                     None => {
-                        tracing::error!("Data stream closed unexpectedly");
+                        error!("Data stream closed unexpectedly");
                         break;
                     }
                 }
             }
 
-            tracing::info!("Event monitor task exiting");
+            info!("Event monitor task exiting");
         });
 
         // Spawn job completion timer outside the main monitoring task
@@ -587,7 +579,7 @@ impl BitaxeBoard {
             if let Some(config) = Self::calculate_pll_for_frequency(current) {
                 configs.push(config);
             } else {
-                tracing::warn!("Failed to calculate PLL for {:.2} MHz, skipping", current);
+                warn!("Failed to calculate PLL for {:.2} MHz, skipping", current);
             }
 
             current += step_mhz;
@@ -822,12 +814,11 @@ impl Board for BitaxeBoard {
 
     async fn initialize(&mut self) -> Result<mpsc::Receiver<BoardEvent>, BoardError> {
         // Phase 1: Hold ASIC in reset during power configuration
-        tracing::info!("Holding ASIC in reset during power initialization");
+        debug!("Holding ASIC in reset during power initialization");
         self.hold_in_reset().await?;
 
         // Phase 2: Initialize power controller while ASIC is in reset
         // This ensures stable core voltage before chip operation
-        tracing::info!("Initializing power management");
 
         // Set I2C bus frequency to 100kHz for all devices
         self.i2c.set_frequency(100_000).await.map_err(|e| {
@@ -844,22 +835,22 @@ impl Board for BitaxeBoard {
         tokio::time::sleep(Duration::from_millis(500)).await;
 
         // Phase 3: Release ASIC from reset now that power is stable
-        tracing::info!("Releasing ASIC from reset");
+        debug!("Releasing ASIC from reset");
         self.release_reset().await?;
 
         // Give ASIC time to stabilize after reset release
         tokio::time::sleep(Duration::from_millis(200)).await;
 
         // Phase 4: Initial communication at 115200 baud
-        tracing::info!("Starting chip initialization at 115200 baud");
+        debug!("Starting chip initialization at 115200 baud");
 
         // Step 1: Version Mask Configuration (Enable 11-bit responses)
         // The very first commands sent are to configure the version mask.
         // This MUST be done before chip discovery to enable 11-bit response frames.
         // Send 3 times as per reference implementation
-        tracing::debug!("Sending version mask configuration (3 times)");
+        debug!("Sending version mask configuration (3 times)");
         for i in 1..=3 {
-            tracing::trace!("Version mask send {}/3", i);
+            trace!("Version mask send {}/3", i);
             let version_cmd = Command::WriteRegister {
                 broadcast: true, // Broadcast to all chips
                 chip_address: 0x00,
@@ -877,7 +868,7 @@ impl Board for BitaxeBoard {
         // Step 2: Chip Discovery
         self.discover_chips().await?;
 
-        tracing::info!("Discovered {} chip(s)", self.chip_infos.len());
+        debug!("Discovered {} chip(s)", self.chip_infos.len());
 
         // Verify expected BM1370 chip was found
         if let Some(first_chip) = self.chip_infos.first() {
@@ -888,15 +879,15 @@ impl Board for BitaxeBoard {
                     first_chip.chip_id[0], first_chip.chip_id[1]
                 )));
             }
-            tracing::debug!("Found expected BM1370 chip");
+            debug!("Found expected BM1370 chip");
         }
 
         // Step 3: Pre-Configuration (after 1-second pause per reference)
-        tracing::info!("Waiting 1 second before configuration...");
+        debug!("Waiting 1 second before configuration...");
         tokio::time::sleep(Duration::from_secs(1)).await;
 
         // Send version mask again
-        tracing::debug!("Sending version mask again after discovery");
+        debug!("Sending version mask again after discovery");
         let version_cmd = Command::WriteRegister {
             broadcast: true,
             chip_address: 0x00,
@@ -935,7 +926,7 @@ impl Board for BitaxeBoard {
 
         // BM1370 requires additional initialization after chip discovery
         // Step 4: Core Configuration (Broadcast)
-        tracing::debug!("Sending broadcast core configuration");
+        debug!("Sending broadcast core configuration");
 
         // CoreRegister = 0x8B0080 (sent as big-endian: 0x80 0x00 0x8B 0x00)
         let core_reg_cmd1 = Command::WriteRegister {
@@ -982,7 +973,7 @@ impl Board for BitaxeBoard {
         self.send_config_command(io_strength_cmd).await?;
 
         // Step 5: Chip-Specific Configuration (addr=0x00)
-        tracing::debug!("Sending chip-specific configuration for address 0x00");
+        debug!("Sending chip-specific configuration for address 0x00");
 
         // InitControl = 0xF0010700 (chip-specific, not broadcast)
         let init_control_specific = Command::WriteRegister {
@@ -1035,7 +1026,7 @@ impl Board for BitaxeBoard {
         self.send_config_command(core_reg_specific3).await?;
 
         // Step 6: Additional Settings
-        tracing::debug!("Sending additional settings");
+        debug!("Sending additional settings");
 
         // MiscSettings = 0x80440000 (bytes: 00 00 44 80)
         let misc_b9_cmd = Command::WriteRegister {
@@ -1080,7 +1071,7 @@ impl Board for BitaxeBoard {
         // Step 7: Frequency Ramping (56.25 MHz → 525 MHz)
         // The frequency is ramped up gradually through many steps
         // Following esp-miner's approach: 6.25 MHz steps with 100ms delays
-        tracing::info!("Starting frequency ramping from 56.25 MHz to 525 MHz");
+        debug!("Starting frequency ramping from 56.25 MHz to 525 MHz");
         let frequency_steps = Self::generate_frequency_ramp_steps(56.25, 525.0, 6.25);
 
         for (i, pll_config) in frequency_steps.iter().enumerate() {
@@ -1095,11 +1086,11 @@ impl Board for BitaxeBoard {
             tokio::time::sleep(Duration::from_millis(100)).await;
 
             if i % 10 == 0 || i == frequency_steps.len() - 1 {
-                tracing::trace!("Frequency ramp step {}/{}", i + 1, frequency_steps.len());
+                trace!("Frequency ramp step {}/{}", i + 1, frequency_steps.len());
             }
         }
 
-        tracing::info!("Frequency ramping complete");
+        debug!("Frequency ramping complete");
 
         // Step 8: Final Configuration
         // After frequency ramping is complete
@@ -1122,11 +1113,11 @@ impl Board for BitaxeBoard {
         // requests, so bitaxe-raw firmware never changes UART baud rate. Need to either:
         // 1. Use rusb to send SET_LINE_CODING directly, or
         // 2. Implement a bitaxe-raw control channel command for baud rate changes
-        tracing::info!("Skipping baud rate change, staying at 115200");
+        warn!("Skipping baud rate change, staying at 115200");
 
         // Step 9: Version Mask Re-Send (final)
         // After all configuration, send version mask once more
-        tracing::debug!("Sending final version mask configuration");
+        debug!("Sending final version mask configuration");
         let version_cmd_final = Command::WriteRegister {
             broadcast: true,
             chip_address: 0x00,
@@ -1137,7 +1128,7 @@ impl Board for BitaxeBoard {
         self.send_config_command(version_cmd_final).await?;
 
         // Allow PLL and chip configuration to settle before sending jobs
-        tracing::debug!("Waiting for chip configuration to settle");
+        debug!("Waiting for chip configuration to settle");
         tokio::time::sleep(Duration::from_millis(150)).await;
 
         // Create event channel
@@ -1180,7 +1171,7 @@ impl Board for BitaxeBoard {
             .await
             .map_err(BoardError::Communication)?;
 
-        tracing::info!(
+        debug!(
             job_id = job.job_id,
             chip_count = self.chip_infos.len(),
             chip_job_id = self.next_job_id,
@@ -1228,14 +1219,14 @@ impl Board for BitaxeBoard {
     }
 
     async fn shutdown(&mut self) -> Result<(), BoardError> {
-        tracing::info!("Shutting down Bitaxe board");
+        info!("Shutting down Bitaxe board");
 
         // Signal hash threads to shut down gracefully
         if let Some(ref tx) = self.thread_shutdown {
             if let Err(e) = tx.send(ThreadRemovalSignal::Shutdown) {
                 warn!("Failed to send shutdown signal to threads: {}", e);
             } else {
-                tracing::debug!("Sent shutdown signal to hash threads");
+                debug!("Sent shutdown signal to hash threads");
                 // Give threads time to exit gracefully
                 tokio::time::sleep(Duration::from_millis(200)).await;
             }
@@ -1264,7 +1255,7 @@ impl Board for BitaxeBoard {
             handle.abort();
         }
 
-        tracing::info!("Bitaxe board shutdown complete");
+        info!("Bitaxe board shutdown complete");
         Ok(())
     }
 
@@ -1293,7 +1284,7 @@ impl Board for BitaxeBoard {
         // Create BM13xxThread with the streams
         let thread = BM13xxThread::new(data_reader, data_writer, removal_rx);
 
-        tracing::info!("Created BM13xx hash thread from BitaxeBoard");
+        info!("Created BM13xx hash thread from BitaxeBoard");
 
         Ok(vec![Box::new(thread)])
     }
@@ -1305,25 +1296,29 @@ async fn create_from_usb(
 ) -> crate::error::Result<Box<dyn Board + Send>> {
     use tokio_serial::SerialPortBuilderExt;
 
+    // Get serial ports
+    let serial_ports = device.serial_ports()?;
+
     // Bitaxe Gamma requires exactly 2 serial ports
-    if device.serial_ports.len() != 2 {
+    if serial_ports.len() != 2 {
         return Err(crate::error::Error::Hardware(format!(
             "Bitaxe Gamma requires exactly 2 serial ports, found {}",
-            device.serial_ports.len()
+            serial_ports.len()
         )));
     }
 
-    tracing::info!(
-        "Opening Bitaxe Gamma serial ports: control={}, data={}",
-        device.serial_ports[0],
-        device.serial_ports[1]
+    debug!(
+        serial = ?device.serial_number,
+        control = %serial_ports[0],
+        data = %serial_ports[1],
+        "Opening Bitaxe Gamma serial ports"
     );
 
     // Open control port at 115200 baud
-    let control_port = tokio_serial::new(&device.serial_ports[0], 115200).open_native_async()?;
+    let control_port = tokio_serial::new(&serial_ports[0], 115200).open_native_async()?;
 
     // Create the board with the control port and data port path
-    let mut board = BitaxeBoard::new(control_port, &device.serial_ports[1])
+    let mut board = BitaxeBoard::new(control_port, &serial_ports[1])
         .map_err(|e| crate::error::Error::Hardware(format!("Failed to create board: {}", e)))?;
 
     // Initialize the board (reset, discover chips, start event monitoring)
@@ -1334,7 +1329,7 @@ async fn create_from_usb(
 
     // Event receiver is retrieved by the scheduler using take_event_receiver()
 
-    tracing::info!(
+    info!(
         "Bitaxe board initialized successfully with {} chips",
         board.chip_count()
     );

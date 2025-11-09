@@ -113,17 +113,22 @@ impl Board for EmberOne {
 
 // Factory function to create EmberOne board from USB device info
 async fn create_from_usb(device: UsbDeviceInfo) -> crate::error::Result<Box<dyn Board + Send>> {
+    // Get serial ports
+    let serial_ports = device.serial_ports()?;
+
     // EmberOne uses 2 serial ports like Bitaxe (control + data)
-    if device.serial_ports.len() != 2 {
+    if serial_ports.len() != 2 {
         tracing::warn!(
             expected = 2,
-            found = device.serial_ports.len(),
+            found = serial_ports.len(),
+            serial = ?device.serial_number,
             "EmberOne expected 2 serial ports, creating stub anyway"
         );
     } else {
         tracing::debug!(
-            control = %device.serial_ports[0],
-            data = %device.serial_ports[1],
+            serial = ?device.serial_number,
+            control = %serial_ports[0],
+            data = %serial_ports[1],
             "EmberOne serial ports"
         );
     }
@@ -155,15 +160,14 @@ mod tests {
 
     #[test]
     fn test_board_creation() {
-        let device = UsbDeviceInfo {
-            vid: 0xc0de,
-            pid: 0xcafe,
-            serial_number: Some("TEST001".to_string()),
-            manufacturer: Some("EmberOne".to_string()),
-            product: Some("Mining Board".to_string()),
-            device_path: "/sys/devices/test".to_string(),
-            serial_ports: vec!["/dev/ttyACM0".to_string(), "/dev/ttyACM1".to_string()],
-        };
+        let device = UsbDeviceInfo::new_for_test(
+            0xc0de,
+            0xcafe,
+            Some("TEST001".to_string()),
+            Some("EmberOne".to_string()),
+            Some("Mining Board".to_string()),
+            "/sys/devices/test".to_string(),
+        );
 
         let board = EmberOne::new(device);
         assert!(board.is_ok());
