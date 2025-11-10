@@ -85,7 +85,7 @@ impl Backplane {
 
                 match board.shutdown().await {
                     Ok(()) => {
-                        info!(board = %model, serial = %board_id, "Board shutdown complete");
+                        debug!(board = %model, serial = %board_id, "Board shutdown complete");
                     }
                     Err(e) => {
                         error!(
@@ -175,7 +175,7 @@ impl Backplane {
                             board = %board_info.model,
                             serial = %board_id,
                             error = %e,
-                            "Failed to create hash threads"
+                            "Failed to initialize board"
                         );
                     }
                 }

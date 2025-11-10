@@ -339,7 +339,7 @@ impl BitaxeBoard {
                             register: bm13xx::Register::ChipId { chip_type, core_count, address }
                         })) => {
                             let chip_id = chip_type.id_bytes();
-                            info!("Discovered chip {:?} ({:02x}{:02x}) at address {address}",
+                            debug!("Discovered chip {:?} ({:02x}{:02x}) at address {address}",
                                          chip_type, chip_id[0], chip_id[1]);
 
                             let chip_info = ChipInfo {
@@ -406,8 +406,6 @@ impl BitaxeBoard {
         // Initialize the TPS546
         match tps546.init().await {
             Ok(()) => {
-                info!("TPS546D24A power controller initialized");
-
                 // Delay before setting voltage
                 tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
@@ -415,14 +413,14 @@ impl BitaxeBoard {
                 const DEFAULT_VOUT: f32 = 1.2;
                 match tps546.set_vout(DEFAULT_VOUT).await {
                     Ok(()) => {
-                        info!("Core voltage set to {DEFAULT_VOUT}V");
+                        debug!("Core voltage set to {DEFAULT_VOUT}V");
 
                         // Wait for voltage to stabilize
                         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
                         // Verify voltage
                         match tps546.get_vout().await {
-                            Ok(mv) => info!("Core voltage readback: {:.3}V", mv as f32 / 1000.0),
+                            Ok(mv) => debug!("Core voltage readback: {:.3}V", mv as f32 / 1000.0),
                             Err(e) => warn!("Failed to read core voltage: {}", e),
                         }
 
@@ -462,8 +460,6 @@ impl BitaxeBoard {
         // Initialize the EMC2101
         match fan.init().await {
             Ok(()) => {
-                info!("EMC2101 fan controller initialized");
-
                 // Set fan to full speed until closed-loop control is implemented
                 const FULL_SPEED: u8 = 100;
                 if let Err(e) = fan.set_pwm_percent(FULL_SPEED).await {
@@ -709,8 +705,16 @@ impl BitaxeBoard {
                 }
 
                 info!(
-                    "Board stats - Chips: {}, ASIC: {}, Fan: {} ({}), VR: {}, Power: {} @ {} (Vin: {}, Vout: {})",
-                    chip_count, temp, fan_pwm, fan_rpm, vr_temp, power_w, iout, vin, vout
+                    chip_count,
+                    asic_temp = %temp,
+                    fan_pwm = %fan_pwm,
+                    fan_rpm = %fan_rpm,
+                    vr_temp = %vr_temp,
+                    power = %power_w,
+                    current = %iout,
+                    vin = %vin,
+                    vout = %vout,
+                    "Board stats"
                 );
             }
         });
@@ -743,7 +747,7 @@ impl Board for BitaxeBoard {
         self.asic_nrst = Some(reset_pin);
 
         // Phase 1: Hold ASIC in reset during power configuration
-        debug!("Holding ASIC in reset during power initialization");
+        trace!("Holding ASIC in reset during power initialization");
         self.hold_in_reset().await?;
 
         // Phase 2: Initialize power controller while ASIC is in reset
@@ -781,7 +785,7 @@ impl Board for BitaxeBoard {
 
         self.discover_chips().await?;
 
-        debug!("Discovered {} chip(s)", self.chip_infos.len());
+        debug!(count = self.chip_infos.len(), "Discovered chips");
 
         // Verify expected BM1370 chip was found
         if let Some(first_chip) = self.chip_infos.first() {
@@ -792,11 +796,9 @@ impl Board for BitaxeBoard {
                     first_chip.chip_id[0], first_chip.chip_id[1]
                 )));
             }
-            debug!("Found expected BM1370 chip");
         }
 
         // Put chip back in reset
-        debug!("Putting ASIC back in reset");
         self.hold_in_reset().await?;
 
         // Create event channel
@@ -901,7 +903,7 @@ impl Board for BitaxeBoard {
         // Turn off core voltage
         if let Some(ref regulator) = self.regulator {
             match regulator.lock().await.set_vout(0.0).await {
-                Ok(()) => info!("Core voltage turned off"),
+                Ok(()) => debug!("Core voltage turned off"),
                 Err(e) => warn!("Failed to turn off core voltage: {}", e),
             }
         }
@@ -919,7 +921,12 @@ impl Board for BitaxeBoard {
             handle.abort();
         }
 
-        info!("Bitaxe board shutdown complete");
+        let board_info = self.board_info();
+        info!(
+            model = %board_info.model,
+            serial = ?board_info.serial_number,
+            "Board shutdown complete"
+        );
         Ok(())
     }
 
@@ -964,7 +971,7 @@ impl Board for BitaxeBoard {
         // Create BM13xxThread with streams and peripherals
         let thread = BM13xxThread::new(data_reader, data_writer, peripherals, removal_rx);
 
-        info!("Created BM13xx hash thread from BitaxeBoard");
+        debug!("Created BM13xx hash thread from BitaxeBoard");
 
         Ok(vec![Box::new(thread)])
     }
@@ -1009,7 +1016,7 @@ async fn create_from_usb(
 
     // Event receiver is retrieved by the scheduler using take_event_receiver()
 
-    info!(
+    debug!(
         "Bitaxe board initialized successfully with {} chips",
         board.chip_count()
     );

@@ -41,7 +41,7 @@ pub async fn task(
     // Wait for the first set of hash threads from the backplane
     let threads = match thread_rx.recv().await {
         Some(threads) => {
-            info!("Received {} hash thread(s) from backplane", threads.len());
+            debug!("Received {} hash thread(s) from backplane", threads.len());
             threads
         }
         None => return,
@@ -54,7 +54,7 @@ pub async fn task(
         .next()
         .expect("Should have at least one thread");
 
-    info!("Received hash thread from backplane");
+    debug!("Received hash thread from backplane");
 
     // Get the event receiver from the thread
     let mut event_rx = match thread.take_event_receiver() {
@@ -68,7 +68,7 @@ pub async fn task(
     // Create job generator for testing (using difficulty 1 for easy verification)
     let difficulty = 1;
     let _job_generator = JobGenerator::new(difficulty);
-    info!("Created job generator with difficulty {}", difficulty);
+    debug!("Created job generator with difficulty {}", difficulty);
 
     // Track active jobs for nonce verification
     let _active_jobs: HashMap<u64, crate::asic::MiningJob> = HashMap::new();
@@ -81,10 +81,9 @@ pub async fn task(
 
     // TODO: Assign initial work to thread via thread.update_work()
     // For now, thread starts idle - work assignment will be implemented later
-    info!("Thread ready (idle, awaiting work assignment implementation)");
+    debug!("Thread ready (idle, awaiting work assignment implementation)");
 
     // Main scheduler loop
-    info!("Starting mining scheduler");
 
     while !running.is_cancelled() {
         tokio::select! {
@@ -134,18 +133,16 @@ pub async fn task(
 
             // Shutdown
             _ = running.cancelled() => {
-                info!("Scheduler shutdown requested");
+                debug!("Scheduler shutdown requested");
                 break;
             }
         }
     }
 
     // Log final statistics
-    info!("Mining session complete");
     stats.log_summary();
 
-    info!("Scheduler shutdown complete");
-    trace!("Scheduler task stopped.");
+    debug!("Scheduler shutdown complete");
 }
 
 /// Mining statistics tracker
@@ -155,7 +152,6 @@ struct MiningStats {
     invalid_nonces: u64,
     jobs_completed: u64,
     start_time: std::time::Instant,
-    last_log_time: std::time::Instant,
     difficulty: f64,
 }
 
@@ -168,7 +164,7 @@ impl Default for MiningStats {
             invalid_nonces: 0,
             jobs_completed: 0,
             start_time: now,
-            last_log_time: now,
+
             difficulty: 1.0,
         }
     }
@@ -177,76 +173,63 @@ impl Default for MiningStats {
 impl MiningStats {
     fn log_summary(&mut self) {
         let elapsed = self.start_time.elapsed().as_secs_f64();
-        let _interval = self.last_log_time.elapsed().as_secs_f64();
-        self.last_log_time = std::time::Instant::now();
-
-        info!("Mining statistics:");
-        info!("  Uptime: {:.0}s", elapsed);
-        info!("  Difficulty: {}", self.difficulty);
 
         // Theoretical hashrate based on chip specifications
-        // BM1370 has 1280 hash engines, each doing 1 hash per clock cycle
         const TARGET_FREQUENCY_MHZ: f32 = 500.0;
         const BM1370_HASH_ENGINES: f64 = 1280.0;
         let theoretical_hashrate_mhs = TARGET_FREQUENCY_MHZ as f64 * BM1370_HASH_ENGINES;
+
+        let valid_pct = if self.nonces_found > 0 {
+            self.valid_nonces as f64 / self.nonces_found as f64 * 100.0
+        } else {
+            0.0
+        };
+
+        // Basic statistics
         info!(
-            "  Hashrate (theoretical): {:.2} MH/s at {} MHz",
-            theoretical_hashrate_mhs, TARGET_FREQUENCY_MHZ
+            uptime_s = elapsed as u64,
+            difficulty = self.difficulty,
+            theoretical_mhs = format!("{:.2}", theoretical_hashrate_mhs),
+            nonces_found = self.nonces_found,
+            valid = self.valid_nonces,
+            valid_pct = format!("{:.2}", valid_pct),
+            invalid = self.invalid_nonces,
+            jobs_completed = self.jobs_completed,
+            "Mining statistics"
         );
 
-        // Measured hashrate from nonce finding rate
-        // At difficulty D, finding a valid nonce requires searching ~(D × 2^32) hashes on average
-        // This is a Poisson process, so variance is high with small sample sizes
+        // Measured hashrate (if we have data)
         if elapsed > 0.0 && self.valid_nonces > 0 {
             let hashes_per_nonce = self.difficulty * (u32::MAX as f64 + 1.0);
             let estimated_total_hashes = self.valid_nonces as f64 * hashes_per_nonce;
             let measured_hashrate_mhs = (estimated_total_hashes / elapsed) / 1_000_000.0;
-
-            info!(
-                "  Hashrate (measured): {:.2} MH/s from {} valid nonces",
-                measured_hashrate_mhs, self.valid_nonces
-            );
-
-            if self.valid_nonces < 10 {
-                info!("    Note: High variance with <10 nonces, use theoretical hashrate instead");
-            }
-
             let efficiency = (measured_hashrate_mhs / theoretical_hashrate_mhs) * 100.0;
-            info!("  Efficiency: {:.1}%", efficiency);
+
+            debug!(
+                measured_mhs = format!("{:.2}", measured_hashrate_mhs),
+                efficiency_pct = format!("{:.1}", efficiency),
+                sample_size = self.valid_nonces,
+                "Measured hashrate"
+            );
         }
 
-        info!("  Nonces found: {}", self.nonces_found);
-        info!(
-            "  Valid: {} ({:.2}%), Invalid: {}",
-            self.valid_nonces,
-            if self.nonces_found > 0 {
-                self.valid_nonces as f64 / self.nonces_found as f64 * 100.0
-            } else {
-                0.0
-            },
-            self.invalid_nonces
-        );
-        info!("  Jobs completed: {}", self.jobs_completed);
-
-        // Poisson process analysis: expected nonce rate at this hashrate and difficulty
+        // Poisson analysis (if applicable)
         if elapsed > 0.0 && theoretical_hashrate_mhs > 0.0 {
-            // At difficulty D, expected rate = hashrate / (D × 2^32)
             let expected_rate = (theoretical_hashrate_mhs * 1_000_000.0)
-                / (self.difficulty * (u32::MAX as f64 + 1.0)); // nonces per second
+                / (self.difficulty * (u32::MAX as f64 + 1.0));
             let expected_nonces = expected_rate * elapsed;
-            info!(
-                "  Expected ~{:.1} valid nonces in {:.0}s at theoretical hashrate, found {}",
-                expected_nonces, elapsed, self.valid_nonces
-            );
 
-            // For a Poisson process, variance equals mean
             if expected_nonces > 1.0 {
                 let std_dev = expected_nonces.sqrt();
                 let lower = (expected_nonces - 2.0 * std_dev).max(0.0);
                 let upper = expected_nonces + 2.0 * std_dev;
-                info!(
-                    "  95% confidence interval: {:.1} - {:.1} nonces",
-                    lower, upper
+
+                debug!(
+                    expected = format!("{:.1}", expected_nonces),
+                    found = self.valid_nonces,
+                    ci_lower = format!("{:.1}", lower),
+                    ci_upper = format!("{:.1}", upper),
+                    "Poisson analysis (95% CI)"
                 );
             }
         }

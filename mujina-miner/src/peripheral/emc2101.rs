@@ -6,7 +6,10 @@
 //!
 //! Datasheet: <https://www.microchip.com/en-us/product/emc2101>
 
-use crate::hw_trait::{i2c::I2c, HwError, Result};
+use crate::{
+    hw_trait::{i2c::I2c, HwError, Result},
+    tracing::prelude::*,
+};
 
 /// Default I2C address for EMC2101
 pub const DEFAULT_ADDRESS: u8 = 0x4C;
@@ -227,24 +230,23 @@ impl<I: I2c> Emc2101<I> {
             )));
         }
 
-        // Log the detected variant
-        tracing::info!(
-            "Detected EMC2101 variant: MFG=0x{:02X}, Product=0x{:02X}, Rev=0x{:02X}",
-            mfg_id,
-            product_id,
-            revision
+        debug!(
+            mfg_id = format!("{:#04x}", mfg_id),
+            product_id = format!("{:#04x}", product_id),
+            revision = format!("{:#04x}", revision),
+            "Detected EMC2101 variant"
         );
 
         // Read current CONFIG register to preserve other bits
         let mut config = self.read_register(regs::CONFIG).await?;
-        tracing::debug!("Current CONFIG register: 0x{:02X}", config);
+        trace!("Current CONFIG register: 0x{:02X}", config);
 
         // Enable TACH input in CONFIG register
         // Bit 2 = 1: Enable TACH input
         const CONFIG_TACH_ENABLE_BIT: u8 = 0x04;
         config |= CONFIG_TACH_ENABLE_BIT;
         self.write_register(regs::CONFIG, config).await?;
-        tracing::debug!("Updated CONFIG register to: 0x{:02X}", config);
+        trace!("Updated CONFIG register to: 0x{:02X}", config);
 
         // Small delay after enabling TACH for it to stabilize
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
@@ -336,7 +338,7 @@ impl<I: I2c> Emc2101<I> {
         let low = self.read_register(regs::TACH_LOW).await?;
 
         let count = ((high as u16) << 8) | (low as u16);
-        tracing::trace!(
+        trace!(
             "TACH registers: HIGH=0x{:02X}, LOW=0x{:02X}, combined=0x{:04X}",
             high,
             low,

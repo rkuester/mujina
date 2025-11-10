@@ -7,7 +7,7 @@
 
 use anyhow::{bail, Result};
 use thiserror::Error;
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, error, trace, warn};
 
 use super::pmbus::{self, linear11, PmbusCommand, StatusDecoder, VoutMode};
 use crate::hw_trait::I2c;
@@ -428,7 +428,7 @@ impl<I2C: I2c> Tps546<I2C> {
                 pmbus::Operation::OffImmediate.as_u8(),
             )
             .await?;
-            info!("Output voltage turned off");
+            debug!("Output voltage turned off");
         } else {
             // Check voltage range
             if volts < self.config.vout_min || volts > self.config.vout_max {
