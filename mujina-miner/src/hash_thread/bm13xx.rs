@@ -21,7 +21,44 @@ use super::{
 use crate::{
     asic::bm13xx::{self, protocol},
     board::bitaxe::{BitaxePeripherals, ThreadRemovalSignal},
+    tracing::prelude::*,
 };
+
+/// Tracks tasks sent to chip hardware, indexed by chip_job_id.
+///
+/// BM13xx chips use 4-bit job IDs. This tracker maintains snapshots of
+/// HashTasks sent to the chip so we can match nonce responses back to the
+/// correct task context (EN2, ntime, etc.).
+struct ChipJobTracker {
+    tasks: [Option<HashTask>; 16],
+    next_id: u8,
+}
+
+impl ChipJobTracker {
+    fn new() -> Self {
+        Self {
+            tasks: Default::default(),
+            next_id: 0,
+        }
+    }
+
+    fn insert(&mut self, task: HashTask) -> u8 {
+        let chip_job_id = self.next_id;
+        self.tasks[chip_job_id as usize] = Some(task);
+        self.next_id = (self.next_id + 1) % (self.tasks.len() as u8);
+        chip_job_id
+    }
+
+    fn get(&self, chip_job_id: u8) -> Option<&HashTask> {
+        self.tasks
+            .get(chip_job_id as usize)
+            .and_then(|t| t.as_ref())
+    }
+
+    fn clear(&mut self) {
+        self.tasks = Default::default();
+    }
+}
 
 /// Command messages sent from scheduler to thread
 #[derive(Debug)]
@@ -607,7 +644,7 @@ fn calculate_pll_for_frequency(target_freq: f32) -> Option<protocol::PllConfig> 
 /// assigns first work.
 async fn bm13xx_thread_actor<R, W>(
     mut cmd_rx: mpsc::Receiver<ThreadCommand>,
-    evt_tx: mpsc::Sender<HashThreadEvent>,
+    _evt_tx: mpsc::Sender<HashThreadEvent>,
     mut removal_rx: watch::Receiver<ThreadRemovalSignal>,
     status: Arc<RwLock<HashThreadStatus>>,
     mut chip_responses: R,
@@ -618,11 +655,9 @@ async fn bm13xx_thread_actor<R, W>(
     W: Sink<bm13xx::protocol::Command> + Unpin,
     W::Error: std::fmt::Debug,
 {
-    // Chip initialization state
     let mut chip_initialized = false;
-
-    // Thread starts idle (no task)
     let mut current_task: Option<HashTask> = None;
+    let mut chip_jobs = ChipJobTracker::new();
 
     loop {
         tokio::select! {
@@ -634,10 +669,7 @@ async fn bm13xx_thread_actor<R, W>(
                         // False alarm - still running
                     }
                     reason => {
-                        tracing::info!("BM13xx thread removal: {:?}", reason);
-
-                        // Send going offline event
-                        evt_tx.send(HashThreadEvent::GoingOffline).await.ok();
+                        info!(reason = ?reason, "Thread removal signal received");
 
                         // Update status
                         {
@@ -645,7 +677,8 @@ async fn bm13xx_thread_actor<R, W>(
                             s.is_active = false;
                         }
 
-                        break;  // Exit actor loop on any removal reason
+                        // Exit actor loop (channel closure signals removal to scheduler)
+                        break;
                     }
                 }
             }
@@ -654,91 +687,83 @@ async fn bm13xx_thread_actor<R, W>(
             Some(cmd) = cmd_rx.recv() => {
                 match cmd {
                     ThreadCommand::UpdateWork { new_task, response_tx } => {
-                        let job_desc = if let Some(ref old) = current_task {
-                            format!("old={}, new={}", old.job_id, new_task.job_id)
+                        if let Some(ref old) = current_task {
+                            debug!(
+                                old_job = %old.job.template.id,
+                                new_job = %new_task.job.template.id,
+                                "Updating work"
+                            );
                         } else {
-                            format!("from idle, new={}", new_task.job_id)
-                        };
-                        tracing::debug!("BM13xx thread updating work: {}", job_desc);
+                            debug!(new_job = %new_task.job.template.id, "Updating work from idle");
+                        }
 
-                        // Initialize chip on first work assignment
                         if !chip_initialized {
-                            tracing::info!("First work assignment - initializing chip");
+                            info!("First work assignment - initializing chip");
                             if let Err(e) = initialize_chip(&mut chip_commands, &mut peripherals).await {
-                                tracing::error!("Chip initialization failed: {}", e);
+                                error!(error = %e, "Chip initialization failed");
                                 response_tx.send(Err(e)).ok();
                                 continue;
                             }
                             chip_initialized = true;
                         }
 
-                        // Return old task (None if was idle)
                         let old_task = current_task.replace(new_task);
 
-                        // Update status
                         {
                             let mut s = status.write().unwrap();
                             s.is_active = true;
                         }
 
                         response_tx.send(Ok(old_task)).ok();
-
-                        // TODO: Send new job to chips via serial
                     }
 
                     ThreadCommand::ReplaceWork { new_task, response_tx } => {
-                        let job_desc = if let Some(ref old) = current_task {
-                            format!("old={}, new={}", old.job_id, new_task.job_id)
+                        if let Some(ref old) = current_task {
+                            debug!(
+                                old_job = %old.job.template.id,
+                                new_job = %new_task.job.template.id,
+                                "Replacing work"
+                            );
                         } else {
-                            format!("from idle, new={}", new_task.job_id)
-                        };
-                        tracing::debug!("BM13xx thread replacing work: {}", job_desc);
+                            debug!(new_job = %new_task.job.template.id, "Replacing work from idle");
+                        }
 
-                        // Initialize chip on first work assignment
                         if !chip_initialized {
-                            tracing::info!("First work assignment - initializing chip");
+                            info!("First work assignment - initializing chip");
                             if let Err(e) = initialize_chip(&mut chip_commands, &mut peripherals).await {
-                                tracing::error!("Chip initialization failed: {}", e);
+                                error!(error = %e, "Chip initialization failed");
                                 response_tx.send(Err(e)).ok();
                                 continue;
                             }
                             chip_initialized = true;
                         }
 
-                        // Return old task (None if was idle)
                         let old_task = current_task.replace(new_task);
 
-                        // Update status
                         {
                             let mut s = status.write().unwrap();
                             s.is_active = true;
                         }
 
                         response_tx.send(Ok(old_task)).ok();
-
-                        // TODO: Send new job to chips via serial, invalidate old shares
                     }
 
                     ThreadCommand::GoIdle { response_tx } => {
-                        tracing::debug!("BM13xx thread going idle");
+                        debug!("Going idle");
 
-                        // Take current task and go idle
                         let old_task = current_task.take();
 
-                        // Update status
                         {
                             let mut s = status.write().unwrap();
-                            s.is_active = false;  // Now idle
+                            s.is_active = false;
                         }
 
                         response_tx.send(Ok(old_task)).ok();
-
-                        // TODO: Put chips in low power mode
                     }
 
                     ThreadCommand::Shutdown => {
-                        tracing::info!("BM13xx thread shutting down");
-                        evt_tx.send(HashThreadEvent::GoingOffline).await.ok();
+                        info!("Shutdown command received");
+                        // Exit actor loop (channel closure signals shutdown to scheduler)
                         break;
                     }
                 }
@@ -845,7 +870,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_removal_signal_triggers_going_offline() {
+    async fn test_removal_signal_closes_channel() {
         let (removal_tx, removal_rx) = watch::channel(ThreadRemovalSignal::Running);
         let mut thread = BM13xxThread::new(
             mock_response_stream(vec![]),
@@ -862,13 +887,15 @@ mod tests {
             .send(ThreadRemovalSignal::BoardDisconnected)
             .unwrap();
 
-        // Should receive GoingOffline event
-        let event = tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
+        // Channel should close (recv returns None)
+        let result = tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
             .await
-            .expect("timeout waiting for event")
-            .expect("event channel closed");
+            .expect("timeout waiting for channel closure");
 
-        matches!(event, HashThreadEvent::GoingOffline);
+        assert!(
+            result.is_none(),
+            "Expected channel closure (None), got event"
+        );
     }
 
     #[tokio::test]

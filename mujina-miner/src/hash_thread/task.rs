@@ -1,137 +1,68 @@
 //! HashTask and Share types for work assignment and result reporting.
-//!
-//! These are minimal stubs for now - they'll be expanded as the scheduler
-//! and job source infrastructure develops.
+
+use std::sync::Arc;
+
+use bitcoin::block::Version;
+use bitcoin::BlockHash;
+
+use crate::job_source::{Extranonce2, Extranonce2Range};
+use crate::scheduler::ActiveJob;
 
 /// Work assignment from scheduler to hash thread.
 ///
-/// Represents actual mining work from a job source (pool or dummy). The source
-/// handle determines whether results are submitted (pool) or discarded (dummy).
+/// Represents actual mining work from a job source (pool or dummy). Contains
+/// the job (template + source association), the extranonce2 range allocated
+/// to this thread, and state for resumable work iteration.
 ///
-/// If a thread has no HashTask (None), it's idle (low power, no hashing).
-///
-/// TODO: Expand with full job template, EN2 range, state for resumption, etc.
+/// The scheduler maps jobs back to sources via the ActiveJob. Threads don't
+/// need to know about sources. If a thread has no HashTask (None), it's idle
+/// (low power, no hashing).
 #[derive(Debug, Clone)]
 pub struct HashTask {
-    /// Job identifier for tracking
-    pub job_id: u64,
+    /// Job to work on (template + source association)
+    pub job: Arc<ActiveJob>,
 
-    /// Source ID (0 = dummy/testing, >0 = real pool)
-    /// TODO: Replace with SourceHandle when that's available
-    pub source_id: u64,
-    // Future fields:
-    // pub job: Arc<JobTemplate>,
-    // pub source_handle: SourceHandle,
-    // pub en2_range: Extranonce2Range,
-    // pub state: HashTaskState,
-}
+    /// Extranonce2 range allocated to this thread.
+    ///
+    /// None for header-only mining (Stratum v2). Current HashThread
+    /// implementations require EN2 iteration, so None will cause errors
+    /// until header-only support is added.
+    pub en2_range: Option<Extranonce2Range>,
 
-impl HashTask {
-    /// Create a dummy task (full power, results discarded)
-    pub fn dummy(job_id: u64) -> Self {
-        Self {
-            job_id,
-            source_id: 0, // Dummy source
-        }
-    }
+    /// Extranonce2 value.
+    ///
+    /// When scheduler assigns work: starting EN2.
+    /// When stored as snapshot: the EN2 value that was used.
+    /// None for header-only mining (Stratum v2).
+    pub en2: Option<Extranonce2>,
 
-    /// Create an active task (real pool work)
-    pub fn active(job_id: u64, source_id: u64) -> Self {
-        Self { job_id, source_id }
-    }
-
-    /// Create a stub task for testing (dummy)
-    pub fn stub(job_id: u64) -> Self {
-        Self::dummy(job_id)
-    }
-
-    /// Check if this is a dummy task (source_id == 0)
-    pub fn is_dummy(&self) -> bool {
-        self.source_id == 0
-    }
-
-    /// Check if this is active pool work
-    pub fn is_active(&self) -> bool {
-        self.source_id > 0
-    }
+    /// Current ntime value
+    ///
+    /// May be rolled forward during mining. To start, uses the job's time field.
+    pub ntime: u32,
 }
 
 /// Valid share found by a HashThread.
 ///
-/// The hash has already been calculated and filtered by pool_target.
-/// TODO: Expand with full block header fields, actual hash, etc.
+/// Hash has been computed and verified against the job target. Scheduler uses
+/// the task reference to route shares back to the originating source.
 #[derive(Debug, Clone)]
 pub struct Share {
-    /// Job this share solves
-    pub job_id: u64,
+    /// Task this share solves (contains job template and source mapping)
+    pub task: Arc<HashTask>,
 
     /// Winning nonce
     pub nonce: u32,
-    // Future fields:
-    // pub job: Arc<JobTemplate>,
-    // pub source_handle: SourceHandle,
-    // pub en2: Option<Extranonce2>,
-    // pub version: Version,
-    // pub ntime: u32,
-    // pub hash: BlockHash,
-}
 
-impl Share {
-    /// Create a stub share for testing
-    pub fn stub(job_id: u64, nonce: u32) -> Self {
-        Self { job_id, nonce }
-    }
-}
+    /// Computed block hash
+    pub hash: BlockHash,
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+    /// Version bits
+    pub version: Version,
 
-    #[test]
-    fn test_hash_task_dummy() {
-        let task = HashTask::dummy(42);
-        assert!(task.is_dummy());
-        assert!(!task.is_active());
-        assert_eq!(task.source_id, 0);
-        assert_eq!(task.job_id, 42);
-    }
+    /// Block timestamp
+    pub ntime: u32,
 
-    #[test]
-    fn test_hash_task_active() {
-        let task = HashTask::active(99, 5);
-        assert!(!task.is_dummy());
-        assert!(task.is_active());
-        assert_eq!(task.source_id, 5);
-        assert_eq!(task.job_id, 99);
-    }
-
-    #[test]
-    fn test_hash_task_stub_creation() {
-        let task = HashTask::stub(123);
-        assert_eq!(task.job_id, 123);
-        assert!(task.is_dummy(), "stub tasks are dummy tasks");
-    }
-
-    #[test]
-    fn test_share_stub_creation() {
-        let share = Share::stub(456, 0xdeadbeef);
-        assert_eq!(share.job_id, 456);
-        assert_eq!(share.nonce, 0xdeadbeef);
-    }
-
-    #[test]
-    fn test_hash_task_clone() {
-        let task1 = HashTask::stub(789);
-        let task2 = task1.clone();
-        assert_eq!(task1.job_id, task2.job_id);
-        assert_eq!(task1.source_id, task2.source_id);
-    }
-
-    #[test]
-    fn test_share_clone() {
-        let share1 = Share::stub(100, 200);
-        let share2 = share1.clone();
-        assert_eq!(share1.job_id, share2.job_id);
-        assert_eq!(share1.nonce, share2.nonce);
-    }
+    /// Extranonce2 value used (None in, e.g., header-only mining in Stratum v2)
+    pub extranonce2: Option<Extranonce2>,
 }

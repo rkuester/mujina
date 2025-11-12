@@ -11,11 +11,12 @@ use crate::tracing::prelude::*;
 use crate::{
     backplane::Backplane,
     hash_thread::HashThread,
-    scheduler,
+    job_source::{dummy::DummySource, SourceEvent},
+    scheduler::{self, SourceRegistration},
     transport::{TransportEvent, UsbTransport},
 };
 
-/// The main daemon that coordinates all mining operations.
+/// The main daemon.
 pub struct Daemon {
     shutdown: CancellationToken,
     tracker: TaskTracker,
@@ -35,6 +36,7 @@ impl Daemon {
         // Create channels for component communication
         let (transport_tx, transport_rx) = mpsc::channel::<TransportEvent>(100);
         let (thread_tx, thread_rx) = mpsc::channel::<Vec<Box<dyn HashThread>>>(10);
+        let (source_reg_tx, source_reg_rx) = mpsc::channel::<SourceRegistration>(10);
 
         // Create and start USB transport discovery
         let usb_transport = UsbTransport::new(transport_tx.clone());
@@ -56,14 +58,41 @@ impl Daemon {
                     _ = shutdown.cancelled() => {}
                 }
 
-                // Shutdown all boards regardless of which arm completed
                 backplane.shutdown_all_boards().await;
             }
         });
 
-        // Start the scheduler with thread receiver
-        self.tracker
-            .spawn(scheduler::task(self.shutdown.clone(), thread_rx));
+        // Create and register DummySource
+        let (source_event_tx, source_event_rx) = mpsc::channel::<SourceEvent>(100);
+        let (source_cmd_tx, source_cmd_rx) = mpsc::channel(10);
+
+        let dummy_source = DummySource::new(
+            source_cmd_rx,
+            source_event_tx,
+            self.shutdown.clone(),
+            tokio::time::Duration::from_secs(30),
+        )?;
+
+        source_reg_tx
+            .send(SourceRegistration {
+                name: "dummy".into(),
+                event_rx: source_event_rx,
+                command_tx: source_cmd_tx,
+            })
+            .await?;
+
+        self.tracker.spawn(async move {
+            if let Err(e) = dummy_source.run().await {
+                error!("DummySource error: {}", e);
+            }
+        });
+
+        // Start the scheduler
+        self.tracker.spawn(scheduler::task(
+            self.shutdown.clone(),
+            thread_rx,
+            source_reg_rx,
+        ));
         self.tracker.close();
 
         info!("Started.");

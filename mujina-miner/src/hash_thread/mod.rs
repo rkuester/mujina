@@ -65,6 +65,10 @@ pub struct HashThreadStatus {
 }
 
 /// Events emitted by HashThreads back to the scheduler.
+///
+/// When a thread shuts down (USB unplug, fault, user request, etc.), it closes
+/// its event channel instead of sending an event. The scheduler detects channel
+/// closure and handles thread removal.
 #[derive(Debug)]
 pub enum HashThreadEvent {
     /// Valid share found (already filtered by pool_target)
@@ -84,9 +88,6 @@ pub enum HashThreadEvent {
 
     /// Periodic status update
     StatusUpdate(HashThreadStatus),
-
-    /// Thread going offline (any reason: USB unplug, fault, user request, shutdown)
-    GoingOffline,
 }
 
 /// Error types for HashThread operations.

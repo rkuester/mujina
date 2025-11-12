@@ -18,13 +18,63 @@
 //! functionality is added, after which the functionality is refactored out to
 //! where it belongs.
 
+use slotmap::SlotMap;
 use std::collections::HashMap;
+use std::sync::Arc;
 use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
+use tokio_stream::{StreamExt, StreamMap};
 use tokio_util::sync::CancellationToken;
 
-use crate::hash_thread::{HashThread, HashThreadEvent};
-use crate::job_generator::JobGenerator;
+use crate::hash_thread::{task::HashTask, HashThread, HashThreadEvent};
+use crate::job_source::{JobTemplate, MerkleRootKind, SourceCommand, SourceEvent};
 use crate::tracing::prelude::*;
+
+/// Unique identifier for a job source, assigned by the scheduler.
+pub type SourceId = slotmap::DefaultKey;
+
+/// Unique identifier for a hash thread, assigned by the scheduler.
+pub type ThreadId = slotmap::DefaultKey;
+
+/// Association between a job template and its originating source.
+///
+/// When the scheduler receives a job from a source, it wraps it in ActiveJob
+/// to track the source association. HashTasks reference this via Arc, allowing
+/// shares to be routed back to the correct source without threads needing to
+/// know about sources.
+#[derive(Debug, Clone)]
+pub struct ActiveJob {
+    /// Source that provided this job
+    pub source_id: SourceId,
+
+    /// Job template with block header fields
+    pub template: JobTemplate,
+}
+
+/// Registration message for adding a job source to the scheduler.
+///
+/// The daemon creates sources and sends this message to register them.
+/// The scheduler inserts the source into its SlotMap and begins listening
+/// for events.
+pub struct SourceRegistration {
+    /// Source name for logging
+    pub name: String,
+
+    /// Event receiver for this source (UpdateJob, ReplaceJob, ClearJobs)
+    pub event_rx: mpsc::Receiver<SourceEvent>,
+
+    /// Command sender for this source (SubmitShare, etc.)
+    pub command_tx: mpsc::Sender<SourceCommand>,
+}
+
+/// Internal scheduler tracking for a registered source.
+struct SourceEntry {
+    /// Source name for logging
+    name: String,
+
+    /// Command channel for sending to this source
+    command_tx: mpsc::Sender<SourceCommand>,
+}
 
 // TODO: Future enhancements for frequency ramping:
 // - Make ramp parameters configurable (step size, delay, target)
@@ -33,94 +83,222 @@ use crate::tracing::prelude::*;
 // - Implement adaptive ramping based on chip response
 // - Add rollback on errors during ramp
 
-/// Run the scheduler task, receiving hash threads from the backplane.
+/// Run the scheduler task, receiving hash threads and job sources.
 pub async fn task(
     running: CancellationToken,
     mut thread_rx: mpsc::Receiver<Vec<Box<dyn HashThread>>>,
+    mut source_reg_rx: mpsc::Receiver<SourceRegistration>,
 ) {
+    // Source storage and event multiplexing
+    let mut sources: SlotMap<SourceId, SourceEntry> = SlotMap::new();
+    let mut source_events: StreamMap<SourceId, ReceiverStream<SourceEvent>> = StreamMap::new();
+
+    // Thread storage and event multiplexing
+    let mut threads: SlotMap<ThreadId, Box<dyn HashThread>> = SlotMap::new();
+    let mut thread_events: StreamMap<ThreadId, ReceiverStream<HashThreadEvent>> = StreamMap::new();
+
+    // Track which job each thread is working on
+    let mut thread_assignments: HashMap<ThreadId, Arc<ActiveJob>> = HashMap::new();
+
     // Wait for the first set of hash threads from the backplane
-    let threads = match thread_rx.recv().await {
-        Some(threads) => {
-            debug!("Received {} hash thread(s) from backplane", threads.len());
-            threads
-        }
+    let initial_threads = match thread_rx.recv().await {
+        Some(threads) => threads,
         None => return,
     };
 
-    // Store threads and get their event receivers
-    // For now, we only support one thread (Bitaxe Gamma has 1 chip)
-    let mut thread = threads
-        .into_iter()
-        .next()
-        .expect("Should have at least one thread");
+    if initial_threads.is_empty() {
+        error!("No hash threads received from backplane");
+        return;
+    }
 
-    debug!("Received hash thread from backplane");
+    debug!(
+        "Received {} hash thread(s) from backplane",
+        initial_threads.len()
+    );
 
-    // Get the event receiver from the thread
-    let mut event_rx = match thread.take_event_receiver() {
-        Some(rx) => rx,
-        None => {
-            error!("Thread was not initialized properly - no event receiver available");
-            return;
-        }
-    };
+    // Insert threads into SlotMap and StreamMap
+    for mut thread in initial_threads {
+        let event_rx = thread
+            .take_event_receiver()
+            .expect("Thread missing event receiver");
 
-    // Create job generator for testing (using difficulty 1 for easy verification)
-    let difficulty = 1;
-    let _job_generator = JobGenerator::new(difficulty);
-    debug!("Created job generator with difficulty {}", difficulty);
-
-    // Track active jobs for nonce verification
-    let _active_jobs: HashMap<u64, crate::asic::MiningJob> = HashMap::new();
+        let thread_id = threads.insert(thread);
+        thread_events.insert(thread_id, ReceiverStream::new(event_rx));
+        debug!(thread_id = ?thread_id, "Thread registered");
+    }
 
     // Track mining statistics
-    let mut stats = MiningStats {
-        difficulty: difficulty as f64,
-        ..Default::default()
-    };
+    let mut stats = MiningStats::default();
 
-    // TODO: Assign initial work to thread via thread.update_work()
-    // For now, thread starts idle - work assignment will be implemented later
-    debug!("Thread ready (idle, awaiting work assignment implementation)");
+    debug!("Scheduler ready (awaiting job sources)");
 
     // Main scheduler loop
 
     while !running.is_cancelled() {
         tokio::select! {
-            // Handle hash thread events
-            Some(event) = event_rx.recv() => {
+            // Source registration
+            Some(registration) = source_reg_rx.recv() => {
+                let source_id = sources.insert(SourceEntry {
+                    name: registration.name.clone(),
+                    command_tx: registration.command_tx,
+                });
+                source_events.insert(source_id, ReceiverStream::new(registration.event_rx));
+                debug!(source_id = ?source_id, name = %registration.name, "Source registered");
+            }
+
+            // Source events
+            Some((source_id, event)) = source_events.next() => {
+                let source = sources.get(source_id)
+                    .expect("StreamMap returned invalid source_id");
+
+                // TODO: Factor out common job assignment logic (EN2 extraction, ActiveJob
+                // creation, range splitting, work assignment) into helper function
+                match event {
+                    SourceEvent::UpdateJob(job_template) => {
+                        debug!(
+                            source = %source.name,
+                            job_id = %job_template.id,
+                            "UpdateJob received"
+                        );
+
+                        // Extract EN2 range (only supported for computed merkle roots)
+                        let full_en2_range = match &job_template.merkle_root {
+                            MerkleRootKind::Computed(template) => template.extranonce2_range.clone(),
+                            MerkleRootKind::Fixed(_) => {
+                                error!(job_id = %job_template.id, "Header-only jobs not supported");
+                                continue;
+                            }
+                        };
+
+                        // Create active job with source association
+                        let active_job = Arc::new(ActiveJob {
+                            source_id,
+                            template: job_template,
+                        });
+
+                        // Split EN2 range among all threads
+                        let en2_slices = full_en2_range.split(threads.len())
+                            .expect("Failed to split EN2 range among threads");
+
+                        // Assign work to all threads
+                        for ((thread_id, thread), en2_range) in threads.iter_mut().zip(en2_slices) {
+                            let starting_en2 = en2_range.iter().next();
+
+                            let task = HashTask {
+                                job: active_job.clone(),
+                                en2_range: Some(en2_range),
+                                en2: starting_en2,
+                                ntime: active_job.template.time,
+                            };
+
+                            if let Err(e) = thread.update_work(task).await {
+                                error!(thread_id = ?thread_id, error = %e, "Failed to assign work");
+                            } else {
+                                thread_assignments.insert(thread_id, active_job.clone());
+                            }
+                        }
+                    }
+
+                    SourceEvent::ReplaceJob(job_template) => {
+                        debug!(
+                            source = %source.name,
+                            job_id = %job_template.id,
+                            "ReplaceJob received"
+                        );
+
+                        // Extract EN2 range (only supported for computed merkle roots)
+                        let full_en2_range = match &job_template.merkle_root {
+                            MerkleRootKind::Computed(template) => template.extranonce2_range.clone(),
+                            MerkleRootKind::Fixed(_) => {
+                                error!(job_id = %job_template.id, "Header-only jobs not supported");
+                                continue;
+                            }
+                        };
+
+                        // Create active job with source association
+                        let active_job = Arc::new(ActiveJob {
+                            source_id,
+                            template: job_template,
+                        });
+
+                        // Split EN2 range among all threads
+                        let en2_slices = full_en2_range.split(threads.len())
+                            .expect("Failed to split EN2 range among threads");
+
+                        // Replace work on all threads (old shares invalid)
+                        for ((thread_id, thread), en2_range) in threads.iter_mut().zip(en2_slices) {
+                            let starting_en2 = en2_range.iter().next();
+
+                            let task = HashTask {
+                                job: active_job.clone(),
+                                en2_range: Some(en2_range),
+                                en2: starting_en2,
+                                ntime: active_job.template.time,
+                            };
+
+                            if let Err(e) = thread.replace_work(task).await {
+                                error!(thread_id = ?thread_id, error = %e, "Failed to replace work");
+                            } else {
+                                thread_assignments.insert(thread_id, active_job.clone());
+                            }
+                        }
+                    }
+
+                    SourceEvent::ClearJobs => {
+                        debug!(source = %source.name, "ClearJobs received");
+
+                        let affected_threads: Vec<ThreadId> = thread_assignments
+                            .iter()
+                            .filter(|(_, job)| job.source_id == source_id)
+                            .map(|(tid, _)| *tid)
+                            .collect();
+
+                        for tid in affected_threads {
+                            if let Some(thread) = threads.get_mut(tid) {
+                                if let Err(e) = thread.go_idle().await {
+                                    error!(thread_id = ?tid, error = %e, "Failed to idle thread");
+                                }
+                            }
+                            thread_assignments.remove(&tid);
+                        }
+                    }
+                }
+            }
+
+            // Thread events
+            Some((thread_id, event)) = thread_events.next() => {
                 match event {
                     HashThreadEvent::ShareFound(share) => {
-                        info!("Share found! Job {} nonce {:#x}", share.job_id, share.nonce);
+                        debug!(
+                            thread_id = ?thread_id,
+                            job_id = %share.task.job.template.id,
+                            nonce = format!("{:#x}", share.nonce),
+                            hash = %share.hash,
+                            "Share found"
+                        );
                         stats.nonces_found += 1;
                         stats.valid_nonces += 1;
                         // TODO: Verify share and submit to pool
                     }
 
                     HashThreadEvent::WorkExhausted { en2_searched } => {
-                        info!("Thread exhausted work (searched {} EN2 values)", en2_searched);
+                        info!(thread_id = ?thread_id, en2_searched, "Work exhausted");
                         stats.jobs_completed += 1;
-
-                        // TODO: Assign new work via thread.update_work()
-                        // For now, we don't have work assignment implemented
-                        warn!("Work exhausted but new work assignment not yet implemented");
+                        // TODO: Assign new work to this thread
                     }
 
                     HashThreadEvent::WorkDepletionWarning { estimated_remaining_ms } => {
-                        debug!("Work depletion warning: ~{}ms remaining", estimated_remaining_ms);
+                        debug!(thread_id = ?thread_id, remaining_ms = estimated_remaining_ms, "Work depletion warning");
                         // TODO: Prepare next work assignment
                     }
 
                     HashThreadEvent::StatusUpdate(status) => {
-                        trace!("Thread status: hashrate={:.2} GH/s, active={}",
-                               status.hashrate / 1_000_000_000.0, status.is_active);
-                    }
-
-                    HashThreadEvent::GoingOffline => {
-                        warn!("Hash thread going offline");
-                        // Thread is shutting down (board removed, fault, etc.)
-                        // TODO: Handle thread removal, reassign work to other threads
-                        running.cancel();  // For now, just shut down
+                        trace!(
+                            thread_id = ?thread_id,
+                            hashrate_ghs = format!("{:.2}", status.hashrate / 1_000_000_000.0),
+                            active = status.is_active,
+                            "Thread status"
+                        );
                     }
                 }
             }

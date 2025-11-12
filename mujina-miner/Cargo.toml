@@ -36,6 +36,7 @@ nix = { workspace = true }
 parking_lot = { workspace = true }
 regex = { workspace = true }
 rustix = { workspace = true }
+slotmap = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 tokio-udev = { workspace = true }
