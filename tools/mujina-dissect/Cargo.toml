@@ -40,6 +40,7 @@ hex = "0.4"
 # Protocol parsing
 bytes = "1.7"
 tokio-util = { version = "0.7", features = ["codec"] }
+bitcoin = { workspace = true }
 
 # Logging (optional)
 tracing = "0.1"

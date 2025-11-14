@@ -11,6 +11,7 @@
 //! implementation shared between the dissector and the main miner.
 
 use crate::capture::{BaudRate, Channel, SerialEvent};
+use bitcoin::hashes::Hash;
 use bytes::{Buf, BytesMut};
 use mujina_miner::asic::bm13xx::{
     crc::{crc16, crc5},
@@ -360,8 +361,6 @@ fn parse_bm13xx_command_frame(data: &[u8]) -> Result<Command, ProtocolError> {
         // Parse work frame (JobFull)
         let job_data_len = _length - 4;
         if job_data_len == 82 && data.len() >= 2 + _length {
-            use bitcoin::hashes::Hash;
-
             let job_data_bytes = &data[4..(4 + 82)];
 
             // Extract job_id from job_header (shift right 3 to get 4-bit value)

@@ -841,6 +841,50 @@ pub fn hash_from_wire_bytes(wire_bytes: &[u8; 32]) -> [u8; 32] {
     hash
 }
 
+/// Version rolling field from BM13xx nonce responses.
+///
+/// The chip returns a 16-bit version rolling value that occupies bits 13-28
+/// of the block version when shifted left 13 positions. This value is OR'd
+/// with the base version to produce the final block header version.
+///
+/// Wire format: 2 bytes, big-endian
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VersionRolling(u16);
+
+impl VersionRolling {
+    /// Create from raw u16 value
+    pub fn new(value: u16) -> Self {
+        Self(value)
+    }
+
+    /// Get raw u16 value
+    pub fn value(self) -> u16 {
+        self.0
+    }
+
+    /// Apply this rolling field to a base version to produce the final version.
+    ///
+    /// Shifts the rolling field left 13 bits and OR's with the base version.
+    pub fn apply_to_version(
+        self,
+        base_version: bitcoin::block::Version,
+    ) -> bitcoin::block::Version {
+        let base = base_version.to_consensus();
+        let rolled = base | ((self.0 as i32) << 13);
+        bitcoin::block::Version::from_consensus(rolled)
+    }
+
+    /// Decode from wire bytes (big-endian)
+    pub fn from_wire_bytes(bytes: [u8; 2]) -> Self {
+        Self(u16::from_be_bytes(bytes))
+    }
+
+    /// Encode to wire bytes (big-endian)
+    pub fn to_wire_bytes(self) -> [u8; 2] {
+        self.0.to_be_bytes()
+    }
+}
+
 #[derive(Debug)]
 pub enum Command {
     /// Assign an address to the first unaddressed chip via daisy-chain forwarding
@@ -1108,7 +1152,7 @@ pub enum Response {
         nonce: u32,
         job_id: u8,
         midstate_num: u8,
-        version: u16,
+        version: VersionRolling,
         subcore_id: u8,
     },
 }
@@ -1148,8 +1192,11 @@ impl Response {
                 let nonce = bytes.get_u32_le();
                 let midstate_num = bytes.get_u8();
                 let result_header = bytes.get_u8();
-                // Version rolling field (16 bits to shift left 13 and OR with base version)
-                let version = bytes.get_u16_le();
+
+                // Version rolling field: 2 bytes, big-endian
+                // Occupies bits 13-28 of block version when shifted left 13
+                let version_bytes = [bytes.get_u8(), bytes.get_u8()];
+                let version = VersionRolling::from_wire_bytes(version_bytes);
                 // CRC already consumed
 
                 // Extract job_id and subcore_id from result_header
@@ -2043,8 +2090,8 @@ mod response_tests {
         assert_eq!(job_id, 9);
         assert_eq!(subcore_id, 9);
 
-        // Version: 0xF922
-        assert_eq!(version, 0xf922);
+        // Version: 0xF922 (big-endian bytes [0x22, 0xF9])
+        assert_eq!(version, VersionRolling::new(0x22f9));
 
         // Verify main core extraction
         let main_core = (nonce >> 25) & 0x7f;
@@ -2057,6 +2104,7 @@ mod response_tests {
         let test_cases = vec![
             // RX: AA 55 07 35 CD CF 02 5E 00 2E 96
             // result_header=0x5e: bits[7:4]=5, bits[3:0]=14
+            // version bytes [0x00, 0x2E] big-endian = 0x002E
             (
                 &[
                     0xaa, 0x55, 0x07, 0x35, 0xcd, 0xcf, 0x02, 0x5e, 0x00, 0x2e, 0x96,
@@ -2065,10 +2113,11 @@ mod response_tests {
                 0x02,
                 5,
                 14,
-                0x2e00,
+                VersionRolling::new(0x002e),
             ),
             // RX: AA 55 46 03 32 E7 00 C3 2C 83 99
             // result_header=0xc3: bits[7:4]=12, bits[3:0]=3
+            // version bytes [0x2C, 0x83] big-endian = 0x2C83
             (
                 &[
                     0xaa, 0x55, 0x46, 0x03, 0x32, 0xe7, 0x00, 0xc3, 0x2c, 0x83, 0x99,
@@ -2077,7 +2126,7 @@ mod response_tests {
                 0x00,
                 12,
                 3,
-                0x832c,
+                VersionRolling::new(0x2c83),
             ),
         ];
 
@@ -2349,6 +2398,44 @@ mod response_tests {
             }
             _ => panic!("Expected ReadRegister response"),
         }
+    }
+
+    #[test]
+    fn decode_nonce_response_from_esp_miner_capture() {
+        use crate::asic::bm13xx::test_data::esp_miner_job;
+
+        // Decode nonce response from hardware capture and verify against test data
+        let response =
+            decode_frame(&esp_miner_job::wire_rx::FRAME).expect("Should decode valid frame");
+
+        let Response::Nonce {
+            nonce,
+            job_id,
+            midstate_num,
+            version,
+            subcore_id,
+        } = response
+        else {
+            panic!("Expected nonce response");
+        };
+
+        // Verify all fields match test data
+        assert_eq!(nonce, *esp_miner_job::wire_rx::NONCE);
+        assert_eq!(midstate_num, *esp_miner_job::wire_rx::MIDSTATE_NUM);
+        assert_eq!(job_id, *esp_miner_job::wire_rx::JOB_ID);
+        assert_eq!(subcore_id, *esp_miner_job::wire_rx::SUBCORE_ID);
+        assert_eq!(
+            version,
+            VersionRolling::new(*esp_miner_job::wire_rx::VERSION_ROLLING_FIELD)
+        );
+
+        // Verify version rolling field shifted left 13 matches submit VERSION
+        let version_shifted = (version.value() as u32) << 13;
+        assert_eq!(
+            version_shifted,
+            *esp_miner_job::submit::VERSION,
+            "Version rolling field << 13 should match mining.submit version"
+        );
     }
 }
 
@@ -2802,7 +2889,7 @@ impl BM13xxProtocol {
                 nonce,
                 job_id,
                 midstate_num: _,
-                version,
+                version: _,
                 subcore_id,
             } => {
                 // Extract main core ID from nonce (bits 25-31)
@@ -2813,10 +2900,6 @@ impl BM13xxProtocol {
 
                 // Job ID is already extracted correctly (4 bits)
                 let actual_job_id = job_id as u64;
-
-                // Combine version bits with nonce for version rolling
-                // Version bits come in bits 15:0, need to shift to 28:13
-                let _version_bits = (version as u32) << 13;
 
                 Ok(MiningResult::NonceFound {
                     job_id: actual_job_id,
