@@ -6,6 +6,7 @@
 use super::connection::Connection;
 use super::error::{StratumError, StratumResult};
 use super::messages::{ClientCommand, ClientEvent, JsonRpcMessage, SubmitParams};
+use crate::tracing::prelude::*;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -23,6 +24,14 @@ pub struct PoolConfig {
 
     /// User agent string
     pub user_agent: String,
+
+    /// Suggested starting difficulty
+    ///
+    /// Sent via mining.suggest_difficulty after authorization to request work
+    /// at an appropriate difficulty for the miner's hashrate.
+    ///
+    /// Recommended: ~1 share per 30 seconds
+    pub suggested_difficulty: u64,
 }
 
 impl Default for PoolConfig {
@@ -32,6 +41,7 @@ impl Default for PoolConfig {
             username: String::new(),
             password: String::new(),
             user_agent: "mujina-miner/0.1.0".to_string(),
+            suggested_difficulty: 4096,
         }
     }
 }
@@ -272,6 +282,36 @@ impl StratumV1Client {
         }
     }
 
+    /// Suggest a difficulty to the pool.
+    ///
+    /// Sends `mining.suggest_difficulty` to request work at a specific difficulty.
+    /// This is a hint to the pool; it may or may not honor the suggestion.
+    /// The pool will respond with `mining.set_difficulty` if it accepts.
+    async fn suggest_difficulty(
+        &mut self,
+        conn: &mut Connection,
+        difficulty: u64,
+    ) -> StratumResult<()> {
+        use serde_json::json;
+
+        let response = self
+            .send_request(conn, "mining.suggest_difficulty", json!([difficulty]))
+            .await?;
+
+        // Response is typically true/false, but we don't strictly care
+        // The pool will send mining.set_difficulty if it accepts
+        match response {
+            JsonRpcMessage::Response { result, .. } => {
+                debug!(
+                    accepted = ?result.as_ref().and_then(|v| v.as_bool()),
+                    "Pool responded to difficulty suggestion"
+                );
+                Ok(())
+            }
+            _ => Ok(()), // Ignore unexpected responses
+        }
+    }
+
     /// Submit a share to the pool.
     ///
     /// Sends `mining.submit` and waits for acceptance/rejection. Uses the
@@ -457,6 +497,15 @@ impl StratumV1Client {
         self.authorize(&mut conn).await?;
         info!("Authorized");
 
+        // Suggest difficulty
+        info!(difficulty = %self.config.suggested_difficulty, "Suggesting difficulty to pool");
+        if let Err(e) = self
+            .suggest_difficulty(&mut conn, self.config.suggested_difficulty)
+            .await
+        {
+            warn!(error = %e, "Failed to suggest difficulty (non-fatal)");
+        }
+
         // Main event loop
         loop {
             tokio::select! {
@@ -577,6 +626,7 @@ mod tests {
             username: "bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh.test-mujina".to_string(),
             password: "x".to_string(),
             user_agent: "mujina-miner/0.1.0-test".to_string(),
+            suggested_difficulty: 4096,
         };
 
         let client = StratumV1Client::new(config, event_tx, shutdown.clone());
