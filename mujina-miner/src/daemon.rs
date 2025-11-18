@@ -12,8 +12,9 @@ use crate::{
     api::{self, ApiConfig},
     backplane::Backplane,
     hash_thread::HashThread,
-    job_source::{dummy::DummySource, SourceEvent},
+    job_source::{dummy::DummySource, stratum_v1::StratumV1Source, SourceEvent},
     scheduler::{self, SourceRegistration},
+    stratum_v1::PoolConfig as StratumPoolConfig,
     transport::{TransportEvent, UsbTransport},
 };
 
@@ -63,30 +64,78 @@ impl Daemon {
             }
         });
 
-        // Create and register DummySource
+        // Create job source (Stratum v1 or Dummy)
+        // Controlled by environment variables:
+        // - POOL_URL: Pool address (e.g., stratum+tcp://localhost:3333)
+        // - POOL_USER: Worker username
+        // - POOL_PASS: Worker password (optional, defaults to "x")
         let (source_event_tx, source_event_rx) = mpsc::channel::<SourceEvent>(100);
         let (source_cmd_tx, source_cmd_rx) = mpsc::channel(10);
 
-        let dummy_source = DummySource::new(
-            source_cmd_rx,
-            source_event_tx,
-            self.shutdown.clone(),
-            tokio::time::Duration::from_secs(30),
-        )?;
+        if let Ok(pool_url) = std::env::var("POOL_URL") {
+            // Use Stratum v1 source
+            let pool_user =
+                std::env::var("POOL_USER").unwrap_or_else(|_| "mujina-test-worker".to_string());
+            let pool_pass = std::env::var("POOL_PASS").unwrap_or_else(|_| "x".to_string());
 
-        source_reg_tx
-            .send(SourceRegistration {
-                name: "dummy".into(),
-                event_rx: source_event_rx,
-                command_tx: source_cmd_tx,
-            })
-            .await?;
+            info!(
+                pool = %pool_url,
+                user = %pool_user,
+                "Using Stratum v1 job source"
+            );
 
-        self.tracker.spawn(async move {
-            if let Err(e) = dummy_source.run().await {
-                error!("DummySource error: {}", e);
-            }
-        });
+            let stratum_config = StratumPoolConfig {
+                url: pool_url,
+                username: pool_user,
+                password: pool_pass,
+                user_agent: "mujina-miner/0.1.0".to_string(),
+            };
+
+            let stratum_source = StratumV1Source::new(
+                stratum_config,
+                source_cmd_rx,
+                source_event_tx,
+                self.shutdown.clone(),
+            );
+
+            source_reg_tx
+                .send(SourceRegistration {
+                    name: "stratum-v1".into(),
+                    event_rx: source_event_rx,
+                    command_tx: source_cmd_tx,
+                })
+                .await?;
+
+            self.tracker.spawn(async move {
+                if let Err(e) = stratum_source.run().await {
+                    error!("Stratum v1 source error: {}", e);
+                }
+            });
+        } else {
+            // Use DummySource
+            info!("Using dummy job source (set POOL_URL to use Stratum v1)");
+
+            let dummy_source = DummySource::new(
+                source_cmd_rx,
+                source_event_tx,
+                self.shutdown.clone(),
+                tokio::time::Duration::from_secs(30),
+            )?;
+
+            source_reg_tx
+                .send(SourceRegistration {
+                    name: "dummy".into(),
+                    event_rx: source_event_rx,
+                    command_tx: source_cmd_tx,
+                })
+                .await?;
+
+            self.tracker.spawn(async move {
+                if let Err(e) = dummy_source.run().await {
+                    error!("DummySource error: {}", e);
+                }
+            });
+        }
 
         // Start the scheduler
         self.tracker.spawn(scheduler::task(
