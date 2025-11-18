@@ -45,6 +45,7 @@ mod extranonce2;
 pub(crate) mod job;
 mod merkle;
 mod messages;
+pub mod stratum_v1;
 pub mod test_blocks;
 mod version;
 

@@ -14,6 +14,7 @@ pub mod mgmt_protocol;
 pub mod peripheral;
 pub mod pool;
 pub mod scheduler;
+pub mod stratum_v1;
 pub mod tracing;
 pub mod transport;
 pub mod types;

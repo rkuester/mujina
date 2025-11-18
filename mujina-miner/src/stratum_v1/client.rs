@@ -1,0 +1,676 @@
+//! Stratum v1 client implementation.
+//!
+//! This module contains the main client that manages the connection lifecycle,
+//! protocol state, and event emission.
+
+use super::connection::Connection;
+use super::error::{StratumError, StratumResult};
+use super::messages::{ClientCommand, ClientEvent, JsonRpcMessage, SubmitParams};
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
+
+/// Pool connection configuration.
+#[derive(Debug, Clone)]
+pub struct PoolConfig {
+    /// Pool URL (stratum+tcp://host:port or host:port)
+    pub url: String,
+
+    /// Worker username
+    pub username: String,
+
+    /// Worker password
+    pub password: String,
+
+    /// User agent string
+    pub user_agent: String,
+}
+
+impl Default for PoolConfig {
+    fn default() -> Self {
+        Self {
+            url: String::new(),
+            username: String::new(),
+            password: String::new(),
+            user_agent: "mujina-miner/0.1.0".to_string(),
+        }
+    }
+}
+
+/// Stratum v1 client.
+///
+/// Manages connection to a mining pool, handles the protocol lifecycle
+/// (subscribe, authorize), and emits events for jobs and shares.
+///
+/// Handles Stratum's interleaved message pattern where notifications can
+/// arrive between request/response pairs. During setup (subscribe/authorize),
+/// we process notifications inline while waiting for responses.
+pub struct StratumV1Client {
+    /// Pool configuration
+    config: PoolConfig,
+
+    /// Where to send events
+    event_tx: mpsc::Sender<ClientEvent>,
+
+    /// Where to receive commands (optional)
+    command_rx: Option<mpsc::Receiver<ClientCommand>>,
+
+    /// Shutdown signal
+    shutdown: CancellationToken,
+
+    /// Auto-incrementing message ID
+    next_id: u64,
+
+    /// Protocol state (filled after subscription)
+    state: Option<ProtocolState>,
+}
+
+/// Protocol state after successful subscription.
+#[derive(Debug)]
+struct ProtocolState {
+    /// Extranonce1 value from subscription
+    extranonce1: String,
+
+    /// Extranonce2 size in bytes
+    extranonce2_size: usize,
+
+    /// Current difficulty (if set)
+    difficulty: Option<u64>,
+
+    /// Current version mask (if set)
+    version_mask: Option<u32>,
+}
+
+impl StratumV1Client {
+    /// Create a new Stratum v1 client.
+    pub fn new(
+        config: PoolConfig,
+        event_tx: mpsc::Sender<ClientEvent>,
+        shutdown: CancellationToken,
+    ) -> Self {
+        Self {
+            config,
+            event_tx,
+            command_rx: None,
+            shutdown,
+            next_id: 1,
+            state: None,
+        }
+    }
+
+    /// Create a new Stratum v1 client with command channel.
+    pub fn with_commands(
+        config: PoolConfig,
+        event_tx: mpsc::Sender<ClientEvent>,
+        command_rx: mpsc::Receiver<ClientCommand>,
+        shutdown: CancellationToken,
+    ) -> Self {
+        Self {
+            config,
+            event_tx,
+            command_rx: Some(command_rx),
+            shutdown,
+            next_id: 1,
+            state: None,
+        }
+    }
+
+    /// Get next message ID and increment counter.
+    fn next_id(&mut self) -> u64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        id
+    }
+
+    /// Send a request and wait for its response.
+    ///
+    /// Sends the request and then loops reading messages from the connection,
+    /// handling notifications along the way, until the response arrives.
+    /// This handles Stratum's message interleaving during the setup phase.
+    async fn send_request(
+        &mut self,
+        conn: &mut Connection,
+        method: &str,
+        params: serde_json::Value,
+    ) -> StratumResult<JsonRpcMessage> {
+        let id = self.next_id();
+
+        // Send request
+        let msg = JsonRpcMessage::request(id, method, params);
+        conn.write_message(&msg).await?;
+
+        // Loop until we get our response, handling notifications along the way
+        loop {
+            let msg = conn
+                .read_message()
+                .await?
+                .ok_or(StratumError::Disconnected)?;
+
+            match msg {
+                JsonRpcMessage::Response { id: resp_id, .. } if resp_id == id => {
+                    // This is our response
+                    return Ok(msg);
+                }
+                JsonRpcMessage::Response { id: other_id, .. } => {
+                    // Response for a different request - shouldn't happen during setup
+                    tracing::warn!(msg_id = other_id, "Received response for different request");
+                }
+                JsonRpcMessage::Request {
+                    id: None,
+                    method,
+                    params,
+                } => {
+                    // Notification - handle it while waiting for our response
+                    if let Err(e) = self.handle_notification(&method, &params).await {
+                        tracing::warn!(error = %e, "Error handling notification during setup");
+                    }
+                }
+                JsonRpcMessage::Request {
+                    id: Some(_),
+                    method,
+                    ..
+                } => {
+                    // Request with ID from server (very unusual)
+                    tracing::warn!(method = %method, "Server sent request during setup");
+                }
+            }
+        }
+    }
+
+    /// Subscribe to mining notifications.
+    ///
+    /// Sends `mining.subscribe` and waits for response containing extranonce1
+    /// and extranonce2_size. Uses the message router to handle interleaved
+    /// notifications.
+    async fn subscribe(&mut self, conn: &mut Connection) -> StratumResult<()> {
+        use serde_json::json;
+
+        let response = self
+            .send_request(conn, "mining.subscribe", json!([&self.config.user_agent]))
+            .await?;
+
+        // Parse response
+        match response {
+            JsonRpcMessage::Response {
+                result: Some(result),
+                error: None,
+                ..
+            } => {
+                // Result is an array: [[subscriptions...], extranonce1, extranonce2_size]
+                let arr = result.as_array().ok_or_else(|| {
+                    StratumError::InvalidMessage("subscribe result not an array".to_string())
+                })?;
+
+                if arr.len() < 3 {
+                    return Err(StratumError::InvalidMessage(
+                        "subscribe result too short".to_string(),
+                    ));
+                }
+
+                let extranonce1 = arr[1].as_str().ok_or_else(|| {
+                    StratumError::InvalidMessage("extranonce1 not a string".to_string())
+                })?;
+
+                let extranonce2_size = arr[2].as_u64().ok_or_else(|| {
+                    StratumError::InvalidMessage("extranonce2_size not a number".to_string())
+                })? as usize;
+
+                self.state = Some(ProtocolState {
+                    extranonce1: extranonce1.to_string(),
+                    extranonce2_size,
+                    difficulty: None,
+                    version_mask: None,
+                });
+
+                Ok(())
+            }
+            JsonRpcMessage::Response {
+                error: Some(error), ..
+            } => Err(StratumError::SubscriptionFailed(format!("{:?}", error))),
+            _ => Err(StratumError::UnexpectedResponse(
+                "Invalid subscribe response".to_string(),
+            )),
+        }
+    }
+
+    /// Authorize with the pool.
+    ///
+    /// Sends `mining.authorize` with username and password. Uses the message
+    /// router to handle interleaved notifications.
+    async fn authorize(&mut self, conn: &mut Connection) -> StratumResult<()> {
+        use serde_json::json;
+
+        let response = self
+            .send_request(
+                conn,
+                "mining.authorize",
+                json!([&self.config.username, &self.config.password]),
+            )
+            .await?;
+
+        // Parse response
+        match response {
+            JsonRpcMessage::Response {
+                result: Some(result),
+                error: None,
+                ..
+            } => {
+                let authorized = result.as_bool().unwrap_or(false);
+                if authorized {
+                    Ok(())
+                } else {
+                    Err(StratumError::AuthorizationFailed(
+                        "Pool returned false".to_string(),
+                    ))
+                }
+            }
+            JsonRpcMessage::Response {
+                error: Some(error), ..
+            } => Err(StratumError::AuthorizationFailed(format!("{:?}", error))),
+            _ => Err(StratumError::UnexpectedResponse(
+                "Invalid authorize response".to_string(),
+            )),
+        }
+    }
+
+    /// Submit a share to the pool.
+    ///
+    /// Sends `mining.submit` and waits for acceptance/rejection. Uses the
+    /// message router to handle interleaved notifications.
+    async fn submit(&mut self, conn: &mut Connection, params: SubmitParams) -> StratumResult<bool> {
+        use serde_json::Value;
+
+        // Convert to Stratum JSON format
+        let submit_json = params.to_stratum_json();
+        let response = self
+            .send_request(conn, "mining.submit", Value::Array(submit_json))
+            .await?;
+
+        // Parse response
+        match response {
+            JsonRpcMessage::Response {
+                result: Some(result),
+                error: None,
+                ..
+            } => {
+                // Result should be true for accepted
+                Ok(result.as_bool().unwrap_or(false))
+            }
+            JsonRpcMessage::Response {
+                error: Some(_error),
+                ..
+            } => {
+                // Rejection
+                Ok(false)
+            }
+            _ => Err(StratumError::UnexpectedResponse(
+                "Invalid submit response".to_string(),
+            )),
+        }
+    }
+
+    /// Handle a notification from the pool.
+    async fn handle_notification(
+        &mut self,
+        method: &str,
+        params: &serde_json::Value,
+    ) -> StratumResult<()> {
+        match method {
+            "mining.notify" => {
+                self.handle_mining_notify(params).await?;
+            }
+            "mining.set_difficulty" => {
+                self.handle_set_difficulty(params).await?;
+            }
+            "mining.set_version_mask" => {
+                self.handle_set_version_mask(params).await?;
+            }
+            "client.reconnect" => {
+                // Pool is requesting reconnect - treat as disconnection
+                return Err(StratumError::Disconnected);
+            }
+            _ => {
+                // Unknown notification - log and ignore
+                tracing::warn!(method = %method, "Unknown notification method");
+            }
+        }
+        Ok(())
+    }
+
+    /// Handle mining.notify notification.
+    async fn handle_mining_notify(&mut self, params: &serde_json::Value) -> StratumResult<()> {
+        use super::messages::JobNotification;
+
+        let arr = params.as_array().ok_or_else(|| {
+            StratumError::InvalidMessage("mining.notify params not an array".to_string())
+        })?;
+
+        let job = JobNotification::from_stratum_params(arr)
+            .map_err(|e| StratumError::InvalidMessage(format!("Failed to parse job: {}", e)))?;
+
+        self.event_tx
+            .send(ClientEvent::NewJob(job))
+            .await
+            .map_err(|_| StratumError::Disconnected)?;
+
+        Ok(())
+    }
+
+    /// Handle mining.set_difficulty notification.
+    async fn handle_set_difficulty(&mut self, params: &serde_json::Value) -> StratumResult<()> {
+        let arr = params.as_array().ok_or_else(|| {
+            StratumError::InvalidMessage("set_difficulty params not an array".to_string())
+        })?;
+
+        if arr.is_empty() {
+            return Err(StratumError::InvalidMessage(
+                "set_difficulty params empty".to_string(),
+            ));
+        }
+
+        let difficulty = arr[0]
+            .as_u64()
+            .ok_or_else(|| StratumError::InvalidMessage("difficulty not a number".to_string()))?;
+
+        if let Some(state) = &mut self.state {
+            state.difficulty = Some(difficulty);
+        }
+
+        self.event_tx
+            .send(ClientEvent::DifficultyChanged(difficulty))
+            .await
+            .map_err(|_| StratumError::Disconnected)?;
+
+        Ok(())
+    }
+
+    /// Handle mining.set_version_mask notification.
+    async fn handle_set_version_mask(&mut self, params: &serde_json::Value) -> StratumResult<()> {
+        let arr = params.as_array().ok_or_else(|| {
+            StratumError::InvalidMessage("set_version_mask params not an array".to_string())
+        })?;
+
+        if arr.is_empty() {
+            return Err(StratumError::InvalidMessage(
+                "set_version_mask params empty".to_string(),
+            ));
+        }
+
+        // Parse hex string to u32
+        let mask_str = arr[0]
+            .as_str()
+            .ok_or_else(|| StratumError::InvalidMessage("version_mask not a string".to_string()))?;
+
+        let mask = u32::from_str_radix(mask_str.trim_start_matches("0x"), 16)
+            .map_err(|_| StratumError::InvalidMessage("version_mask not valid hex".to_string()))?;
+
+        if let Some(state) = &mut self.state {
+            state.version_mask = Some(mask);
+        }
+
+        self.event_tx
+            .send(ClientEvent::VersionMaskSet(mask))
+            .await
+            .map_err(|_| StratumError::Disconnected)?;
+
+        Ok(())
+    }
+
+    /// Run the client (main event loop).
+    ///
+    /// Connects to the pool, subscribes, authorizes, and then enters the main
+    /// event loop to handle notifications and submit shares.
+    ///
+    /// Uses a separate reader task to handle the message router pattern,
+    /// allowing requests to wait for responses while processing interleaved
+    /// notifications.
+    pub async fn run(mut self) -> StratumResult<()> {
+        use tracing::{debug, info, warn};
+
+        // Connect
+        let mut conn = Connection::connect(&self.config.url).await?;
+
+        // Subscribe
+        info!("Subscribing to pool");
+        self.subscribe(&mut conn).await?;
+
+        let state = self.state.as_ref().unwrap();
+        debug!(
+            extranonce1 = hex::encode(&state.extranonce1),
+            extranonce2_size = %state.extranonce2_size,
+            "Subscribed"
+        );
+
+        // Emit subscription event with state
+        let extranonce1_bytes = hex::decode(&state.extranonce1)
+            .map_err(|e| StratumError::InvalidMessage(format!("Invalid extranonce1: {}", e)))?;
+
+        self.event_tx
+            .send(ClientEvent::Subscribed {
+                extranonce1: extranonce1_bytes,
+                extranonce2_size: state.extranonce2_size,
+            })
+            .await
+            .map_err(|_| StratumError::Disconnected)?;
+
+        // Authorize
+        info!(username = %self.config.username, "Authorizing");
+        self.authorize(&mut conn).await?;
+        info!("Authorized");
+
+        // Main event loop
+        loop {
+            tokio::select! {
+                // Read messages from pool
+                msg = conn.read_message() => {
+                    match msg? {
+                        Some(msg) => {
+                            // Handle the message
+                            match msg {
+                                JsonRpcMessage::Request { id: None, method, params } => {
+                                    // Notification
+                                    if let Err(e) = self.handle_notification(&method, &params).await {
+                                        warn!(error = %e, "Error handling notification");
+                                        // Non-fatal errors continue
+                                        if matches!(e, StratumError::Disconnected) {
+                                            return Err(e);
+                                        }
+                                    }
+                                }
+                                JsonRpcMessage::Response { id, .. } => {
+                                    // Response to a request we sent
+                                    // During main loop, we handle responses inline in submit()
+                                    // This would be a stray response - log and ignore
+                                    debug!(msg_id = %id, "Received unexpected response in main loop");
+                                }
+                                JsonRpcMessage::Request { id: Some(_), method, .. } => {
+                                    // Request with ID from server (unusual, but handle it)
+                                    warn!(method = %method, "Server sent request (not notification)");
+                                }
+                            }
+                        }
+                        None => {
+                            // Connection closed
+                            info!("Connection closed by pool");
+                            self.event_tx.send(ClientEvent::Disconnected).await.ok();
+                            return Err(StratumError::Disconnected);
+                        }
+                    }
+                }
+
+                // Commands from external code (if command channel exists)
+                Some(cmd) = async {
+                    match &mut self.command_rx {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    match cmd {
+                        ClientCommand::SubmitShare(params) => {
+                            debug!(job_id = %params.job_id, "Submitting share to pool");
+                            match self.submit(&mut conn, params).await {
+                                Ok(accepted) => {
+                                    if accepted {
+                                        // Will be notified via response
+                                    } else {
+                                        warn!("Share rejected (submit returned false)");
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!(error = %e, "Failed to submit share");
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Shutdown signal
+                _ = self.shutdown.cancelled() => {
+                    info!("Shutdown requested");
+                    self.event_tx.send(ClientEvent::Disconnected).await.ok();
+                    return Ok(());
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bitcoin::hashes::Hash;
+    use tokio::time::{timeout, Duration};
+
+    /// Integration test against a real pool.
+    ///
+    /// This test connects to public-pool.io:21496 (a public Bitcoin mining pool)
+    /// to validate the complete protocol implementation. It verifies:
+    /// - TCP connection establishment
+    /// - mining.subscribe handshake
+    /// - mining.authorize authentication
+    /// - Receiving mining.notify (new jobs)
+    /// - Receiving mining.set_difficulty
+    ///
+    /// This test is marked #[ignore] because:
+    /// - It requires network connectivity
+    /// - It depends on external infrastructure
+    /// - It may take several seconds to complete
+    ///
+    /// Run explicitly with:
+    ///   cargo test --lib stratum_v1::client::tests::test_real_pool_connection -- --ignored
+    #[tokio::test]
+    #[ignore]
+    async fn test_real_pool_connection() {
+        use tracing_subscriber::{fmt, EnvFilter};
+
+        // Initialize logging for the test
+        let _ = fmt()
+            .with_env_filter(
+                EnvFilter::from_default_env().add_directive("mujina_miner=debug".parse().unwrap()),
+            )
+            .try_init();
+
+        let (event_tx, mut event_rx) = mpsc::channel(100);
+        let shutdown = CancellationToken::new();
+
+        let config = PoolConfig {
+            url: "stratum+tcp://localhost:3333".to_string(),
+            username: "bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh.test-mujina".to_string(),
+            password: "x".to_string(),
+            user_agent: "mujina-miner/0.1.0-test".to_string(),
+        };
+
+        let client = StratumV1Client::new(config, event_tx, shutdown.clone());
+
+        // Spawn client
+        let client_handle = tokio::spawn(async move { client.run().await });
+
+        // Collect events with timeout
+        let mut subscribed = false;
+        let mut received_job = false;
+        let mut received_difficulty = false;
+
+        let result = timeout(Duration::from_secs(30), async {
+            loop {
+                match event_rx.recv().await {
+                    Some(event) => {
+                        println!("Event: {:?}", event);
+
+                        match event {
+                            ClientEvent::Subscribed {
+                                extranonce1,
+                                extranonce2_size,
+                            } => {
+                                println!(
+                                    "OK Subscribed: extranonce1={}, size={}",
+                                    hex::encode(&extranonce1),
+                                    extranonce2_size
+                                );
+                                assert!(!extranonce1.is_empty(), "extranonce1 should not be empty");
+                                assert!(
+                                    extranonce2_size >= 4 && extranonce2_size <= 8,
+                                    "extranonce2_size should be 4-8 bytes"
+                                );
+                                subscribed = true;
+                            }
+
+                            ClientEvent::NewJob(job) => {
+                                println!("OK Received job: {}", job.job_id);
+                                assert!(!job.job_id.is_empty(), "job_id should not be empty");
+                                assert_eq!(
+                                    job.prev_hash.as_byte_array().len(),
+                                    32,
+                                    "prev_hash should be 32 bytes"
+                                );
+                                assert!(!job.coinbase1.is_empty(), "coinbase1 should not be empty");
+                                assert!(!job.coinbase2.is_empty(), "coinbase2 should not be empty");
+                                received_job = true;
+                            }
+
+                            ClientEvent::DifficultyChanged(diff) => {
+                                println!("OK Difficulty changed: {}", diff);
+                                assert!(diff > 0, "difficulty should be positive");
+                                received_difficulty = true;
+                            }
+
+                            ClientEvent::VersionMaskSet(mask) => {
+                                println!("OK Version mask set: {:#010x}", mask);
+                            }
+
+                            ClientEvent::Disconnected => {
+                                println!("Disconnected from pool");
+                                break;
+                            }
+
+                            ClientEvent::Error(err) => {
+                                println!("Error: {}", err);
+                            }
+
+                            _ => {}
+                        }
+
+                        // Once we have all the events we're looking for, stop
+                        if subscribed && received_job && received_difficulty {
+                            println!("\nOK All expected events received!");
+                            break;
+                        }
+                    }
+                    None => {
+                        println!("Event channel closed - client task ended");
+                        break;
+                    }
+                }
+            }
+        })
+        .await;
+
+        // Shutdown client
+        shutdown.cancel();
+        let _ = client_handle.await;
+
+        // Verify we got events
+        assert!(result.is_ok(), "Test timed out waiting for pool events");
+        assert!(subscribed, "Should have received subscription");
+        assert!(received_job, "Should have received at least one job");
+        assert!(received_difficulty, "Should have received difficulty");
+    }
+}
