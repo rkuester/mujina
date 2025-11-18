@@ -75,7 +75,7 @@ impl Daemon {
         if let Ok(pool_url) = std::env::var("POOL_URL") {
             // Use Stratum v1 source
             let pool_user =
-                std::env::var("POOL_USER").unwrap_or_else(|_| "mujina-test-worker".to_string());
+                std::env::var("POOL_USER").unwrap_or_else(|_| "mujina-testing".to_string());
             let pool_pass = std::env::var("POOL_PASS").unwrap_or_else(|_| "x".to_string());
 
             info!(
@@ -88,7 +88,7 @@ impl Daemon {
                 url: pool_url,
                 username: pool_user,
                 password: pool_pass,
-                user_agent: "mujina-miner/0.1.0".to_string(),
+                user_agent: "mujina-miner/0.1.0-alpha".to_string(),
                 suggested_difficulty: 1024,
             };
 

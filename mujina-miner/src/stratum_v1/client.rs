@@ -40,8 +40,8 @@ impl Default for PoolConfig {
             url: String::new(),
             username: String::new(),
             password: String::new(),
-            user_agent: "mujina-miner/0.1.0".to_string(),
-            suggested_difficulty: 4096,
+            user_agent: "mujina-miner/0.1.0-alpha".to_string(),
+            suggested_difficulty: 2048,
         }
     }
 }
@@ -301,9 +301,9 @@ impl StratumV1Client {
 
     /// Suggest a difficulty to the pool.
     ///
-    /// Sends `mining.suggest_difficulty` to request work at a specific difficulty.
-    /// This is a hint to the pool; it may or may not honor the suggestion.
-    /// The pool will respond with `mining.set_difficulty` if it accepts.
+    /// Sends `mining.suggest_difficulty` as a JSON-RPC notification (no id)
+    /// to request work at a specific difficulty. The pool responds with a
+    /// `mining.set_difficulty` notification if it accepts the suggestion.
     async fn suggest_difficulty(
         &mut self,
         conn: &mut Connection,
@@ -311,22 +311,11 @@ impl StratumV1Client {
     ) -> StratumResult<()> {
         use serde_json::json;
 
-        let response = self
-            .send_request(conn, "mining.suggest_difficulty", json!([difficulty]))
-            .await?;
+        // Send as notification (no id, no response expected)
+        let msg = JsonRpcMessage::notification("mining.suggest_difficulty", json!([difficulty]));
+        conn.write_message(&msg).await?;
 
-        // Response is typically true/false, but we don't strictly care
-        // The pool will send mining.set_difficulty if it accepts
-        match response {
-            JsonRpcMessage::Response { result, .. } => {
-                debug!(
-                    accepted = ?result.as_ref().and_then(|v| v.as_bool()),
-                    "Pool responded to difficulty suggestion"
-                );
-                Ok(())
-            }
-            _ => Ok(()), // Ignore unexpected responses
-        }
+        Ok(())
     }
 
     /// Submit a share to the pool.
