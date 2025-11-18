@@ -49,6 +49,9 @@ struct ProtocolState {
 
     /// Current share difficulty (from mining.set_difficulty)
     share_difficulty: Option<u64>,
+
+    /// Authorized version mask (from mining.configure or mining.set_version_mask)
+    version_mask: Option<u32>,
 }
 
 impl StratumV1Source {
@@ -78,9 +81,14 @@ impl StratumV1Source {
         // Create extranonce2 range (full range for the given size)
         let extranonce2_range = Extranonce2Range::new(state.extranonce2_size as u8)?;
 
-        // Convert version to VersionTemplate with full GP bits available
-        // Stratum sends base version, we allow hardware to roll GP bits
-        let version_template = VersionTemplate::new(job.version, GeneralPurposeBits::full())?;
+        // Convert version to VersionTemplate
+        // Use authorized mask from pool (or none if pool didn't authorize version rolling)
+        let gp_bits_mask = state
+            .version_mask
+            .map(|mask| GeneralPurposeBits::from(&mask.to_be_bytes()))
+            .unwrap_or_else(GeneralPurposeBits::none);
+
+        let version_template = VersionTemplate::new(job.version, gp_bits_mask)?;
 
         // Convert share difficulty to target
         // Default to difficulty 1 if not yet set by pool
@@ -123,6 +131,7 @@ impl StratumV1Source {
                     extranonce1,
                     extranonce2_size,
                     share_difficulty: None,
+                    version_mask: None,
                 });
             }
 
@@ -149,8 +158,10 @@ impl StratumV1Source {
             }
 
             ClientEvent::VersionMaskSet(mask) => {
-                debug!(mask = format!("{:#010x}", mask), "Version mask set");
-                // Version rolling is handled in VersionTemplate
+                info!(mask = format!("{:#010x}", mask), "Version mask set");
+                if let Some(state) = &mut self.state {
+                    state.version_mask = Some(mask);
+                }
             }
 
             ClientEvent::ShareAccepted { job_id } => {

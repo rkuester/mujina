@@ -203,12 +203,98 @@ impl StratumV1Client {
         .map_err(|_| StratumError::Timeout)?
     }
 
+    /// Configure version rolling support.
+    ///
+    /// Sends `mining.configure` to request version rolling capability.
+    /// Must be called before subscribe. Returns the mask authorized by the pool,
+    /// or None if the pool doesn't support version rolling.
+    ///
+    /// This is an optional extension. If the pool doesn't respond or errors,
+    /// we gracefully fall back to mining without version rolling.
+    async fn configure_version_rolling(
+        &mut self,
+        conn: &mut Connection,
+    ) -> StratumResult<Option<u32>> {
+        use serde_json::json;
+
+        // Request GP bits mask (0x1fffe000 = bits 13-28)
+        let result = self
+            .send_request(
+                conn,
+                "mining.configure",
+                json!([
+                    ["version-rolling"],
+                    {"version-rolling.mask": "1fffe000"}
+                ]),
+            )
+            .await;
+
+        match result {
+            Ok(JsonRpcMessage::Response {
+                result: Some(result),
+                error: None,
+                ..
+            }) => {
+                // Parse result object
+                let obj = result.as_object().ok_or_else(|| {
+                    StratumError::InvalidMessage("configure result not an object".to_string())
+                })?;
+
+                // Check if version rolling was accepted
+                let accepted = obj
+                    .get("version-rolling")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+
+                if !accepted {
+                    debug!("Pool declined version rolling");
+                    return Ok(None);
+                }
+
+                // Get the authorized mask
+                let mask_str = obj
+                    .get("version-rolling.mask")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| {
+                        StratumError::InvalidMessage("Missing version-rolling.mask".to_string())
+                    })?;
+
+                let mask =
+                    u32::from_str_radix(mask_str.trim_start_matches("0x"), 16).map_err(|_| {
+                        StratumError::InvalidMessage("Invalid version mask hex".to_string())
+                    })?;
+
+                info!(
+                    mask = format!("{:#x}", mask),
+                    "Pool authorized version rolling"
+                );
+                Ok(Some(mask))
+            }
+            Ok(JsonRpcMessage::Response { error: Some(_), .. }) => {
+                // Pool returned error - doesn't support mining.configure
+                debug!("Pool doesn't support mining.configure (error response)");
+                Ok(None)
+            }
+            Err(StratumError::Timeout) => {
+                // Pool didn't respond - doesn't support mining.configure
+                debug!("Pool doesn't support mining.configure (timeout)");
+                Ok(None)
+            }
+            Err(e) => Err(e), // Other errors are fatal
+            _ => Ok(None),
+        }
+    }
+
     /// Subscribe to mining notifications.
     ///
     /// Sends `mining.subscribe` and waits for response containing extranonce1
     /// and extranonce2_size. Uses the message router to handle interleaved
-    /// notifications.
-    async fn subscribe(&mut self, conn: &mut Connection) -> StratumResult<()> {
+    /// notifications. (TODO: Does this still use a router?)
+    async fn subscribe(
+        &mut self,
+        conn: &mut Connection,
+        authorized_mask: Option<u32>,
+    ) -> StratumResult<()> {
         use serde_json::json;
 
         let response = self
@@ -245,7 +331,7 @@ impl StratumV1Client {
                     extranonce1: extranonce1.to_string(),
                     extranonce2_size,
                     difficulty: None,
-                    version_mask: None,
+                    version_mask: authorized_mask,
                 });
 
                 Ok(())
@@ -475,9 +561,12 @@ impl StratumV1Client {
         // Connect
         let mut conn = Connection::connect(&self.config.url).await?;
 
+        // Configure version rolling (before subscribe)
+        let authorized_mask = self.configure_version_rolling(&mut conn).await?;
+
         // Subscribe
         info!("Subscribing to pool");
-        self.subscribe(&mut conn).await?;
+        self.subscribe(&mut conn, authorized_mask).await?;
 
         let state = self.state.as_ref().unwrap();
         debug!(

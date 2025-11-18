@@ -27,6 +27,11 @@ impl GeneralPurposeBits {
         Self([0xff, 0xff])
     }
 
+    /// No mask - no bits rollable
+    pub fn none() -> Self {
+        Self([0x00, 0x00])
+    }
+
     /// Check if value bits fit within this mask
     pub fn contains(&self, value: &GeneralPurposeBits) -> bool {
         self.0
@@ -67,6 +72,29 @@ impl From<[u8; 2]> for GeneralPurposeBits {
 impl From<GeneralPurposeBits> for [u8; 2] {
     fn from(gp: GeneralPurposeBits) -> Self {
         gp.0
+    }
+}
+
+impl From<&[u8; 4]> for GeneralPurposeBits {
+    /// Create from a 4-byte version mask (e.g., from Stratum mining.configure).
+    ///
+    /// Extracts bits 13-28 from the mask by interpreting the bytes as a big-endian
+    /// u32, shifting right 13 positions, and taking the resulting 16 bits.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use mujina_miner::job_source::GeneralPurposeBits;
+    ///
+    /// // Stratum mask 0x1fffe000 (bits 13-28 all set)
+    /// let mask_bytes = [0x1f, 0xff, 0xe0, 0x00];
+    /// let gp_bits = GeneralPurposeBits::from(&mask_bytes);
+    /// assert_eq!(gp_bits.as_bytes(), &[0xff, 0xff]);
+    /// ```
+    fn from(mask_bytes: &[u8; 4]) -> Self {
+        let mask = u32::from_be_bytes(*mask_bytes);
+        let bits = (mask >> 13) as u16;
+        Self(bits.to_be_bytes())
     }
 }
 
