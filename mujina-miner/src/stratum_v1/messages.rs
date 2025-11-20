@@ -12,8 +12,8 @@ use serde_json::Value;
 
 /// Events emitted by the Stratum client.
 ///
-/// These events are sent via channel to the client consumer (typically a job
-/// source) to notify about protocol state changes and new work.
+/// These events are sent via channel to the client consumer
+/// to notify about protocol state changes and new work.
 #[derive(Debug, Clone)]
 pub enum ClientEvent {
     /// Version rolling configured (result of mining.configure)
@@ -304,6 +304,17 @@ impl SubmitParams {
 /// - Requests (have method and params, may have id)
 /// - Responses (have id and result or error)
 /// - Notifications (have method and params, no id)
+///
+/// ## Why not use a JSON-RPC library?
+///
+/// Stratum v1 predates JSON-RPC 2.0 and uses non-standard conventions:
+/// - Notifications use `id: null` instead of omitting the id field
+/// - Error format is simplified (array instead of structured object)
+/// - No version field
+///
+/// Standard JSON-RPC libraries expect spec compliance, creating impedance
+/// mismatch. This lightweight custom type (80 lines) fits Stratum's quirks
+/// exactly without adapter layers.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum JsonRpcMessage {
