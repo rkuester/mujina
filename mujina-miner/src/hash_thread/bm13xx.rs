@@ -911,6 +911,8 @@ async fn bm13xx_thread_actor<R, W>(
                                                         chip_job_id = job_id,
                                                         nonce = format!("{:#x}", nonce),
                                                         hash = %hash,
+                                                        hash_diff = %DisplayDifficulty::from_hash(&hash),
+                                                        target_diff = %DisplayDifficulty::from_target(&task.share_target),
                                                         "Share found and reported"
                                                     );
                                                 }
