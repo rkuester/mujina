@@ -1,12 +1,104 @@
 # Contributing to Mujina Miner
 
-Thank you for your interest in contributing to mujina-miner! This document
-provides guidelines and instructions for contributing to the project.
+Thank you for your interest in contributing to mujina-miner! We're excited to
+have you here. This document will help you understand how to contribute
+effectively and get your changes merged quickly.
 
-## Code of Conduct
+The workflow described here is designed to make contributing easier---not
+harder. By discussing changes before implementation, you'll get early
+feedback, avoid wasted effort, and increase the chances your contribution
+will be merged.
 
-This project adheres to a Code of Conduct that all contributors are expected
-to follow. Please be respectful and constructive in all interactions.
+## Quick Guide
+
+### I have a bug or something isn't working
+
+1. Search [discussions] and the [issue tracker] for similar problems. Tip:
+   also search [closed issues] and [closed discussions]---your issue might
+   have already been fixed!
+2. If your issue hasn't been reported, open an ["Issue Triage" discussion]
+   and fill in the template completely. Use this category only for bug
+   reports---thank you!
+
+[discussions]: https://github.com/mujina/mujina-miner/discussions
+[issue tracker]: https://github.com/mujina/mujina-miner/issues
+[closed issues]: https://github.com/mujina/mujina-miner/issues?q=is%3Aissue+state%3Aclosed
+[closed discussions]: https://github.com/mujina/mujina-miner/discussions?discussions_q=is%3Aclosed
+["Issue Triage" discussion]: https://github.com/mujina/mujina-miner/discussions/new?category=issue-triage
+
+### I have an idea for a feature
+
+Open a discussion in the ["Ideas" category] to propose and discuss the
+feature before implementation.
+
+["Ideas" category]: https://github.com/mujina/mujina-miner/discussions/new?category=ideas
+
+### I've implemented a feature
+
+1. If there's an issue for the feature, open a pull request.
+2. If there's no issue, open a discussion first and link to your branch.
+   Getting feedback before the PR makes the review process smoother.
+
+### I'd like to contribute
+
+All issues are actionable---pick one and start working on it. Thank you! If
+you need help or guidance, comment on the issue. Issues tagged with "good
+first issue" are extra friendly to new contributors.
+
+### I have a question
+
+Open a [Q&A discussion] or ask in our community chat (if available).
+
+[Q&A discussion]: https://github.com/mujina/mujina-miner/discussions/new?category=q-a
+
+## General Patterns
+
+### Issues are Actionable
+
+**This workflow is adapted from [Ghostty]**. Thanks to Mitchell Hashimoto
+and contributors for the pattern!
+
+[Ghostty]: https://github.com/ghostty-org/ghostty
+
+The mujina-miner [issue tracker] is for _actionable items_.
+
+Unlike some projects, mujina-miner **does not use the issue tracker for
+discussion or feature requests**. Instead, we use GitHub [discussions] for
+that. Once a discussion reaches a point where a well-understood, actionable
+item is identified, it's moved to the issue tracker. **This pattern makes it
+easier for maintainers or contributors to find issues to work on since
+_every issue_ is ready to be worked on.**
+
+If you're experiencing a bug and have clear steps to reproduce it, open an
+issue triage discussion. If you're experiencing a bug but aren't sure how to
+reproduce it or aren't sure if it's a bug, open a discussion. If you have an
+idea for a feature, open a discussion.
+
+### Pull Requests Implement an Issue
+
+Pull requests should be associated with a previously accepted issue. This
+helps ensure your effort aligns with project goals and increases the
+likelihood of a quick merge.
+
+**Why this matters:** Without prior discussion, you risk spending time on
+work that conflicts with planned changes, doesn't fit the project direction,
+or solves a problem in a way that won't be merged. A quick discussion up
+front saves everyone time.
+
+**Exception:** Trivial improvements don't need discussion or an issue. This
+includes typo fixes, wording improvements, spelling corrections, log level
+adjustments, comment improvements, and documentation clarifications. Use
+your judgment---if the change is obviously correct and self-contained, just
+open the PR.
+
+Issues tagged with "feature" or "enhancement" represent accepted,
+well-scoped work. If you implement an issue as described, your pull request
+will be accepted with a high degree of certainty.
+
+> [!NOTE]
+> **Design discussions belong in Discussions, not PRs.** If you want
+> feedback on an approach before committing to the full implementation, open
+> a discussion and link to your branch.
 
 ## Getting Started
 
@@ -43,8 +135,9 @@ to follow. Please be respectful and constructive in all interactions.
 
 ### Before You Start
 
-1. Check existing issues and pull requests to avoid duplicate work
-2. For significant changes, open an issue first to discuss the approach
+1. Check existing discussions and issues to avoid duplicate work
+2. For significant changes, open a discussion first to get feedback on the
+   approach before implementation
 3. Read the architecture documentation in `docs/architecture.md`
 4. Familiarize yourself with `CODE_STYLE.md` and `CODING_GUIDELINES.md`
 
@@ -196,6 +289,12 @@ heterogeneous board configurations.
 
 ## Pull Request Process
 
+**Before opening a PR:** Ensure there's an accepted issue for your change. If
+not, open a discussion first to get feedback. (Exception: trivial improvements,
+including typos, wording, log levels, comments, and documentation don't need an
+issue. Use your judgment---if it's obviously correct and self-contained, just
+open the PR.)
+
 1. Update your branch with the latest upstream changes:
    ```bash
    git fetch upstream
@@ -210,14 +309,22 @@ heterogeneous board configurations.
 3. Create a pull request on GitHub with:
    - Clear title describing the change
    - Description of what changed and why
-   - Reference to any related issues
+   - **Reference to the issue being implemented** (required)
+   - Link to the discussion that led to the issue (helpful context)
    - Screenshots/logs if applicable
 
 4. Address review feedback promptly
 
 5. Once approved, your PR will be merged
 
+**Tip:** Following this process (discussion -> issue -> PR) dramatically
+increases the chances of a quick merge. It shows you've done your homework
+and the work aligns with project goals.
+
 ## Areas for Contribution
+
+All issues in the [issue tracker] are actionable and ready to be worked on.
+Pick one that matches your interests and skill level!
 
 ### Good First Issues
 
@@ -229,16 +336,16 @@ Look for issues labeled `good first issue` for beginner-friendly tasks:
 
 ### High-Priority Areas
 
+Check the issue tracker for issues labeled `priority` or `enhancement` in
+these areas:
 - Pool protocol implementations (Stratum v2)
 - Additional ASIC chip support
 - Hardware monitoring and safety features
 - API endpoint implementations
 - Performance optimizations
 
-### Feature Requests
-
-Check the roadmap in `CLAUDE.md` and GitHub issues for planned features.
-Always discuss major features before implementation.
+If you want to work on something not yet in the issue tracker, open a
+discussion first to propose it.
 
 ## Hardware Testing
 
@@ -250,9 +357,8 @@ If you have mining hardware:
 
 ## Questions and Support
 
-- Open an issue for bugs or feature requests
-- Use discussions for general questions
-- Join our community chat (if available)
+See the [Quick Guide](#quick-guide) at the top of this document for routing
+your question or request to the right place.
 
 ## Recognition
 
