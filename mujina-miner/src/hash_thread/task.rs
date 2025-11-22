@@ -65,6 +65,13 @@ pub struct Share {
     /// Computed block hash
     pub hash: BlockHash,
 
+    /// Threshold difficulty this share was validated against.
+    ///
+    /// This represents the expected hashing work, not the achieved difficulty.
+    /// Used for hashrate calculation where each share represents the same
+    /// expected work regardless of its actual hash difficulty (which is luck).
+    pub threshold_difficulty: f64,
+
     /// Version bits
     pub version: Version,
 

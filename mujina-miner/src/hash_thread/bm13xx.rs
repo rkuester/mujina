@@ -548,8 +548,6 @@ where
 
     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
 
-    tracing::info!("BM13xx chip initialized and ready for mining");
-
     Ok(())
 }
 
@@ -718,9 +716,7 @@ async fn bm13xx_thread_actor<R, W>(
                     ThreadRemovalSignal::Running => {
                         // False alarm - still running
                     }
-                    reason => {
-                        info!(reason = ?reason, "Thread removal signal received");
-
+                    _reason => {
                         // Update status
                         {
                             let mut s = status.write().unwrap();
@@ -748,7 +744,7 @@ async fn bm13xx_thread_actor<R, W>(
                         }
 
                         if !chip_initialized {
-                            info!("First work assignment - initializing chip");
+                            trace!("Initializing chip on first assignment.");
                             if let Err(e) = initialize_chip(&mut chip_commands, &mut peripherals).await {
                                 error!(error = %e, "Chip initialization failed");
                                 response_tx.send(Err(e)).ok();
@@ -799,7 +795,7 @@ async fn bm13xx_thread_actor<R, W>(
                         }
 
                         if !chip_initialized {
-                            info!("First work assignment - initializing chip");
+                            trace!("Initializing chip on first assignment.");
                             if let Err(e) = initialize_chip(&mut chip_commands, &mut peripherals).await {
                                 error!(error = %e, "Chip initialization failed");
                                 response_tx.send(Err(e)).ok();
@@ -893,11 +889,13 @@ async fn bm13xx_thread_actor<R, W>(
 
                                             // Validate against task share target
                                             if task.share_target.is_met_by(hash) {
-                                                // Create share
+                                                // Create share with threshold difficulty for hashrate calculation
+                                                let threshold_difficulty = task.share_target.difficulty_float();
                                                 let share = super::task::Share {
                                                     task: Arc::new(task.clone()),
                                                     nonce,
                                                     hash,
+                                                    threshold_difficulty,
                                                     version: full_version,
                                                     ntime: task.ntime,
                                                     extranonce2: task.en2,

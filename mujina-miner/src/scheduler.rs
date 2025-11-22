@@ -141,6 +141,11 @@ pub async fn task(
     // Track mining statistics
     let mut stats = MiningStats::default();
 
+    // Create interval for periodic status logging
+    let mut status_interval = tokio::time::interval(tokio::time::Duration::from_secs(30));
+    status_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut first_tick = true;
+
     debug!("Scheduler ready (awaiting job sources)");
 
     // Main scheduler loop
@@ -289,14 +294,18 @@ pub async fn task(
                             hash = %share.hash,
                             "Share found"
                         );
-                        stats.nonces_found += 1;
+
+                        // Track hashes for hashrate measurement
+                        // Use threshold difficulty, not achieved difficulty (see MiningStats doc)
+                        let hashes = (share.threshold_difficulty * (u32::MAX as f64 + 1.0)) as u128;
+                        stats.total_hashes += hashes;
 
                         // Check if share meets source threshold
                         let source_id = share.task.job.source_id;
                         let template = &share.task.job.template;
 
                         if template.share_target.is_met_by(share.hash) {
-                            stats.valid_nonces += 1;
+                            stats.shares_submitted += 1;
 
                             // Submit share to originating source
                             if let Some(source) = sources.get(source_id) {
@@ -332,7 +341,6 @@ pub async fn task(
 
                     HashThreadEvent::WorkExhausted { en2_searched } => {
                         info!(thread_id = ?thread_id, en2_searched, "Work exhausted");
-                        stats.jobs_completed += 1;
                         // TODO: Assign new work to this thread
                     }
 
@@ -353,9 +361,12 @@ pub async fn task(
             }
 
             // Periodic status check
-            _ = tokio::time::sleep(tokio::time::Duration::from_secs(30)) => {
-                trace!("Scheduler heartbeat - mining active");
-                stats.log_summary();
+            _ = status_interval.tick() => {
+                if first_tick {
+                    first_tick = false;
+                } else {
+                    stats.log_summary();
+                }
             }
 
             // Shutdown
@@ -373,23 +384,44 @@ pub async fn task(
 }
 
 /// Mining statistics tracker
+///
+/// # Hashrate Calculation Methodology
+///
+/// We calculate hashrate using **threshold difficulty**, not achieved difficulty.
+///
+/// ## Statistical Model
+///
+/// - Chip hashes at constant rate (what we want to measure)
+/// - Shares meeting threshold D_t arrive as Poisson process
+/// - Achieved difficulty follows exponential distribution (memoryless)
+/// - Each share represents expected work: D_t * 2^32 hashes
+///
+/// ## Comparison to Pool Statistics
+///
+/// Mining pools (like hydrapool) use achieved difficulty because they don't
+/// control miner thresholds. We control our threshold, so we can use it
+/// directly for more stable estimates.
+///
+/// Using achieved difficulty introduces high variance from outliers. One lucky
+/// difficulty-10M share would dominate the average, incorrectly inflating
+/// hashrate estimates. Threshold-based calculation is variance-minimizing.
 struct MiningStats {
-    nonces_found: u64,
-    valid_nonces: u64,
-    jobs_completed: u64,
     start_time: std::time::Instant,
-    difficulty: f64,
+    /// Total hashes performed (accumulated across all shares).
+    ///
+    /// Uses u128 for overflow safety. At 1 TH/s, u64 would overflow in 5 hours
+    /// but u128 won't overflow for 10 quadrillion years.
+    total_hashes: u128,
+    shares_submitted: u64,
 }
 
 impl Default for MiningStats {
     fn default() -> Self {
         let now = std::time::Instant::now();
         Self {
-            nonces_found: 0,
-            valid_nonces: 0,
-            jobs_completed: 0,
             start_time: now,
-            difficulty: 1.0,
+            total_hashes: 0,
+            shares_submitted: 0,
         }
     }
 }
@@ -398,63 +430,28 @@ impl MiningStats {
     fn log_summary(&mut self) {
         let elapsed = self.start_time.elapsed().as_secs_f64();
 
-        // Theoretical hashrate based on chip specifications
-        const TARGET_FREQUENCY_MHZ: f32 = 500.0;
-        const BM1370_HASH_ENGINES: f64 = 1280.0;
-        let theoretical_hashrate_mhs = TARGET_FREQUENCY_MHZ as f64 * BM1370_HASH_ENGINES;
-
-        let valid_pct = if self.nonces_found > 0 {
-            self.valid_nonces as f64 / self.nonces_found as f64 * 100.0
+        // Calculate hashrate from accumulated hashes
+        let hashrate_ghs = if elapsed > 0.0 && self.total_hashes > 0 {
+            let hashrate_hs = self.total_hashes as f64 / elapsed;
+            Some(hashrate_hs / 1_000_000_000.0)
         } else {
-            0.0
+            None
         };
 
-        // Basic statistics
-        info!(
-            uptime_s = elapsed as u64,
-            difficulty = self.difficulty,
-            theoretical_mhs = format!("{:.2}", theoretical_hashrate_mhs),
-            nonces_found = self.nonces_found,
-            valid = self.valid_nonces,
-            valid_pct = format!("{:.2}", valid_pct),
-            jobs_completed = self.jobs_completed,
-            "Mining statistics"
-        );
-
-        // Measured hashrate (if we have data)
-        if elapsed > 0.0 && self.valid_nonces > 0 {
-            let hashes_per_nonce = self.difficulty * (u32::MAX as f64 + 1.0);
-            let estimated_total_hashes = self.valid_nonces as f64 * hashes_per_nonce;
-            let measured_hashrate_mhs = (estimated_total_hashes / elapsed) / 1_000_000.0;
-            let efficiency = (measured_hashrate_mhs / theoretical_hashrate_mhs) * 100.0;
-
-            debug!(
-                measured_mhs = format!("{:.2}", measured_hashrate_mhs),
-                efficiency_pct = format!("{:.1}", efficiency),
-                sample_size = self.valid_nonces,
-                "Measured hashrate"
+        // Mining statistics
+        if let Some(ghs) = hashrate_ghs {
+            info!(
+                uptime_s = elapsed as u64,
+                hashrate = format!("{:.1} GH/s", ghs),
+                shares = self.shares_submitted,
+                "Mining status."
             );
-        }
-
-        // Poisson analysis (if applicable)
-        if elapsed > 0.0 && theoretical_hashrate_mhs > 0.0 {
-            let expected_rate = (theoretical_hashrate_mhs * 1_000_000.0)
-                / (self.difficulty * (u32::MAX as f64 + 1.0));
-            let expected_nonces = expected_rate * elapsed;
-
-            if expected_nonces > 1.0 {
-                let std_dev = expected_nonces.sqrt();
-                let lower = (expected_nonces - 2.0 * std_dev).max(0.0);
-                let upper = expected_nonces + 2.0 * std_dev;
-
-                debug!(
-                    expected = format!("{:.1}", expected_nonces),
-                    found = self.valid_nonces,
-                    ci_lower = format!("{:.1}", lower),
-                    ci_upper = format!("{:.1}", upper),
-                    "Poisson analysis (95% CI)"
-                );
-            }
+        } else {
+            info!(
+                uptime_s = elapsed as u64,
+                shares = self.shares_submitted,
+                "Mining status."
+            );
         }
     }
 }
