@@ -8,13 +8,20 @@
 //! access to the `trace!()`, `debug!()`, `info!()`, `warn!()`, and `error!()`
 //! macros.
 
-use std::env;
+use std::{env, fmt};
 use time::OffsetDateTime;
+use tracing::field::{Field, Visit};
+use tracing::{Event, Level, Subscriber};
 use tracing_journald;
 use tracing_subscriber::{
     filter::{EnvFilter, LevelFilter},
-    fmt::{format::Writer, time::FormatTime},
+    fmt::{
+        format::{DefaultFields, Writer as FmtWriter},
+        time::FormatTime,
+        FmtContext, FormatEvent, FormatFields,
+    },
     prelude::*,
+    registry::LookupSpan,
 };
 
 pub mod prelude {
@@ -55,7 +62,7 @@ fn use_stdout() {
             tracing_subscriber::fmt::layer()
                 .with_timer(LocalTimer)
                 .with_target(true)
-                .fmt_fields(tracing_subscriber::fmt::format::DefaultFields::new())
+                .fmt_fields(DefaultFields::new())
                 .event_format(CustomFormatter),
         )
         .init();
@@ -80,8 +87,8 @@ impl FieldCollector {
     }
 }
 
-impl tracing::field::Visit for FieldCollector {
-    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+impl Visit for FieldCollector {
+    fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
         if field.name() == "message" {
             self.message = Some(format!("{:?}", value));
         } else {
@@ -97,17 +104,17 @@ impl tracing::field::Visit for FieldCollector {
     }
 }
 
-impl<S, N> tracing_subscriber::fmt::FormatEvent<S, N> for CustomFormatter
+impl<S, N> FormatEvent<S, N> for CustomFormatter
 where
-    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
-    N: for<'a> tracing_subscriber::fmt::FormatFields<'a> + 'static,
+    S: Subscriber + for<'a> LookupSpan<'a>,
+    N: for<'a> FormatFields<'a> + 'static,
 {
     fn format_event(
         &self,
-        _ctx: &tracing_subscriber::fmt::FmtContext<'_, S, N>,
-        mut writer: tracing_subscriber::fmt::format::Writer<'_>,
-        event: &tracing::Event<'_>,
-    ) -> std::fmt::Result {
+        _ctx: &FmtContext<'_, S, N>,
+        mut writer: FmtWriter<'_>,
+        event: &Event<'_>,
+    ) -> fmt::Result {
         // Collect fields first so we can extract log.target if present
         let mut visitor = FieldCollector::new();
         event.record(&mut visitor);
@@ -120,11 +127,11 @@ where
         // Write level with foreground color
         let level = *event.metadata().level();
         let (level_color, level_text) = match level {
-            tracing::Level::ERROR => ("\x1b[31m", "ERROR"), // Red
-            tracing::Level::WARN => ("\x1b[33m", "WARN "),  // Yellow
-            tracing::Level::INFO => ("\x1b[32m", "INFO "),  // Green
-            tracing::Level::DEBUG => ("\x1b[34m", "DEBUG"), // Blue
-            tracing::Level::TRACE => ("\x1b[35m", "TRACE"), // Magenta
+            Level::ERROR => ("\x1b[31m", "ERROR"), // Red
+            Level::WARN => ("\x1b[33m", "WARN "),  // Yellow
+            Level::INFO => ("\x1b[32m", "INFO "),  // Green
+            Level::DEBUG => ("\x1b[34m", "DEBUG"), // Blue
+            Level::TRACE => ("\x1b[35m", "TRACE"), // Magenta
         };
         write!(writer, "{}{}\x1b[0m ", level_color, level_text)?;
 
@@ -191,7 +198,7 @@ where
 struct LocalTimer;
 
 impl FormatTime for LocalTimer {
-    fn format_time(&self, w: &mut Writer<'_>) -> std::fmt::Result {
+    fn format_time(&self, w: &mut FmtWriter<'_>) -> fmt::Result {
         let now = OffsetDateTime::now_local().unwrap_or(OffsetDateTime::now_utc());
         write!(
             w,
