@@ -10,6 +10,23 @@ pub use bitcoin::{Amount, BlockHash, Network, Target, Transaction, TxOut, Work};
 
 use bitcoin::hashes::sha256d;
 
+use crate::u256::U256;
+
+// Conversions between U256 and bitcoin's Target type. These live here rather
+// than in u256.rs to avoid coupling the generic integer type to bitcoin.
+
+impl From<Target> for U256 {
+    fn from(target: Target) -> Self {
+        Self::from_le_bytes(target.to_le_bytes())
+    }
+}
+
+impl From<U256> for Target {
+    fn from(u: U256) -> Self {
+        Target::from_le_bytes(u.to_le_bytes())
+    }
+}
+
 /// A mining job sent to ASIC chips.
 #[derive(Debug, Clone)]
 pub struct Job {
@@ -90,6 +107,14 @@ impl HashRate {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_target_u256_roundtrip() {
+        let target = Target::MAX;
+        let u = U256::from(target);
+        let back = Target::from(u);
+        assert_eq!(target, back);
+    }
 
     #[test]
     fn test_hashrate_conversions() {

@@ -42,6 +42,7 @@ regex = { workspace = true }
 reqwest = { workspace = true }
 rustix = { workspace = true }
 slotmap = { workspace = true }
+ruint = "1.17.0"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 tokio-udev = { workspace = true }
