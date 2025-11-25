@@ -88,6 +88,32 @@ struct SourceEntry {
     command_tx: mpsc::Sender<SourceCommand>,
 }
 
+/// Calculates aggregate hashrate from all registered threads.
+fn total_hashrate_estimate<T>(threads: &SlotMap<ThreadId, T>) -> HashRate
+where
+    T: std::ops::Deref<Target = dyn HashThread>,
+{
+    let total: u64 = threads
+        .values()
+        .map(|t| t.capabilities().hashrate_estimate.0)
+        .sum();
+    HashRate(total)
+}
+
+/// Broadcasts hashrate update to all registered sources.
+///
+/// Currently sends the same aggregate hashrate to all sources. In the future,
+/// this will send per-source allocations based on scheduling policy (e.g., when
+/// splitting hashrate across multiple pools).
+async fn broadcast_hashrate(sources: &SlotMap<SourceId, SourceEntry>, hashrate: HashRate) {
+    for source in sources.values() {
+        let _ = source
+            .command_tx
+            .send(SourceCommand::UpdateHashRate(hashrate))
+            .await;
+    }
+}
+
 // TODO: Future enhancements for frequency ramping:
 // - Make ramp parameters configurable (step size, delay, target)
 // - Monitor chip temperature/errors during ramp
@@ -149,6 +175,9 @@ pub async fn task(
 
     debug!("Scheduler ready (awaiting job sources)");
 
+    // Track thread count to detect disconnections
+    let mut last_thread_count = threads.len();
+
     // Main scheduler loop
 
     while !running.is_cancelled() {
@@ -161,6 +190,12 @@ pub async fn task(
                 });
                 source_events.insert(source_id, ReceiverStream::new(registration.event_rx));
                 debug!(source_id = ?source_id, name = %registration.name, "Source registered");
+
+                // Send current hashrate estimate to the new source
+                let hashrate = total_hashrate_estimate(&threads);
+                if let Some(source) = sources.get(source_id) {
+                    let _ = source.command_tx.send(SourceCommand::UpdateHashRate(hashrate)).await;
+                }
             }
 
             // Source events
@@ -361,6 +396,31 @@ pub async fn task(
                 }
             }
 
+            // New thread batches from backplane
+            Some(new_threads) = thread_rx.recv() => {
+                if new_threads.is_empty() {
+                    continue;
+                }
+
+                debug!("Received {} new hash thread(s)", new_threads.len());
+
+                for mut thread in new_threads {
+                    let event_rx = thread
+                        .take_event_receiver()
+                        .expect("Thread missing event receiver");
+
+                    let thread_id = threads.insert(thread);
+                    thread_events.insert(thread_id, ReceiverStream::new(event_rx));
+                    debug!(thread_id = ?thread_id, "Thread registered");
+                }
+
+                // Broadcast updated hashrate to all sources
+                let hashrate = total_hashrate_estimate(&threads);
+                broadcast_hashrate(&sources, hashrate).await;
+
+                last_thread_count = thread_events.len();
+            }
+
             // Periodic status check
             _ = status_interval.tick() => {
                 if first_tick {
@@ -375,6 +435,28 @@ pub async fn task(
                 debug!("Scheduler shutdown requested");
                 break;
             }
+        }
+
+        // Detect thread disconnections (StreamMap silently removes ended streams)
+        // Check thread_events since that's where disconnections are detected.
+        let current_count = thread_events.len();
+        if current_count != last_thread_count {
+            debug!(
+                previous = last_thread_count,
+                current = current_count,
+                "Thread count changed"
+            );
+
+            // Remove threads that no longer have active event streams
+            let active_ids: std::collections::HashSet<_> = thread_events.keys().collect();
+            threads.retain(|id, _| active_ids.contains(&id));
+            thread_assignments.retain(|id, _| active_ids.contains(id));
+
+            last_thread_count = current_count;
+
+            // Broadcast updated hashrate to all sources
+            let hashrate = total_hashrate_estimate(&threads);
+            broadcast_hashrate(&sources, hashrate).await;
         }
     }
 
