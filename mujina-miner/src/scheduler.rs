@@ -136,6 +136,7 @@ fn warn_if_difficulty_too_high(job: &JobTemplate, hashrate: HashRate, source_nam
         warn!(
             source = %source_name,
             job_id = %job.id,
+            hashrate = %hashrate.to_human_readable(),
             expected_share_interval_secs = time_to_share.as_secs(),
             "Share difficulty too high for hashrate (expected > 5 min between shares)"
         );
