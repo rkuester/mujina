@@ -250,6 +250,28 @@ mod tests {
         let recovered = difficulty_for_share_interval(interval, hashrate);
         assert!((u64::from(recovered) as i64 - 1024).abs() < 2);
     }
+
+    #[test]
+    fn test_expected_time_to_share_from_target() {
+        // Should match expected_time_to_share when using equivalent difficulty
+        let difficulty = Difficulty::new(1024);
+        let target = difficulty.to_target();
+        let hashrate = HashRate::from_terahashes(1.0);
+
+        let time_from_difficulty = expected_time_to_share(difficulty, hashrate);
+        let time_from_target = expected_time_to_share_from_target(target, hashrate);
+
+        // Should be very close (small floating point differences allowed)
+        let diff_secs = (time_from_difficulty.as_secs_f64() - time_from_target.as_secs_f64()).abs();
+        assert!(diff_secs < 1.0, "Times differ by {} seconds", diff_secs);
+
+        // Zero hashrate should return Duration::MAX
+        let zero_hashrate = HashRate(0);
+        assert_eq!(
+            expected_time_to_share_from_target(target, zero_hashrate),
+            Duration::MAX
+        );
+    }
 }
 
 mod difficulty;
