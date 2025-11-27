@@ -137,7 +137,7 @@ fn warn_if_difficulty_too_high(job: &JobTemplate, hashrate: HashRate, source_nam
             source = %source_name,
             job_id = %job.id,
             hashrate = %hashrate.to_human_readable(),
-            expected_share_interval_secs = time_to_share.as_secs(),
+            expected_share_interval = %format_duration(time_to_share.as_secs()),
             "Share difficulty too high for hashrate (expected > 5 min between shares)"
         );
         true
@@ -523,14 +523,14 @@ pub async fn task(
     debug!("Scheduler shutdown complete");
 }
 
-/// Format seconds as human-readable uptime.
+/// Format seconds as human-readable duration.
 ///
 /// Scales format based on duration to keep output compact:
 /// - Under 1 minute: "45s"
 /// - Under 1 hour: "12m 30s"
 /// - Under 1 day: "12h 38m"
 /// - 1 day or more: "1d 12h"
-fn format_uptime(secs: u64) -> String {
+fn format_duration(secs: u64) -> String {
     const MINUTE: u64 = 60;
     const HOUR: u64 = 60 * MINUTE;
     const DAY: u64 = 24 * HOUR;
@@ -607,7 +607,7 @@ impl MiningStats {
         };
 
         info!(
-            uptime = %format_uptime(elapsed.as_secs()),
+            uptime = %format_duration(elapsed.as_secs()),
             hashrate = %hashrate_str,
             shares = self.shares_submitted,
             "Mining status."
