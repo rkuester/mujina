@@ -145,6 +145,18 @@ pub trait VoltageRegulator: Send + Sync {
     async fn set_voltage(&mut self, volts: f32) -> anyhow::Result<()>;
 }
 
+/// Hardware interfaces provided by the board to the hash thread.
+///
+/// Bundles optional hardware capabilities. Not all boards provide all
+/// interfaces. Hash threads should handle missing capabilities gracefully.
+pub struct BoardPeripherals {
+    /// ASIC enable/disable control
+    pub asic_enable: Option<Box<dyn AsicEnable>>,
+
+    /// Voltage regulator control
+    pub voltage_regulator: Option<Box<dyn VoltageRegulator>>,
+}
+
 /// Signal from board to hash thread for shutdown coordination.
 ///
 /// Board sends this via watch channel to signal thread shutdown. Thread checks

@@ -16,13 +16,11 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio_stream::StreamExt;
 
 use super::{
-    task::HashTask, HashThread, HashThreadCapabilities, HashThreadError, HashThreadEvent,
-    HashThreadStatus, ThreadRemovalSignal,
+    task::HashTask, BoardPeripherals, HashThread, HashThreadCapabilities, HashThreadError,
+    HashThreadEvent, HashThreadStatus, ThreadRemovalSignal,
 };
 use crate::{
     asic::bm13xx::{self, protocol},
-    board::bitaxe::BitaxePeripherals,
-    hw_trait::gpio::{GpioPin, PinValue},
     tracing::prelude::*,
     types::{Difficulty, HashRate},
 };
@@ -110,18 +108,18 @@ pub struct BM13xxThread {
 impl BM13xxThread {
     /// Create a new BM13xx thread with Stream/Sink for chip communication
     ///
-    /// Thread starts with chip in reset (uninit). Chip will be initialized when
-    /// first work is assigned.
+    /// Thread starts with chip disabled. Chip will be initialized when first
+    /// work is assigned.
     ///
     /// # Arguments
     /// * `chip_responses` - Stream of decoded responses from chips
     /// * `chip_commands` - Sink for sending encoded commands to chips
-    /// * `peripherals` - Shared peripheral handles (reset pin, voltage regulator)
+    /// * `peripherals` - Hardware interfaces from board (enable, regulator, etc.)
     /// * `removal_rx` - Watch channel for board-triggered removal
     pub fn new<R, W>(
         chip_responses: R,
         chip_commands: W,
-        peripherals: BitaxePeripherals,
+        peripherals: BoardPeripherals,
         removal_rx: watch::Receiver<ThreadRemovalSignal>,
     ) -> Self
     where
@@ -228,15 +226,10 @@ impl HashThread for BM13xxThread {
 
 /// Initialize BM13xx chip for mining.
 ///
-/// Releases chip from reset, configures all registers, and ramps frequency to
-/// target. This is Bitaxe-specific initialization for a single BM1370 chip.
-///
-/// This function contains the complete chip initialization sequence that was
-/// previously done by the board. The chip starts in reset and is configured
-/// for mining when the scheduler assigns first work.
+/// Enables chip, configures all registers, and ramps frequency to target.
 async fn initialize_chip<W>(
     chip_commands: &mut W,
-    peripherals: &mut BitaxePeripherals,
+    peripherals: &mut BoardPeripherals,
 ) -> Result<(), HashThreadError>
 where
     W: Sink<bm13xx::protocol::Command> + Unpin,
@@ -244,20 +237,18 @@ where
 {
     use protocol::{Command, Register};
 
-    // Release from reset
-    tracing::debug!("Releasing ASIC from reset");
-    peripherals
-        .asic_nrst
-        .write(PinValue::High)
-        .await
-        .map_err(|e| {
-            HashThreadError::InitializationFailed(format!("Failed to release reset: {}", e))
+    // Enable the ASIC
+    if let Some(ref mut asic_enable) = peripherals.asic_enable {
+        debug!("Enabling ASIC");
+        asic_enable.enable().await.map_err(|e| {
+            HashThreadError::InitializationFailed(format!("Failed to enable ASIC: {}", e))
         })?;
+    }
 
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
     // Send version mask configuration (3 times)
-    tracing::debug!("Configuring version mask");
+    debug!("Configuring version mask");
     for _ in 1..=3 {
         chip_commands
             .send(Command::WriteRegister {
@@ -278,7 +269,7 @@ where
     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
     // Pre-configuration registers
-    tracing::debug!("Sending pre-configuration registers");
+    debug!("Sending pre-configuration registers");
 
     chip_commands
         .send(Command::WriteRegister {
@@ -317,7 +308,7 @@ where
         })?;
 
     // Core configuration (broadcast)
-    tracing::debug!("Sending broadcast core configuration");
+    debug!("Sending broadcast core configuration");
 
     chip_commands
         .send(Command::WriteRegister {
@@ -377,7 +368,7 @@ where
         })?;
 
     // Chip-specific configuration
-    tracing::debug!("Sending chip-specific configuration");
+    debug!("Sending chip-specific configuration");
 
     chip_commands
         .send(Command::WriteRegister {
@@ -498,7 +489,7 @@ where
         })?;
 
     // Frequency ramping (56.25 MHz -> 525 MHz)
-    tracing::debug!("Ramping frequency from 56.25 MHz to 525 MHz");
+    debug!("Ramping frequency from 56.25 MHz to 525 MHz");
     let frequency_steps = generate_frequency_ramp_steps(56.25, 525.0, 6.25);
 
     for (i, pll_config) in frequency_steps.iter().enumerate() {
@@ -516,11 +507,11 @@ where
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         if i % 10 == 0 || i == frequency_steps.len() - 1 {
-            tracing::trace!("Frequency ramp step {}/{}", i + 1, frequency_steps.len());
+            trace!("Frequency ramp step {}/{}", i + 1, frequency_steps.len());
         }
     }
 
-    tracing::debug!("Frequency ramping complete");
+    debug!("Frequency ramping complete");
 
     // Final configuration
     chip_commands
@@ -686,8 +677,8 @@ fn calculate_pll_for_frequency(target_freq: f32) -> Option<protocol::PllConfig> 
 /// - Serial communication with chips
 /// - Share filtering and event emission (TODO)
 ///
-/// Thread starts with chip in reset (uninit). Chip is configured when scheduler
-/// assigns first work.
+/// Chip is disabled on startup to establish known state. Chip is enabled and
+/// configured when scheduler assigns first work.
 async fn bm13xx_thread_actor<R, W>(
     mut cmd_rx: mpsc::Receiver<ThreadCommand>,
     evt_tx: mpsc::Sender<HashThreadEvent>,
@@ -695,12 +686,19 @@ async fn bm13xx_thread_actor<R, W>(
     status: Arc<RwLock<HashThreadStatus>>,
     mut chip_responses: R,
     mut chip_commands: W,
-    mut peripherals: BitaxePeripherals,
+    mut peripherals: BoardPeripherals,
 ) where
     R: Stream<Item = Result<bm13xx::protocol::Response, std::io::Error>> + Unpin,
     W: Sink<bm13xx::protocol::Command> + Unpin,
     W::Error: std::fmt::Debug,
 {
+    // Disable ASIC on startup to establish known state
+    if let Some(ref mut asic_enable) = peripherals.asic_enable {
+        if let Err(e) = asic_enable.disable().await {
+            warn!(error = %e, "Failed to disable ASIC on startup");
+        }
+    }
+
     let mut chip_initialized = false;
     let mut current_task: Option<HashTask> = None;
     let mut chip_jobs = ChipJobTracker::new();
@@ -980,7 +978,7 @@ async fn bm13xx_thread_actor<R, W>(
         }
     }
 
-    tracing::debug!("BM13xx thread actor exiting");
+    debug!("BM13xx thread actor exiting");
 }
 
 #[cfg(test)]

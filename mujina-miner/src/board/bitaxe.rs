@@ -19,7 +19,7 @@ use crate::{
         bm13xx::{self, protocol::Command, BM13xxProtocol},
         ChipInfo,
     },
-    hash_thread::{bm13xx::BM13xxThread, HashThread, ThreadRemovalSignal},
+    hash_thread::{bm13xx::BM13xxThread, BoardPeripherals, HashThread, ThreadRemovalSignal},
     hw_trait::{
         gpio::{Gpio, GpioPin, PinValue},
         i2c::I2c,
@@ -44,18 +44,29 @@ use super::{
     Board, BoardError, BoardEvent, BoardInfo,
 };
 
-/// Peripheral handles shared between board and hash thread.
-///
-/// Board-specific design choice for Bitaxe: the thread needs direct access to
-/// the reset pin and voltage regulator for real-time chip control. Other boards
-/// may use different cooperation patterns.
-#[derive(Clone)]
-pub struct BitaxePeripherals {
-    /// ASIC reset (active low)
-    pub asic_nrst: BitaxeRawGpioPin,
+/// Adapter implementing `AsicEnable` for Bitaxe's GPIO-based reset control.
+struct BitaxeAsicEnable {
+    /// Reset pin (directly controls nRST on the BM1370)
+    nrst_pin: BitaxeRawGpioPin,
+}
 
-    /// Voltage regulator for core voltage tuning (cached state requires Mutex)
-    pub regulator: Arc<Mutex<Tps546<BitaxeRawI2c>>>,
+#[async_trait]
+impl crate::hash_thread::AsicEnable for BitaxeAsicEnable {
+    async fn enable(&mut self) -> anyhow::Result<()> {
+        // Release reset (nRST is active-low, so High = running)
+        self.nrst_pin
+            .write(PinValue::High)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to release reset: {}", e))
+    }
+
+    async fn disable(&mut self) -> anyhow::Result<()> {
+        // Assert reset (nRST is active-low, so Low = reset)
+        self.nrst_pin
+            .write(PinValue::Low)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to assert reset: {}", e))
+    }
 }
 
 /// A wrapper around AsyncRead that traces raw bytes as they're read
@@ -911,20 +922,19 @@ impl Board for BitaxeBoard {
                 "No data writer available - already taken or not initialized".into(),
             ))?;
 
-        // Create peripheral bundle for thread
-        let peripherals = BitaxePeripherals {
-            asic_nrst: self
-                .asic_nrst
-                .clone()
-                .ok_or(BoardError::InitializationFailed(
-                    "Reset pin not initialized".into(),
-                ))?,
-            regulator: self
-                .regulator
-                .clone()
-                .ok_or(BoardError::InitializationFailed(
-                    "Voltage regulator not initialized".into(),
-                ))?,
+        // Create ASIC enable adapter (wraps GPIO pin)
+        let nrst_pin = self
+            .asic_nrst
+            .clone()
+            .ok_or(BoardError::InitializationFailed(
+                "Reset pin not initialized".into(),
+            ))?;
+        let asic_enable = BitaxeAsicEnable { nrst_pin };
+
+        // Bundle peripherals for thread
+        let peripherals = BoardPeripherals {
+            asic_enable: Some(Box::new(asic_enable)),
+            voltage_regulator: None, // Not used by hash thread yet
         };
 
         // Create BM13xxThread with streams and peripherals
