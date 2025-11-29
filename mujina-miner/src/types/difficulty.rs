@@ -34,6 +34,9 @@ use std::fmt;
 pub struct Difficulty(u64);
 
 impl Difficulty {
+    /// Maximum difficulty (used when hash is zero or impossibly small).
+    pub const MAX: Self = Self(u64::MAX);
+
     /// Create a new difficulty value.
     pub const fn new(value: u64) -> Self {
         Self(value)
@@ -202,7 +205,7 @@ mod tests {
     fn test_difficulty_from_hash() {
         // Target::MAX gives difficulty 1
         let hash = BlockHash::from_byte_array(Target::MAX.to_le_bytes());
-        assert_eq!(Difficulty::from_hash(&hash).0, 1);
+        assert_eq!(Difficulty::from_hash(&hash), Difficulty::new(1));
 
         // Half of Target::MAX gives difficulty 2
         let mut bytes = Target::MAX.to_le_bytes();
@@ -214,16 +217,16 @@ mod tests {
             carry = new_carry;
         }
         let hash = BlockHash::from_byte_array(bytes);
-        assert_eq!(Difficulty::from_hash(&hash).0, 2);
+        assert_eq!(Difficulty::from_hash(&hash), Difficulty::new(2));
 
         // Very small hash gives high difficulty
         let mut bytes = [0u8; 32];
         bytes[0] = 1; // Smallest non-zero LE value
         let hash = BlockHash::from_byte_array(bytes);
-        assert!(Difficulty::from_hash(&hash).0 > 1_000_000);
+        assert!(Difficulty::from_hash(&hash) > Difficulty::new(1_000_000));
 
-        // Zero hash saturates to u64::MAX
+        // Zero hash saturates to MAX
         let hash = BlockHash::from_byte_array([0u8; 32]);
-        assert_eq!(Difficulty::from_hash(&hash).0, u64::MAX);
+        assert_eq!(Difficulty::from_hash(&hash), Difficulty::MAX);
     }
 }
