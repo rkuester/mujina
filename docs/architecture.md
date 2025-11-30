@@ -330,14 +330,24 @@ Mining ASIC drivers:
 - Handles: work distribution, nonce collection, frequency control
 - Communicates through hw_trait layer for maximum flexibility
 
-#### Hash Threads
+#### Hash Threads (`asic/hash_thread.rs`)
 
 Hash threads are the scheduler's abstraction for mining work assignment. The
-`HashThread` trait defines only the minimal interface the scheduler needs:
+`HashThread` trait in `asic/hash_thread.rs` defines the minimal interface the
+scheduler needs:
 - Work assignment methods (`update_work()`, `replace_work()`, `go_idle()`)
 - Event reporting channel for shares and status updates
 - Capability and status queries
 - Future: Scheduler will control thread hashrate for power management
+
+This module also defines hardware abstraction traits (`AsicEnable`,
+`VoltageRegulator`) and `BoardPeripherals` for boards to pass abstract hardware
+interfaces to thread implementations.
+
+ASIC-specific thread implementations live alongside their protocol code (e.g.,
+`asic/bm13xx/thread.rs` for BM13xx chips). This colocates the thread actor with
+the protocol it uses, while the scheduler-facing trait stays in a central
+location.
 
 Everything else---chip communication, peripheral access, internal
 architecture---is board-specific implementation detail. This design allows
