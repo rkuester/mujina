@@ -529,8 +529,6 @@ impl Scheduler {
         status_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut first_tick = true;
 
-        debug!("Scheduler ready (awaiting job sources)");
-
         while !running.is_cancelled() {
             tokio::select! {
                 // Source registration

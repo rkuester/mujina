@@ -119,8 +119,6 @@ impl DummySource {
     /// Emits JobTemplates on a timer and handles share submissions from the
     /// scheduler. Runs until the shutdown token is cancelled.
     pub async fn run(mut self) -> Result<()> {
-        info!("Dummy source starting");
-
         // Send initial job immediately
         debug!(job_id = %self.job_template.id, "Emitting initial job");
         self.event_tx
