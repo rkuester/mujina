@@ -94,6 +94,9 @@ struct SourceEntry {
 
     /// Command channel for sending to this source
     command_tx: mpsc::Sender<SourceCommand>,
+
+    /// Last job received from this source (for assigning to newly-arriving threads)
+    last_job: Option<Arc<JobTemplate>>,
 }
 
 /// Calculates aggregate hashrate from all registered threads.
@@ -203,6 +206,7 @@ pub async fn task(
                 let source_id = sources.insert(SourceEntry {
                     name: registration.name.clone(),
                     command_tx: registration.command_tx,
+                    last_job: None,
                 });
                 source_events.insert(source_id, ReceiverStream::new(registration.event_rx));
                 debug!(source_id = ?source_id, name = %registration.name, "Source registered");
@@ -216,32 +220,20 @@ pub async fn task(
 
             // Source events
             Some((source_id, event)) = source_events.next() => {
-                let source = sources.get(source_id)
-                    .expect("StreamMap returned invalid source_id");
+                // Clone source name upfront to avoid borrow conflicts with caching
+                let source_name = sources.get(source_id)
+                    .expect("StreamMap returned invalid source_id")
+                    .name.clone();
 
                 // TODO: Factor out common job assignment logic (EN2 extraction, ActiveJob
                 // creation, range splitting, work assignment) into helper function
                 match event {
                     SourceEvent::UpdateJob(job_template) => {
                         debug!(
-                            source = %source.name,
+                            source = %source_name,
                             job_id = %job_template.id,
                             "UpdateJob received"
                         );
-
-                        // Skip if no threads registered yet
-                        if threads.is_empty() {
-                            debug!(source = %source.name, "No threads available, skipping job");
-                            continue;
-                        }
-
-                        // Check if difficulty is reasonable for our hashrate (once per source)
-                        if !difficulty_warned_sources.contains(&source_id) {
-                            let hashrate = total_hashrate_estimate(&threads);
-                            if warn_if_difficulty_too_high(&job_template, hashrate, &source.name) {
-                                difficulty_warned_sources.insert(source_id);
-                            }
-                        }
 
                         // Extract EN2 range (only supported for computed merkle roots)
                         let full_en2_range = match &job_template.merkle_root {
@@ -253,6 +245,25 @@ pub async fn task(
                         };
 
                         let template = Arc::new(job_template);
+
+                        // Cache job for newly-arriving threads
+                        if let Some(source) = sources.get_mut(source_id) {
+                            source.last_job = Some(template.clone());
+                        }
+
+                        // Skip assignment if no threads registered yet
+                        if threads.is_empty() {
+                            debug!(source = %source_name, "No threads yet, job cached for later");
+                            continue;
+                        }
+
+                        // Check if difficulty is reasonable for our hashrate (once per source)
+                        if !difficulty_warned_sources.contains(&source_id) {
+                            let hashrate = total_hashrate_estimate(&threads);
+                            if warn_if_difficulty_too_high(&template, hashrate, &source_name) {
+                                difficulty_warned_sources.insert(source_id);
+                            }
+                        }
 
                         // Split EN2 range among all threads
                         let en2_slices = full_en2_range.split(threads.len())
@@ -290,24 +301,10 @@ pub async fn task(
 
                     SourceEvent::ReplaceJob(job_template) => {
                         debug!(
-                            source = %source.name,
+                            source = %source_name,
                             job_id = %job_template.id,
                             "ReplaceJob received"
                         );
-
-                        // Skip if no threads registered yet
-                        if threads.is_empty() {
-                            debug!(source = %source.name, "No threads available, skipping job");
-                            continue;
-                        }
-
-                        // Check if difficulty is reasonable for our hashrate (once per source)
-                        if !difficulty_warned_sources.contains(&source_id) {
-                            let hashrate = total_hashrate_estimate(&threads);
-                            if warn_if_difficulty_too_high(&job_template, hashrate, &source.name) {
-                                difficulty_warned_sources.insert(source_id);
-                            }
-                        }
 
                         // Extract EN2 range (only supported for computed merkle roots)
                         let full_en2_range = match &job_template.merkle_root {
@@ -317,6 +314,27 @@ pub async fn task(
                                 continue;
                             }
                         };
+
+                        let template = Arc::new(job_template);
+
+                        // Cache job for newly-arriving threads
+                        if let Some(source) = sources.get_mut(source_id) {
+                            source.last_job = Some(template.clone());
+                        }
+
+                        // Skip assignment if no threads registered yet
+                        if threads.is_empty() {
+                            debug!(source = %source_name, "No threads yet, job cached for later");
+                            continue;
+                        }
+
+                        // Check if difficulty is reasonable for our hashrate (once per source)
+                        if !difficulty_warned_sources.contains(&source_id) {
+                            let hashrate = total_hashrate_estimate(&threads);
+                            if warn_if_difficulty_too_high(&template, hashrate, &source_name) {
+                                difficulty_warned_sources.insert(source_id);
+                            }
+                        }
 
                         // Invalidate old tasks for this source (close channels, stale shares fail)
                         let old_task_ids: Vec<TaskId> = tasks
@@ -328,8 +346,6 @@ pub async fn task(
                             tasks.remove(task_id);
                             share_channels.remove(&task_id);
                         }
-
-                        let template = Arc::new(job_template);
 
                         // Split EN2 range among all threads
                         let en2_slices = full_en2_range.split(threads.len())
@@ -366,7 +382,12 @@ pub async fn task(
                     }
 
                     SourceEvent::ClearJobs => {
-                        debug!(source = %source.name, "ClearJobs received");
+                        debug!(source = %source_name, "ClearJobs received");
+
+                        // Clear cached job so newly-arriving threads don't get stale work
+                        if let Some(source) = sources.get_mut(source_id) {
+                            source.last_job = None;
+                        }
 
                         // Remove tasks for this source (channels close, stale shares fail)
                         // Don't idle threads---they continue with current work until
@@ -476,6 +497,45 @@ pub async fn task(
                 difficulty_warned_sources.clear();
 
                 last_thread_count = thread_events.len();
+
+                // Assign cached jobs from all sources to the new thread
+                for (source_id, source) in sources.iter() {
+                    let Some(template) = &source.last_job else { continue };
+
+                    // Extract full EN2 range (new thread overlaps with others)
+                    let full_en2_range = match &template.merkle_root {
+                        MerkleRootKind::Computed(t) => t.extranonce2_range.clone(),
+                        MerkleRootKind::Fixed(_) => continue,
+                    };
+
+                    let (share_tx, share_rx) = mpsc::channel(32);
+                    let hash_task = HashTask {
+                        template: template.clone(),
+                        en2_range: Some(full_en2_range.clone()),
+                        en2: full_en2_range.iter().next(),
+                        share_target: template.share_target,
+                        ntime: template.time,
+                        share_tx,
+                    };
+
+                    let thread = threads.get_mut(thread_id).expect("Just inserted thread");
+                    if let Err(e) = thread.update_task(hash_task).await {
+                        error!(thread_id = ?thread_id, error = %e, "Failed to assign cached job");
+                    } else {
+                        let task_id = tasks.insert(TaskEntry {
+                            source_id,
+                            template: template.clone(),
+                            thread_id,
+                        });
+                        share_channels.insert(task_id, ReceiverStream::new(share_rx));
+                        debug!(
+                            thread_id = ?thread_id,
+                            source = %source.name,
+                            job_id = %template.id,
+                            "Assigned cached job to new thread"
+                        );
+                    }
+                }
             }
 
             // Periodic status check
