@@ -1,37 +1,19 @@
-//! EmberOne mining board support.
+//! EmberOne mining board support (stub).
 //!
 //! The EmberOne is a mining board with 12 BM1362 ASIC chips, communicating via
 //! USB using the bitaxe-raw protocol (same as Bitaxe boards).
 //!
-//! ## Current Implementation Status
-//!
-//! This is currently a stub implementation that:
-//! - Gets discovered via USB (VID 0xc0de, PID 0xcafe)
-//! - Logs when connected
-//! - Returns errors for all operations (not yet implemented)
-//!
-//! ## Future Implementation
-//!
-//! Will support:
-//! - 12 BM1362 ASIC chips in a chain configuration
-//! - Dual serial ports (control + data)
-//! - bitaxe-raw management protocol
-//! - Temperature and power monitoring
-//! - Full mining operations
+//! This is currently a stub implementation pending full support.
 
 use async_trait::async_trait;
-use tokio::sync::mpsc;
 
 use super::{
-    pattern::{Match, StringMatch},
-    Board, BoardError, BoardEvent, BoardInfo,
+    pattern::{BoardPattern, Match, StringMatch},
+    Board, BoardDescriptor, BoardError, BoardInfo,
 };
-use crate::{
-    asic::{hash_thread::HashThread, ChipInfo},
-    transport::UsbDeviceInfo,
-};
+use crate::{asic::hash_thread::HashThread, error::Error, transport::UsbDeviceInfo};
 
-/// EmberOne mining board (stub implementation).
+/// EmberOne mining board (stub).
 pub struct EmberOne {
     device_info: UsbDeviceInfo,
 }
@@ -45,45 +27,12 @@ impl EmberOne {
 
 #[async_trait]
 impl Board for EmberOne {
-    async fn reset(&mut self) -> Result<(), BoardError> {
-        Err(BoardError::InitializationFailed(
-            "EmberOne reset not yet implemented".into(),
-        ))
-    }
-
-    async fn hold_in_reset(&mut self) -> Result<(), BoardError> {
-        Err(BoardError::InitializationFailed(
-            "EmberOne hold_in_reset not yet implemented".into(),
-        ))
-    }
-
-    async fn initialize(&mut self) -> Result<mpsc::Receiver<BoardEvent>, BoardError> {
-        Err(BoardError::InitializationFailed(
-            "EmberOne initialize not yet implemented".into(),
-        ))
-    }
-
-    fn chip_count(&self) -> usize {
-        // EmberOne has 12 BM1362 chips, but not yet implemented
-        0
-    }
-
-    fn chip_infos(&self) -> &[ChipInfo] {
-        // No chips discovered yet in stub
-        &[]
-    }
-
     fn board_info(&self) -> BoardInfo {
         BoardInfo {
-            model: "EmberOne (stub)".to_string(),
+            model: "EmberOne".to_string(),
             firmware_version: None,
             serial_number: self.device_info.serial_number.clone(),
         }
-    }
-
-    fn take_event_receiver(&mut self) -> Option<mpsc::Receiver<BoardEvent>> {
-        // Stub has no event receiver yet
-        None
     }
 
     async fn shutdown(&mut self) -> Result<(), BoardError> {
@@ -93,43 +42,23 @@ impl Board for EmberOne {
 
     async fn create_hash_threads(&mut self) -> Result<Vec<Box<dyn HashThread>>, BoardError> {
         Err(BoardError::InitializationFailed(
-            "EmberOne hash threads not yet implemented".into(),
+            "EmberOne not yet implemented".into(),
         ))
     }
 }
 
 // Factory function to create EmberOne board from USB device info
 async fn create_from_usb(device: UsbDeviceInfo) -> crate::error::Result<Box<dyn Board + Send>> {
-    // Get serial ports
-    let serial_ports = device.serial_ports()?;
-
-    // EmberOne uses 2 serial ports like Bitaxe (control + data)
-    if serial_ports.len() != 2 {
-        tracing::warn!(
-            expected = 2,
-            found = serial_ports.len(),
-            serial = ?device.serial_number,
-            "EmberOne expected 2 serial ports, creating stub anyway"
-        );
-    } else {
-        tracing::debug!(
-            serial = ?device.serial_number,
-            control = %serial_ports[0],
-            data = %serial_ports[1],
-            "EmberOne serial ports"
-        );
-    }
-
     let board = EmberOne::new(device)
-        .map_err(|e| crate::error::Error::Hardware(format!("Failed to create board: {}", e)))?;
+        .map_err(|e| Error::Hardware(format!("Failed to create board: {}", e)))?;
 
     Ok(Box::new(board))
 }
 
 // Register this board type with the inventory system
 inventory::submit! {
-    crate::board::BoardDescriptor {
-        pattern: crate::board::pattern::BoardPattern {
+    BoardDescriptor {
+        pattern: BoardPattern {
             vid: Match::Any,
             pid: Match::Any,
             manufacturer: Match::Specific(StringMatch::Exact("256F")),
@@ -160,7 +89,6 @@ mod tests {
         assert!(board.is_ok());
 
         let board = board.unwrap();
-        assert_eq!(board.chip_count(), 0); // Stub returns 0 chips
-        assert_eq!(board.board_info().model, "EmberOne (stub)");
+        assert_eq!(board.board_info().model, "EmberOne");
     }
 }

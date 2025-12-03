@@ -8,7 +8,7 @@ use std::{
 };
 use tokio::{
     io::{AsyncRead, ReadBuf},
-    sync::{mpsc, watch, Mutex},
+    sync::{watch, Mutex},
     time,
 };
 use tokio_stream::StreamExt;
@@ -41,7 +41,7 @@ use crate::{
 
 use super::{
     pattern::{Match, StringMatch},
-    Board, BoardError, BoardEvent, BoardInfo,
+    Board, BoardError, BoardInfo,
 };
 
 /// Adapter implementing `AsicEnable` for Bitaxe's GPIO-based reset control.
@@ -134,10 +134,6 @@ pub struct BitaxeBoard {
     data_control: SerialControl,
     /// Discovered chip information (passive record-keeping)
     chip_infos: Vec<ChipInfo>,
-    /// Channel for sending board events
-    event_tx: Option<mpsc::Sender<BoardEvent>>,
-    /// Channel for receiving board events (populated during initialization)
-    event_rx: Option<mpsc::Receiver<BoardEvent>>,
     /// Thread shutdown signal (board-to-thread implementation detail)
     thread_shutdown: Option<watch::Sender<ThreadRemovalSignal>>,
     /// Handle for the statistics task
@@ -198,8 +194,6 @@ impl BitaxeBoard {
             data_reader: Some(FramedRead::new(tracing_reader, bm13xx::FrameCodec)),
             data_control,
             chip_infos: Vec::new(),
-            event_tx: None,
-            event_rx: None,
             thread_shutdown: None,
             stats_task_handle: None,
             serial_number,
@@ -210,6 +204,7 @@ impl BitaxeBoard {
     ///
     /// This function toggles the reset line low for 100ms, then high for 100ms
     /// to properly reset all connected mining chips.
+    #[expect(dead_code, reason = "will be used for error recovery")]
     pub async fn momentary_reset(&mut self) -> Result<(), BoardError> {
         const WAIT: Duration = Duration::from_millis(100);
 
@@ -606,13 +601,90 @@ impl BitaxeBoard {
         ))
     }
 
+    /// Initialize the board and discover connected chips.
+    ///
+    /// After initialization, the board is ready for `create_hash_threads()`.
+    pub async fn initialize(&mut self) -> Result<(), BoardError> {
+        // Create GPIO controller and get reset pin handle
+        let mut gpio_controller = BitaxeRawGpioController::new(self.control_channel.clone());
+        let reset_pin = gpio_controller
+            .pin(Self::ASIC_RESET_PIN)
+            .await
+            .map_err(|e| {
+                BoardError::InitializationFailed(format!("Failed to get reset pin: {}", e))
+            })?;
+        self.asic_nrst = Some(reset_pin);
+
+        // Phase 1: Hold ASIC in reset during power configuration
+        trace!("Holding ASIC in reset during power initialization");
+        self.hold_in_reset().await?;
+
+        // Phase 2: Initialize power controller while ASIC is in reset
+        self.i2c.set_frequency(100_000).await.map_err(|e| {
+            BoardError::InitializationFailed(format!("Failed to set I2C frequency: {}", e))
+        })?;
+
+        self.init_fan_controller().await?;
+        self.init_power_controller().await?;
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // Phase 3: Release ASIC from reset for discovery
+        debug!("Releasing ASIC from reset for discovery");
+        self.release_reset().await?;
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Phase 4: Version mask and chip discovery
+        debug!("Sending version mask configuration (3 times)");
+        for i in 1..=3 {
+            trace!("Version mask send {}/3", i);
+            let version_cmd = Command::WriteRegister {
+                broadcast: true,
+                chip_address: 0x00,
+                register: bm13xx::protocol::Register::VersionMask(
+                    bm13xx::protocol::VersionMask::full_rolling(),
+                ),
+            };
+            self.send_config_command(version_cmd).await?;
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        self.discover_chips().await?;
+
+        debug!(count = self.chip_infos.len(), "Discovered chips");
+
+        // Verify expected BM1370 chip was found
+        if let Some(first_chip) = self.chip_infos.first() {
+            if first_chip.chip_id != Self::EXPECTED_CHIP_ID {
+                return Err(BoardError::InitializationFailed(format!(
+                    "Wrong chip type for Bitaxe Gamma: expected BM1370 ({:02x}{:02x}), found {:02x}{:02x}",
+                    Self::EXPECTED_CHIP_ID[0], Self::EXPECTED_CHIP_ID[1],
+                    first_chip.chip_id[0], first_chip.chip_id[1]
+                )));
+            }
+        }
+
+        // Put chip back in reset
+        self.hold_in_reset().await?;
+
+        // Spawn statistics monitoring task
+        self.spawn_stats_monitor();
+
+        Ok(())
+    }
+
+    /// Number of discovered chips on this board.
+    pub fn chip_count(&self) -> usize {
+        self.chip_infos.len()
+    }
+
     /// Spawn a task to periodically log management statistics
     fn spawn_stats_monitor(&mut self) {
         // Clone data needed for the monitoring task
         let i2c = self.i2c.clone();
-
-        // Clone event channel for reporting critical faults
-        let event_tx = self.event_tx.clone();
 
         // Clone the regulator Arc for stats monitoring
         let regulator = self
@@ -701,20 +773,7 @@ impl BitaxeBoard {
 
                 // Check power status - critical faults will return error
                 if let Err(e) = regulator.lock().await.check_status().await {
-                    // Log the critical fault
                     error!("CRITICAL: Power controller fault detected: {}", e);
-
-                    // Send BoardFault event
-                    if let Some(ref tx) = event_tx {
-                        let fault_event = BoardEvent::BoardFault {
-                            component: "power_controller".to_string(),
-                            fault: e.to_string(),
-                            recoverable: false, // Power faults are critical
-                        };
-                        if let Err(send_err) = tx.send(fault_event).await {
-                            error!("Failed to send board fault event: {}", send_err);
-                        }
-                    }
 
                     // Try to clear the fault once
                     warn!("Attempting to clear power controller faults...");
@@ -722,8 +781,7 @@ impl BitaxeBoard {
                         error!("Failed to clear faults: {}", clear_err);
                     }
 
-                    // Continue monitoring - let scheduler decide what to do
-                    // Don't exit the task, just skip this iteration
+                    // Continue monitoring
                     continue;
                 }
 
@@ -749,114 +807,12 @@ impl BitaxeBoard {
 
 #[async_trait]
 impl Board for BitaxeBoard {
-    async fn reset(&mut self) -> Result<(), BoardError> {
-        self.momentary_reset().await?;
-        Ok(())
-    }
-
-    async fn hold_in_reset(&mut self) -> Result<(), BoardError> {
-        BitaxeBoard::hold_in_reset(self).await?;
-        Ok(())
-    }
-
-    async fn initialize(&mut self) -> Result<mpsc::Receiver<BoardEvent>, BoardError> {
-        // Create GPIO controller and get reset pin handle
-        let mut gpio_controller = BitaxeRawGpioController::new(self.control_channel.clone());
-        let reset_pin = gpio_controller
-            .pin(Self::ASIC_RESET_PIN)
-            .await
-            .map_err(|e| {
-                BoardError::InitializationFailed(format!("Failed to get reset pin: {}", e))
-            })?;
-        self.asic_nrst = Some(reset_pin);
-
-        // Phase 1: Hold ASIC in reset during power configuration
-        trace!("Holding ASIC in reset during power initialization");
-        self.hold_in_reset().await?;
-
-        // Phase 2: Initialize power controller while ASIC is in reset
-        self.i2c.set_frequency(100_000).await.map_err(|e| {
-            BoardError::InitializationFailed(format!("Failed to set I2C frequency: {}", e))
-        })?;
-
-        self.init_fan_controller().await?;
-        self.init_power_controller().await?;
-
-        tokio::time::sleep(Duration::from_millis(500)).await;
-
-        // Phase 3: Release ASIC from reset for discovery
-        debug!("Releasing ASIC from reset for discovery");
-        self.release_reset().await?;
-
-        tokio::time::sleep(Duration::from_millis(200)).await;
-
-        // Phase 4: Version mask and chip discovery
-        debug!("Sending version mask configuration (3 times)");
-        for i in 1..=3 {
-            trace!("Version mask send {}/3", i);
-            let version_cmd = Command::WriteRegister {
-                broadcast: true,
-                chip_address: 0x00,
-                register: bm13xx::protocol::Register::VersionMask(
-                    bm13xx::protocol::VersionMask::full_rolling(),
-                ),
-            };
-            self.send_config_command(version_cmd).await?;
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-
-        tokio::time::sleep(Duration::from_millis(10)).await;
-
-        self.discover_chips().await?;
-
-        debug!(count = self.chip_infos.len(), "Discovered chips");
-
-        // Verify expected BM1370 chip was found
-        if let Some(first_chip) = self.chip_infos.first() {
-            if first_chip.chip_id != Self::EXPECTED_CHIP_ID {
-                return Err(BoardError::InitializationFailed(format!(
-                    "Wrong chip type for Bitaxe Gamma: expected BM1370 ({:02x}{:02x}), found {:02x}{:02x}",
-                    Self::EXPECTED_CHIP_ID[0], Self::EXPECTED_CHIP_ID[1],
-                    first_chip.chip_id[0], first_chip.chip_id[1]
-                )));
-            }
-        }
-
-        // Put chip back in reset
-        self.hold_in_reset().await?;
-
-        // Create event channel
-        let (tx, rx) = tokio::sync::mpsc::channel(100);
-        self.event_tx = Some(tx);
-        self.event_rx = Some(rx);
-
-        // Spawn statistics monitoring task
-        self.spawn_stats_monitor();
-
-        // Return a dummy receiver for trait compatibility
-        let (dummy_tx, dummy_rx) = tokio::sync::mpsc::channel(1);
-        drop(dummy_tx);
-        Ok(dummy_rx)
-    }
-
-    fn chip_count(&self) -> usize {
-        self.chip_infos.len()
-    }
-
-    fn chip_infos(&self) -> &[ChipInfo] {
-        &self.chip_infos
-    }
-
     fn board_info(&self) -> BoardInfo {
         BoardInfo {
             model: "Bitaxe Gamma".to_string(),
             firmware_version: Some("bitaxe-raw".to_string()),
             serial_number: self.serial_number.clone(),
         }
-    }
-
-    fn take_event_receiver(&mut self) -> Option<tokio::sync::mpsc::Receiver<BoardEvent>> {
-        self.event_rx.take()
     }
 
     async fn shutdown(&mut self) -> Result<(), BoardError> {
@@ -975,12 +931,10 @@ async fn create_from_usb(
         .map_err(|e| crate::error::Error::Hardware(format!("Failed to create board: {}", e)))?;
 
     // Initialize the board (reset, discover chips, start event monitoring)
-    let _dummy_rx = board
+    board
         .initialize()
         .await
         .map_err(|e| crate::error::Error::Hardware(format!("Failed to initialize board: {}", e)))?;
-
-    // Event receiver is retrieved by the scheduler using take_event_receiver()
 
     debug!(
         "Bitaxe board initialized successfully with {} chips",

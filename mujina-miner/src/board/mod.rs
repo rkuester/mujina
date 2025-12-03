@@ -4,103 +4,18 @@ pub mod pattern;
 
 use async_trait::async_trait;
 use std::{error::Error, fmt, future::Future, pin::Pin};
-use tokio::sync::mpsc;
 
-use crate::{
-    asic::{hash_thread::HashThread, ChipError, ChipInfo, NonceResult},
-    transport::UsbDeviceInfo,
-};
-
-/// Events emitted by a board during operation.
-#[derive(Debug, Clone)]
-pub enum BoardEvent {
-    /// A chip found a valid nonce
-    NonceFound(NonceResult),
-
-    /// A mining job has completed
-    JobComplete {
-        job_id: u64,
-        reason: JobCompleteReason,
-    },
-
-    /// An error occurred with a specific chip
-    ChipError {
-        chip_address: u8,
-        error: String, // String because ChipError might not be Clone
-    },
-
-    /// A chip's status changed (e.g., temperature, frequency)
-    ChipStatusUpdate {
-        chip_address: u8,
-        temperature_c: Option<f32>,
-        frequency_mhz: Option<u32>,
-    },
-
-    /// A critical board fault occurred
-    BoardFault {
-        component: String, // e.g., "power_controller", "temperature_sensor"
-        fault: String,     // Description of the fault
-        recoverable: bool, // Whether the board might recover
-    },
-}
-
-/// Reasons why a mining job completed.
-#[derive(Debug, Clone, Copy)]
-pub enum JobCompleteReason {
-    /// The chip reported that it finished searching its nonce range
-    RangeExhausted,
-
-    /// The board estimated completion based on elapsed time
-    TimeoutEstimate,
-
-    /// The job was cancelled by the user
-    Cancelled,
-
-    /// A new job was sent, implicitly completing the previous one
-    Superseded,
-}
+use crate::{asic::hash_thread::HashThread, transport::UsbDeviceInfo};
 
 /// Represents a mining board containing one or more ASIC chips.
 ///
-/// A board provides the interface between the host system and mining chips,
-/// handling hardware initialization, reset, chip discovery, and mining operations.
-///
-/// Board implementations communicate asynchronously via an event stream rather
-/// than polling, allowing efficient handling of nonces and job completion.
+/// A board manages hardware peripherals (power, cooling, monitoring) and
+/// creates hash threads that handle chip communication. The backplane creates
+/// boards via factory functions and manages their lifecycle through this trait.
 #[async_trait]
 pub trait Board: Send {
-    /// Reset the board hardware.
-    ///
-    /// This typically involves toggling GPIO pins or sending reset commands
-    /// to bring the board to a known state.
-    async fn reset(&mut self) -> Result<(), BoardError>;
-
-    /// Hold the board's chips in reset state.
-    ///
-    /// This keeps the reset line asserted (low) to ensure chips remain
-    /// disabled. Used during shutdown to ensure a safe state.
-    async fn hold_in_reset(&mut self) -> Result<(), BoardError>;
-
-    /// Initialize the board and discover connected chips.
-    ///
-    /// After initialization, the board is ready to receive mining jobs.
-    /// Returns a receiver for board events.
-    async fn initialize(&mut self) -> Result<mpsc::Receiver<BoardEvent>, BoardError>;
-
-    /// Number of discovered chips on this board.
-    fn chip_count(&self) -> usize;
-
-    /// Information about discovered chips.
-    fn chip_infos(&self) -> &[ChipInfo];
-
     /// Board identification and metadata.
     fn board_info(&self) -> BoardInfo;
-
-    /// Take ownership of the event receiver for this board.
-    ///
-    /// Must be called after initialization to receive board events.
-    /// Returns None if the board hasn't been initialized or receiver was already taken.
-    fn take_event_receiver(&mut self) -> Option<mpsc::Receiver<BoardEvent>>;
 
     /// Gracefully shutdown the board.
     ///
@@ -109,7 +24,7 @@ pub trait Board: Send {
     /// stopping hashing and ensuring chips are in a low-power or reset state.
     async fn shutdown(&mut self) -> Result<(), BoardError>;
 
-    /// Create hash threads for this board
+    /// Create hash threads for this board.
     ///
     /// Transfers serial channel ownership to threads. Board retains peripheral
     /// control (power, cooling, monitoring) and thread shutdown authority.
@@ -137,12 +52,8 @@ pub enum BoardError {
     InitializationFailed(String),
     /// Communication error with board
     Communication(std::io::Error),
-    /// Chip-related error
-    Chip(ChipError),
     /// GPIO or hardware control error
     HardwareControl(String),
-    /// Other error
-    Other(Box<dyn Error + Send + Sync>),
 }
 
 impl fmt::Display for BoardError {
@@ -152,9 +63,7 @@ impl fmt::Display for BoardError {
                 write!(f, "Board initialization failed: {}", msg)
             }
             BoardError::Communication(err) => write!(f, "Board communication error: {}", err),
-            BoardError::Chip(err) => write!(f, "Chip error: {}", err),
             BoardError::HardwareControl(msg) => write!(f, "Hardware control error: {}", msg),
-            BoardError::Other(err) => write!(f, "Board error: {}", err),
         }
     }
 }
@@ -164,12 +73,6 @@ impl Error for BoardError {}
 impl From<std::io::Error> for BoardError {
     fn from(err: std::io::Error) -> Self {
         BoardError::Communication(err)
-    }
-}
-
-impl From<ChipError> for BoardError {
-    fn from(err: ChipError) -> Self {
-        BoardError::Chip(err)
     }
 }
 
