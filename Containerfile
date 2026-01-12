@@ -27,4 +27,4 @@ LABEL org.opencontainers.image.source=https://github.com/256foundation/mujina
 USER mujina
 EXPOSE 7785
 
-ENTRYPOINT ["mujina-minerd"]
+CMD ["mujina-minerd"]
