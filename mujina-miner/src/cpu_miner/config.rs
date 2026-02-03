@@ -52,7 +52,8 @@ mod tests {
     #[test]
     #[serial]
     fn test_from_env_disabled_when_not_set() {
-        std::env::remove_var("MUJINA_CPUMINER_THREADS");
+        // SAFETY: Test runs serially, no concurrent env access
+        unsafe { std::env::remove_var("MUJINA_CPUMINER_THREADS") };
 
         let config = CpuMinerConfig::from_env();
         assert!(config.is_none());
@@ -61,16 +62,22 @@ mod tests {
     #[test]
     #[serial]
     fn test_duty_clamped_to_valid_range() {
-        // Upper bound: 150 -> 100
-        std::env::set_var("MUJINA_CPUMINER_THREADS", "99");
-        std::env::set_var("MUJINA_CPUMINER_DUTY", "150");
+        // SAFETY: Test runs serially, no concurrent env access
+        unsafe {
+            // Upper bound: 150 -> 100
+            std::env::set_var("MUJINA_CPUMINER_THREADS", "99");
+            std::env::set_var("MUJINA_CPUMINER_DUTY", "150");
+        }
         if let Some(config) = CpuMinerConfig::from_env() {
             assert_eq!(config.duty_percent, 100);
         }
 
-        // Lower bound: 0 -> 1
-        std::env::set_var("MUJINA_CPUMINER_THREADS", "99");
-        std::env::set_var("MUJINA_CPUMINER_DUTY", "0");
+        // SAFETY: Test runs serially, no concurrent env access
+        unsafe {
+            // Lower bound: 0 -> 1
+            std::env::set_var("MUJINA_CPUMINER_THREADS", "99");
+            std::env::set_var("MUJINA_CPUMINER_DUTY", "0");
+        }
         if let Some(config) = CpuMinerConfig::from_env() {
             assert_eq!(config.duty_percent, 1);
         }

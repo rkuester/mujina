@@ -181,7 +181,7 @@ pub fn run_mining_loop(
                 }
 
                 // Try this nonce
-                if let (Some(ref task), Some(merkle_root)) = (&current_task, cached_merkle_root) {
+                if let (Some(task), Some(merkle_root)) = (&current_task, cached_merkle_root) {
                     if let Some(share) = try_nonce(task, merkle_root, nonce) {
                         shares_found += 1;
                         debug!(

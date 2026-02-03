@@ -3,7 +3,7 @@ members = ["mujina-miner", "tools/mujina-dissect"]
 resolver = "2"
 
 [workspace.package]
-edition = "2021"
+edition = "2024"
 license = "GPL-3.0-or-later"
 authors = ["Ryan Kuester <rkuester@insymbols.com>"]
 repository = "https://github.com/256-Foundation/Mujina-Mining-Firmware"
