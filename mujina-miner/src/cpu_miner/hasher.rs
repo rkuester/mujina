@@ -21,9 +21,9 @@
 //! 10-20+ MH/s per thread on modern hardware.
 
 use std::sync::{
+    Arc, RwLock,
     atomic::{AtomicBool, Ordering},
     mpsc::{self, TryRecvError},
-    Arc, RwLock,
 };
 use std::time::{Duration, Instant};
 
@@ -371,7 +371,7 @@ mod tests {
     #[test]
     fn test_try_nonce_with_computed_merkle_root() {
         use crate::job_source::{
-            test_blocks::block_881423, Extranonce2, Extranonce2Range, MerkleRootTemplate,
+            Extranonce2, Extranonce2Range, MerkleRootTemplate, test_blocks::block_881423,
         };
 
         // Use block 881423 test data (same as dummy source)

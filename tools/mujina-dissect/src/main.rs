@@ -10,8 +10,8 @@ use anyhow::{Context, Result};
 use bm13xx::{CommandStreamingParser, DecodedFrame, ParsedItem, ResponseStreamingParser};
 use capture::{BaudRate, CaptureEvent, CaptureReader, Channel};
 use clap::Parser;
-use dissect::{dissect_decoded_frame, dissect_i2c_operation_with_context, I2cContexts};
-use i2c::{group_pmbus_transactions, group_transactions, I2cAssembler};
+use dissect::{I2cContexts, dissect_decoded_frame, dissect_i2c_operation_with_context};
+use i2c::{I2cAssembler, group_pmbus_transactions, group_transactions};
 use output::{OutputConfig, OutputEvent};
 use std::path::PathBuf;
 

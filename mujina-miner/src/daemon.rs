@@ -16,14 +16,14 @@ use crate::{
     backplane::Backplane,
     cpu_miner::CpuMinerConfig,
     job_source::{
+        SourceCommand, SourceEvent,
         dummy::DummySource,
         forced_rate::{ForcedRateConfig, ForcedRateSource},
         stratum_v1::StratumV1Source,
-        SourceCommand, SourceEvent,
     },
     scheduler::{self, SourceRegistration},
-    stratum_v1::{PoolConfig as StratumPoolConfig, FLOOD_PREVENTION_CAP},
-    transport::{cpu as cpu_transport, CpuDeviceInfo, TransportEvent, UsbTransport},
+    stratum_v1::{FLOOD_PREVENTION_CAP, PoolConfig as StratumPoolConfig},
+    transport::{CpuDeviceInfo, TransportEvent, UsbTransport, cpu as cpu_transport},
 };
 
 /// The main daemon.

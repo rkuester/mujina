@@ -20,7 +20,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, trace, warn};
 
 use super::{JobTemplate, SourceCommand, SourceEvent};
-use crate::types::{target_for_share_rate, Difficulty, HashRate, ShareRate};
+use crate::types::{Difficulty, HashRate, ShareRate, target_for_share_rate};
 
 /// Configuration for forced share rate wrapper.
 pub struct ForcedRateConfig {
@@ -185,10 +185,10 @@ mod tests {
     use super::*;
     use crate::job_source::{GeneralPurposeBits, MerkleRootKind, VersionTemplate};
     use crate::types::target_for_share_rate;
+    use bitcoin::BlockHash;
     use bitcoin::block::Version;
     use bitcoin::hashes::Hash;
     use bitcoin::pow::{CompactTarget, Target};
-    use bitcoin::BlockHash;
 
     /// Test harness holding all channel endpoints for a ForcedRateSource.
     struct TestHarness {

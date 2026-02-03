@@ -20,15 +20,15 @@ use std::io;
 use std::os::unix::io::FromRawFd;
 use std::os::unix::io::{AsRawFd, BorrowedFd, IntoRawFd, RawFd};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
 use futures::ready;
 use parking_lot::RwLock;
-use rustix::fs::{open, Mode, OFlags};
-use rustix::termios::{tcdrain, tcgetattr, tcsetattr, ControlModes};
+use rustix::fs::{Mode, OFlags, open};
+use rustix::termios::{ControlModes, tcdrain, tcgetattr, tcsetattr};
 use tokio::io::unix::AsyncFd;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
@@ -165,7 +165,7 @@ fn apply_serial_config<Fd: rustix::fd::AsFd>(
             return Err(SerialError::ConfigError(format!(
                 "Invalid data bits: {}",
                 config.data_bits
-            )))
+            )));
         }
     }
 
@@ -192,7 +192,7 @@ fn apply_serial_config<Fd: rustix::fd::AsFd>(
             return Err(SerialError::ConfigError(format!(
                 "Invalid stop bits: {}",
                 config.stop_bits
-            )))
+            )));
         }
     }
 
@@ -442,7 +442,7 @@ impl SerialControl {
             None => {
                 return Err(SerialError::ConfigError(
                     "Failed to acquire configuration lock - possible deadlock".to_string(),
-                ))
+                ));
             }
         };
 
@@ -615,7 +615,7 @@ mod tests {
 
         /// Virtual serial port pair for integration tests using pty
         pub async fn create_virtual_pair() -> Result<(SerialStream, SerialStream), SerialError> {
-            use nix::pty::{openpty, OpenptyResult};
+            use nix::pty::{OpenptyResult, openpty};
 
             // Create a pseudo-terminal pair
             let OpenptyResult { master, slave } = openpty(None, None)

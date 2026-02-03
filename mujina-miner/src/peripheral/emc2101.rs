@@ -7,7 +7,7 @@
 //! Datasheet: <https://www.microchip.com/en-us/product/emc2101>
 
 use crate::{
-    hw_trait::{i2c::I2c, HwError, Result},
+    hw_trait::{HwError, Result, i2c::I2c},
     tracing::prelude::*,
 };
 
@@ -21,11 +21,7 @@ pub struct Percent(u8);
 impl Percent {
     /// Creates a new percentage, clamping to 0-100 range
     pub const fn new_clamped(value: u8) -> Self {
-        if value > 100 {
-            Self(100)
-        } else {
-            Self(value)
-        }
+        if value > 100 { Self(100) } else { Self(value) }
     }
 
     /// Creates a new percentage if value is in range
@@ -373,9 +369,7 @@ impl<I: I2c> Emc2101<I> {
         let count = ((high as u16) << 8) | (low as u16);
         trace!(
             "TACH registers: HIGH=0x{:02X}, LOW=0x{:02X}, combined=0x{:04X}",
-            high,
-            low,
-            count
+            high, low, count
         );
 
         Ok(count)

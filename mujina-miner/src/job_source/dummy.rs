@@ -13,7 +13,7 @@ use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 
-use crate::types::{target_for_share_rate, HashRate, ShareRate};
+use crate::types::{HashRate, ShareRate, target_for_share_rate};
 
 use super::test_blocks::block_881423;
 use super::{

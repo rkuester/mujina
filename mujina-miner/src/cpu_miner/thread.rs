@@ -4,8 +4,9 @@
 //! Uses the actor pattern with a dedicated `std::thread` for hashing.
 
 use std::sync::{
+    Arc, RwLock,
     atomic::{AtomicBool, Ordering},
-    mpsc, Arc, RwLock,
+    mpsc,
 };
 
 use async_trait::async_trait;

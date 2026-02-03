@@ -8,7 +8,7 @@ use std::{
 };
 use tokio::{
     io::{AsyncRead, ReadBuf},
-    sync::{watch, Mutex},
+    sync::{Mutex, watch},
     time,
 };
 use tokio_stream::StreamExt;
@@ -16,20 +16,20 @@ use tokio_util::codec::{FramedRead, FramedWrite};
 
 use crate::{
     asic::{
-        bm13xx::{self, protocol::Command, thread::BM13xxThread, BM13xxProtocol},
-        hash_thread::{BoardPeripherals, HashThread, ThreadRemovalSignal},
         ChipInfo,
+        bm13xx::{self, BM13xxProtocol, protocol::Command, thread::BM13xxThread},
+        hash_thread::{BoardPeripherals, HashThread, ThreadRemovalSignal},
     },
     hw_trait::{
         gpio::{Gpio, GpioPin, PinValue},
         i2c::I2c,
     },
     mgmt_protocol::{
+        ControlChannel,
         bitaxe_raw::{
             gpio::{BitaxeRawGpioController, BitaxeRawGpioPin},
             i2c::BitaxeRawI2c,
         },
-        ControlChannel,
     },
     peripheral::{
         emc2101::{Emc2101, Percent},
@@ -40,8 +40,8 @@ use crate::{
 };
 
 use super::{
-    pattern::{Match, StringMatch},
     Board, BoardError, BoardInfo,
+    pattern::{Match, StringMatch},
 };
 
 /// Adapter implementing `AsicEnable` for Bitaxe's GPIO-based reset control.
@@ -662,8 +662,10 @@ impl BitaxeBoard {
         {
             return Err(BoardError::InitializationFailed(format!(
                 "Wrong chip type for Bitaxe Gamma: expected BM1370 ({:02x}{:02x}), found {:02x}{:02x}",
-                Self::EXPECTED_CHIP_ID[0], Self::EXPECTED_CHIP_ID[1],
-                first_chip.chip_id[0], first_chip.chip_id[1]
+                Self::EXPECTED_CHIP_ID[0],
+                Self::EXPECTED_CHIP_ID[1],
+                first_chip.chip_id[0],
+                first_chip.chip_id[1]
             )));
         }
 

@@ -1395,7 +1395,7 @@ pub mod linear11 {
 
 /// ULINEAR16 data format conversion
 pub mod linear16 {
-    use super::{extract_5bit_exponent, PMBusError};
+    use super::{PMBusError, extract_5bit_exponent};
 
     /// Convert ULINEAR16 format to floating point
     pub fn to_float(value: u16, vout_mode: u8) -> f32 {

@@ -1,10 +1,10 @@
 //! Merkle root specification for mining jobs.
 
 use anyhow::Result;
+use bitcoin::Transaction;
 use bitcoin::consensus::deserialize;
 use bitcoin::hash_types::TxMerkleNode;
-use bitcoin::hashes::{sha256d, Hash};
-use bitcoin::Transaction;
+use bitcoin::hashes::{Hash, sha256d};
 
 use super::{Extranonce2, Extranonce2Range};
 

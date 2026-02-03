@@ -144,7 +144,7 @@ impl StratumV1Client {
         method: &str,
         params: serde_json::Value,
     ) -> StratumResult<JsonRpcMessage> {
-        use tokio::time::{timeout, Duration};
+        use tokio::time::{Duration, timeout};
 
         let id = self.next_id();
 
@@ -724,7 +724,7 @@ mod tests {
     use super::*;
     use crate::job_source::Extranonce2;
     use bitcoin::hashes::Hash;
-    use tokio::time::{timeout, Duration};
+    use tokio::time::{Duration, timeout};
 
     /// Integration test: Connect to public-pool.io and validate protocol.
     ///
@@ -845,7 +845,7 @@ mod tests {
     /// check remains valuable for catching delayed disconnects from pools that
     /// reject our configuration after the initial handshake.
     async fn test_pool_integration(pool_url: &str, username: &str) {
-        use tracing_subscriber::{fmt, EnvFilter};
+        use tracing_subscriber::{EnvFilter, fmt};
 
         // Initialize logging for the test
         let _ = fmt()

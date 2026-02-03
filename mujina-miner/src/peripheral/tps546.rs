@@ -5,11 +5,11 @@
 //!
 //! Datasheet: <https://www.ti.com/lit/ds/symlink/tps546d24a.pdf>
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use thiserror::Error;
 use tracing::{debug, error, trace, warn};
 
-use super::pmbus::{self, linear11, PmbusCommand, StatusDecoder, VoutMode};
+use super::pmbus::{self, PmbusCommand, StatusDecoder, VoutMode, linear11};
 use crate::hw_trait::I2c;
 
 /// Constants for TPS546 device identification

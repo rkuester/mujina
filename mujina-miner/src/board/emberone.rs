@@ -8,8 +8,8 @@
 use async_trait::async_trait;
 
 use super::{
-    pattern::{BoardPattern, Match, StringMatch},
     Board, BoardDescriptor, BoardError, BoardInfo,
+    pattern::{BoardPattern, Match, StringMatch},
 };
 use crate::{asic::hash_thread::HashThread, error::Error, transport::UsbDeviceInfo};
 

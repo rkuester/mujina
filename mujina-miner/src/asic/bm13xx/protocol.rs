@@ -16,7 +16,7 @@ use std::{fmt, io};
 use strum::FromRepr;
 use tokio_util::codec::{Decoder, Encoder};
 
-use super::crc::{crc16, crc5, crc5_is_valid};
+use super::crc::{crc5, crc5_is_valid, crc16};
 use super::error::ProtocolError;
 use crate::job_source::GeneralPurposeBits;
 use crate::tracing::prelude::*;
@@ -2211,9 +2211,9 @@ mod response_tests {
         let mut buf = BytesMut::new();
         // Start of first frame
         buf.put_slice(&[0xaa, 0x55, 0x13, 0x70, 0x00]); // 5 bytes
-                                                        // Lost bytes... skip to middle of nowhere
+        // Lost bytes... skip to middle of nowhere
         buf.put_slice(&[0x99, 0x22, 0xf9]); // Random bytes
-                                            // Valid complete frame
+        // Valid complete frame
         buf.put_slice(&[
             0xaa, 0x55, 0x18, 0x00, 0xa6, 0x40, 0x02, 0x99, 0x22, 0xf9, 0x91,
         ]);

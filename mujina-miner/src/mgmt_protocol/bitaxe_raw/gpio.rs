@@ -3,8 +3,8 @@
 use async_trait::async_trait;
 use tracing::debug;
 
-use super::channel::ControlChannel;
 use super::Packet;
+use super::channel::ControlChannel;
 use crate::hw_trait::gpio::{Gpio, GpioPin, PinMode, PinValue};
 use crate::hw_trait::{HwError, Result};
 

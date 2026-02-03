@@ -3,7 +3,7 @@
 //! This module provides type-safe wrappers for PMBus Linear11 and Linear16 formats,
 //! along with VOUT_MODE handling for proper voltage encoding/decoding.
 
-use super::{extract_5bit_exponent, PMBusError};
+use super::{PMBusError, extract_5bit_exponent};
 
 /// PMBus VOUT_MODE format enumeration
 #[derive(Debug, Clone, Copy, PartialEq)]

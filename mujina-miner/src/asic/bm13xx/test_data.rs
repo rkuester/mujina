@@ -22,10 +22,10 @@
 //! This separation ensures test_data remains a reference dataset that other
 //! modules can depend on without circular dependencies.
 
+use bitcoin::BlockHash;
 use bitcoin::hash_types::TxMerkleNode;
 use bitcoin::hashes::Hash;
 use bitcoin::pow::CompactTarget;
-use bitcoin::BlockHash;
 use std::sync::LazyLock;
 
 // Reference capture log showing the complete mining round-trip:
@@ -332,8 +332,8 @@ pub mod esp_miner_job {
         /// Computed merkle root for hash validation
         /// Computed from coinbase transaction and merkle branches
         pub static MERKLE_ROOT: LazyLock<TxMerkleNode> = LazyLock::new(|| {
-            use bitcoin::consensus::deserialize;
             use bitcoin::Transaction;
+            use bitcoin::consensus::deserialize;
 
             // Build coinbase transaction
             let mut coinbase_bytes = Vec::new();

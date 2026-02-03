@@ -14,7 +14,7 @@ use axum::Router;
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 use tower_http::trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer};
-use tracing::{info, warn, Level};
+use tracing::{Level, info, warn};
 
 /// API server configuration.
 #[derive(Debug, Clone)]

@@ -11,8 +11,8 @@ use crate::{
     error::Result,
     tracing::prelude::*,
     transport::{
-        cpu::TransportEvent as CpuTransportEvent, usb::TransportEvent as UsbTransportEvent,
-        TransportEvent, UsbDeviceInfo,
+        TransportEvent, UsbDeviceInfo, cpu::TransportEvent as CpuTransportEvent,
+        usb::TransportEvent as UsbTransportEvent,
     },
 };
 use std::collections::HashMap;

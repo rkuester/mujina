@@ -356,8 +356,8 @@ pub mod block_881423 {
 
         #[test]
         fn test_merkle_root_from_coinbase_and_branches() {
-            use bitcoin::consensus::deserialize;
             use bitcoin::Transaction;
+            use bitcoin::consensus::deserialize;
 
             // Parse the coinbase transaction
             let coinbase_tx: Transaction = deserialize(COINBASE_TX).expect("Valid transaction");

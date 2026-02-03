@@ -101,7 +101,9 @@ impl From<&[u8; 4]> for GeneralPurposeBits {
 /// Errors from VersionTemplate operations
 #[derive(Debug, thiserror::Error)]
 pub enum VersionTemplateError {
-    #[error("Base version 0x{base_value:08x} has general purpose bits set in positions 13-28: {gp_bits:02x?}")]
+    #[error(
+        "Base version 0x{base_value:08x} has general purpose bits set in positions 13-28: {gp_bits:02x?}"
+    )]
     BaseHasGeneralPurposeBits { base_value: u32, gp_bits: [u8; 2] },
 
     #[error("General purpose bits {gp_bits:02x?} exceed mask {mask:02x?}")]

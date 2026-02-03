@@ -30,9 +30,9 @@ use std::fmt;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use bitcoin::BlockHash;
 use bitcoin::block::Version;
 use bitcoin::pow::Target;
-use bitcoin::BlockHash;
 use tokio::sync::mpsc;
 
 use crate::job_source::{Extranonce2, Extranonce2Range, JobTemplate};

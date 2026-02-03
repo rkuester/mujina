@@ -12,11 +12,7 @@ pub enum PinValue {
 
 impl From<bool> for PinValue {
     fn from(value: bool) -> Self {
-        if value {
-            PinValue::High
-        } else {
-            PinValue::Low
-        }
+        if value { PinValue::High } else { PinValue::Low }
     }
 }
 

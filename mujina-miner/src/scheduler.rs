@@ -44,8 +44,8 @@ use crate::job_source::{
 };
 use crate::tracing::prelude::*;
 use crate::types::{
-    expected_time_to_share_from_target, target_for_share_rate, Difficulty, HashRate, ShareRate,
-    Target,
+    Difficulty, HashRate, ShareRate, Target, expected_time_to_share_from_target,
+    target_for_share_rate,
 };
 use crate::u256::U256;
 

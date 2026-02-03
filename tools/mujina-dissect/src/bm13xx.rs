@@ -14,11 +14,11 @@ use crate::capture::{BaudRate, Channel, SerialEvent};
 use bitcoin::hashes::Hash;
 use bytes::{Buf, BytesMut};
 use mujina_miner::asic::bm13xx::{
-    crc::{crc16, crc5},
+    crc::{crc5, crc16},
     error::ProtocolError,
     protocol::{
-        hash_from_wire_bytes, Command, FrameCodec, JobFullFormat, Register, RegisterAddress,
-        Response,
+        Command, FrameCodec, JobFullFormat, Register, RegisterAddress, Response,
+        hash_from_wire_bytes,
     },
 };
 use std::collections::VecDeque;

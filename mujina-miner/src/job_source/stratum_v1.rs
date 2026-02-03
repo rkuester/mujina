@@ -377,8 +377,8 @@ impl StratumV1Source {
 mod tests {
     use super::*;
     use crate::asic::bm13xx::test_data::esp_miner_job::{
-        notify, submit, POOL_SHARE_DIFFICULTY_INT, STRATUM_EXTRANONCE1, STRATUM_EXTRANONCE2_SIZE,
-        VERSION_MASK,
+        POOL_SHARE_DIFFICULTY_INT, STRATUM_EXTRANONCE1, STRATUM_EXTRANONCE2_SIZE, VERSION_MASK,
+        notify, submit,
     };
     use crate::asic::bm13xx::test_data::stratum_json;
     use crate::job_source::Extranonce2;

@@ -1,9 +1,9 @@
 //! API version 1 endpoints.
 
 use axum::{
+    Router,
     extract::Json,
     routing::{get, post},
-    Router,
 };
 use serde::{Deserialize, Serialize};
 

@@ -16,9 +16,9 @@ use tracing_journald;
 use tracing_subscriber::{
     filter::{EnvFilter, LevelFilter},
     fmt::{
+        FmtContext, FormatEvent, FormatFields,
         format::{DefaultFields, Writer as FmtWriter},
         time::FormatTime,
-        FmtContext, FormatEvent, FormatFields,
     },
     prelude::*,
     registry::LookupSpan,
