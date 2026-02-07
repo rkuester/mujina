@@ -11,6 +11,7 @@ pub mod error;
 pub mod protocol;
 pub mod sequencer;
 pub mod thread;
+pub mod thread_v2;
 pub mod topology;
 
 #[cfg(test)]
