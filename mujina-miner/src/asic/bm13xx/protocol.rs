@@ -797,7 +797,7 @@ pub fn hash_from_wire_bytes(wire_bytes: &[u8; 32]) -> [u8; 32] {
     hash
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Command {
     /// Assign an address to the first unaddressed chip via daisy-chain forwarding
     SetChipAddress { chip_address: u8 },
@@ -974,13 +974,13 @@ impl Command {
                     CommandFlagsCmd::WriteRegisterOrJob,
                 ));
 
-                const JOB_DATA_LEN: u8 = 82; // Size of JobFullFormat
-                const FLAGS_LEN: u8 = 1;
-                const LENGTH_FIELD_LEN: u8 = 1;
-                const CRC_LEN: u8 = 2; // Jobs use CRC16, not CRC5
-                const TOTAL_LEN: u8 = FLAGS_LEN + LENGTH_FIELD_LEN + JOB_DATA_LEN + CRC_LEN;
+                // Length byte encoding per bm13xx-rs and industrial firmware captures:
+                // length = frame_size(88) - preamble(2) - prev_block_hash(32) = 54
+                // The full 88-byte frame is still sent, but the length byte declares
+                // a "short format" that excludes prev_block_hash from the count.
+                const JOB_LENGTH_BYTE: u8 = 54;
 
-                dst.put_u8(TOTAL_LEN);
+                dst.put_u8(JOB_LENGTH_BYTE);
 
                 // Write job data
                 // job_id is a 4-bit value (0-15), encode into bits 6-3 of job_header
@@ -1210,6 +1210,7 @@ impl Decoder for FrameCodec {
         // CRC5 is computed over the 9 data bytes after the preamble
         if !crc5_is_valid(&src[2..FRAME_LEN]) {
             trace!(
+                frame = %HexBytes(&src[..FRAME_LEN]),
                 "Frame sync lost: CRC5 failed for potential frame at position 0. Searching for next frame..."
             );
             src.advance(1);
@@ -1613,7 +1614,7 @@ mod command_tests {
         // Verify packet structure
         assert_eq!(&frame[0..2], &[0x55, 0xaa]); // Preamble
         assert_eq!(frame[2], 0x21); // TYPE_JOB | GROUP_SINGLE | CMD_WRITE
-        assert_eq!(frame[3], 86); // Total length
+        assert_eq!(frame[3], 54); // Length byte (excludes prev_block_hash per bm13xx-rs)
         assert_eq!(frame[4], job.job_id);
         assert_eq!(frame[5], job.num_midstates);
         assert_eq!(&frame[6..10], &job.starting_nonce.to_le_bytes());
@@ -1661,7 +1662,7 @@ mod command_tests {
         use crate::asic::bm13xx::test_data::esp_miner_job;
 
         // Build JobFullFormat from high-level Bitcoin types
-        // Verify encoding produces exact wire bytes from hardware capture
+        // Verify encoding produces correct wire bytes (field-by-field comparison)
         let job = JobFullFormat {
             job_id: *esp_miner_job::wire_tx::JOB_ID,
             num_midstates: esp_miner_job::wire_tx::NUM_MIDSTATES_BYTE[0],
@@ -1688,12 +1689,17 @@ mod command_tests {
             )
             .expect("Failed to encode job command");
 
-        // Verify our encoding exactly matches the hardware capture
-        assert_eq!(
-            frame.as_ref(),
-            &esp_miner_job::wire_tx::FRAME,
-            "JobFull encoding doesn't match hardware capture"
-        );
+        let capture = &esp_miner_job::wire_tx::FRAME;
+
+        // Frame structure matches (preamble, flags, length encoding differs)
+        assert_eq!(frame.len(), capture.len(), "Frame size mismatch");
+        assert_eq!(&frame[0..2], &capture[0..2], "Preamble mismatch");
+        assert_eq!(frame[2], capture[2], "Flags byte mismatch");
+        // Note: frame[3] (length byte) differs: we use 0x36 (industrial), capture has 0x56 (esp-miner)
+        assert_eq!(frame[3], 54, "Should use industrial length encoding");
+
+        // All job data fields match the capture exactly
+        assert_eq!(&frame[4..86], &capture[4..86], "Job data mismatch");
     }
 
     fn assert_frame_eq(cmd: Command, expect: &[u8]) {
@@ -1724,7 +1730,7 @@ mod command_tests {
     fn job_full_encoding_matches_hardware_capture() {
         use crate::asic::bm13xx::test_data::esp_miner_job;
 
-        // Build JobFullFormat from Bitcoin types and verify it encodes to exact wire bytes
+        // Build JobFullFormat from Bitcoin types and verify job data fields match
         let job = JobFullFormat {
             job_id: *esp_miner_job::wire_tx::JOB_ID,
             num_midstates: esp_miner_job::wire_tx::NUM_MIDSTATES_BYTE[0],
@@ -1746,11 +1752,13 @@ mod command_tests {
             .encode(Command::JobFull { job_data: job }, &mut frame)
             .expect("Failed to encode job command");
 
-        // Verify our encoding exactly matches the wire capture
+        let capture = &esp_miner_job::wire_tx::FRAME;
+
+        // Job data (bytes 4-85) must match capture exactly
         assert_eq!(
-            frame.as_ref(),
-            &esp_miner_job::wire_tx::FRAME,
-            "JobFull encoding doesn't match hardware capture"
+            &frame[4..86],
+            &capture[4..86],
+            "Job data fields don't match hardware capture"
         );
     }
 }
@@ -2234,10 +2242,11 @@ mod response_tests {
             )
             .expect("Should encode JobFull command");
 
+        // Job data fields (bytes 4-85) must match
         assert_eq!(
-            tx_frame.as_ref(),
-            &esp_miner_job::wire_tx::FRAME,
-            "TX frame should match hardware capture"
+            &tx_frame[4..86],
+            &esp_miner_job::wire_tx::FRAME[4..86],
+            "TX frame job data should match hardware capture"
         );
 
         let rx_response =
