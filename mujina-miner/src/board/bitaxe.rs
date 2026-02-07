@@ -378,7 +378,7 @@ impl BitaxeBoard {
             vout_scale_loop: 0.25,
             vout_min: 1.0,
             vout_max: 2.0,
-            vout_command: 1.15, // BM1370 default voltage
+            vout_command: 1.10, // BM1370 default voltage (lowered for testing)
 
             // Output voltage protection (relative to vout_command)
             vout_ov_fault_limit: 1.25, // 125% of VOUT_COMMAND
@@ -408,6 +408,15 @@ impl BitaxeBoard {
 
             // Pin configuration
             pin_detect_override: 0xFFFF,
+
+            // Optional fields (not used for Bitaxe)
+            vout_ov_fault_response: None,
+            vout_uv_fault_response: None,
+            compensation_config: None,
+            power_stage_config: None,
+            telemetry_config: None,
+            iout_cal_gain: None,
+            iout_cal_offset: None,
         };
 
         let mut tps546 = Tps546::new(power_i2c, config);
@@ -419,7 +428,7 @@ impl BitaxeBoard {
                 tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
                 // Set initial output voltage, default for BM1370 from esp-miner
-                const DEFAULT_VOUT: f32 = 1.15;
+                const DEFAULT_VOUT: f32 = 1.10;
                 match tps546.set_vout(DEFAULT_VOUT).await {
                     Ok(()) => {
                         debug!("Core voltage set to {DEFAULT_VOUT}V");

@@ -104,6 +104,22 @@ pub struct Tps546Config {
     // Pin configuration
     /// Pin detect override value
     pub pin_detect_override: u16,
+
+    // Optional EmberOne-specific registers
+    /// Output overvoltage fault response (optional)
+    pub vout_ov_fault_response: Option<u8>,
+    /// Output undervoltage fault response (optional)
+    pub vout_uv_fault_response: Option<u8>,
+    /// Compensation configuration coefficients (optional, 5 bytes)
+    pub compensation_config: Option<[u8; 5]>,
+    /// Power stage configuration (optional)
+    pub power_stage_config: Option<u8>,
+    /// Telemetry configuration (optional, 6 bytes)
+    pub telemetry_config: Option<[u8; 6]>,
+    /// Output current calibration gain (optional, raw Linear11)
+    pub iout_cal_gain: Option<u16>,
+    /// Output current calibration offset (optional, raw Linear11)
+    pub iout_cal_offset: Option<u16>,
 }
 
 /// TPS546 error types
@@ -456,6 +472,68 @@ impl<I2C: I2c> Tps546<I2C> {
             self.config.pin_detect_override,
         )
         .await?;
+
+        // Optional EmberOne-specific registers
+        // Standard PMBus fault response registers - these should work
+        if let Some(response) = self.config.vout_ov_fault_response {
+            trace!("Setting VOUT_OV_FAULT_RESPONSE: 0x{:02X}", response);
+            self.write_byte(PmbusCommand::VoutOvFaultResponse, response)
+                .await?;
+        }
+
+        if let Some(response) = self.config.vout_uv_fault_response {
+            trace!("Setting VOUT_UV_FAULT_RESPONSE: 0x{:02X}", response);
+            self.write_byte(PmbusCommand::VoutUvFaultResponse, response)
+                .await?;
+        }
+
+        // Manufacturer-specific registers - may not be supported on all variants
+        if let Some(config) = self.config.compensation_config {
+            trace!("Setting COMPENSATION_CONFIG: {:02X?}", config);
+            if let Err(e) = self
+                .write_block(PmbusCommand::CompensationConfig, &config)
+                .await
+            {
+                warn!("Failed to write COMPENSATION_CONFIG: {} (continuing)", e);
+            }
+            // Device needs time to process compensation coefficients
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        }
+
+        if let Some(config) = self.config.power_stage_config {
+            trace!("Setting POWER_STAGE_CONFIG: 0x{:02X}", config);
+            // POWER_STAGE_CONFIG is a block write with 1 byte, not a byte write
+            if let Err(e) = self
+                .write_block(PmbusCommand::PowerStageConfig, &[config])
+                .await
+            {
+                warn!("Failed to write POWER_STAGE_CONFIG: {} (continuing)", e);
+            }
+        }
+
+        if let Some(config) = self.config.telemetry_config {
+            trace!("Setting TELEMETRY_CONFIG: {:02X?}", config);
+            if let Err(e) = self
+                .write_block(PmbusCommand::TelemetryConfig, &config)
+                .await
+            {
+                warn!("Failed to write TELEMETRY_CONFIG: {} (continuing)", e);
+            }
+        }
+
+        if let Some(gain) = self.config.iout_cal_gain {
+            trace!("Setting IOUT_CAL_GAIN: 0x{:04X}", gain);
+            if let Err(e) = self.write_word(PmbusCommand::IoutCalGain, gain).await {
+                warn!("Failed to write IOUT_CAL_GAIN: {} (continuing)", e);
+            }
+        }
+
+        if let Some(offset) = self.config.iout_cal_offset {
+            trace!("Setting IOUT_CAL_OFFSET: 0x{:04X}", offset);
+            if let Err(e) = self.write_word(PmbusCommand::IoutCalOffset, offset).await {
+                warn!("Failed to write IOUT_CAL_OFFSET: {} (continuing)", e);
+            }
+        }
 
         debug!("TPS546 configuration written successfully");
         Ok(())
@@ -1190,6 +1268,16 @@ impl<I2C: I2c> Tps546<I2C> {
         self.i2c
             .write(TPS546_I2C_ADDR, &[command.as_u8(), bytes[0], bytes[1]])
             .await?;
+        Ok(())
+    }
+
+    async fn write_block(&mut self, command: PmbusCommand, data: &[u8]) -> Result<()> {
+        // PMBus block write: command, length byte, then data bytes
+        let mut buffer = Vec::with_capacity(2 + data.len());
+        buffer.push(command.as_u8());
+        buffer.push(data.len() as u8);
+        buffer.extend_from_slice(data);
+        self.i2c.write(TPS546_I2C_ADDR, &buffer).await?;
         Ok(())
     }
 
