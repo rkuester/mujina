@@ -21,6 +21,9 @@ use super::error::ProtocolError;
 use crate::job_source::GeneralPurposeBits;
 use crate::tracing::prelude::*;
 
+// Re-export Frequency from types module for backward compatibility
+pub use crate::types::Frequency;
+
 /// Wrapper for formatting byte slices as space-separated hex.
 struct HexBytes<'a>(&'a [u8]);
 
@@ -36,79 +39,17 @@ impl fmt::Display for HexBytes<'_> {
     }
 }
 
-/// Mining frequency with validation and PLL calculation
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Frequency {
-    mhz: f32,
-}
-
-impl Frequency {
-    /// Minimum supported frequency in MHz
-    #[allow(dead_code)]
-    pub const MIN_MHZ: f32 = 50.0;
-    /// Maximum supported frequency in MHz
-    #[allow(dead_code)]
-    pub const MAX_MHZ: f32 = 800.0;
-    /// Base crystal frequency in MHz
-    const CRYSTAL_MHZ: f32 = 25.0;
-
-    /// Create frequency from MHz value with validation
-    #[allow(dead_code)]
-    pub fn from_mhz(mhz: f32) -> Result<Self, ProtocolError> {
-        if !(Self::MIN_MHZ..=Self::MAX_MHZ).contains(&mhz) {
-            return Err(ProtocolError::InvalidFrequency { mhz: mhz as u32 });
-        }
-        Ok(Self { mhz })
-    }
-
-    /// Get frequency in MHz
-    #[allow(dead_code)]
-    pub fn mhz(&self) -> f32 {
-        self.mhz
-    }
-
-    /// Calculate optimal PLL configuration for this frequency
-    pub fn calculate_pll(&self) -> PllConfig {
-        let target_freq = self.mhz;
-        let mut best_config = PllConfig::new(0xa0, 2, 0x55); // Default
-        let mut min_error = f32::MAX;
-
-        // Search for optimal PLL settings
-        // ref_divider: 1 or 2
-        // post_divider1: 1-7, must be >= post_divider2
-        // post_divider2: 1-7
-        // fb_divider: 0xa0-0xef (160-239)
-
-        for ref_div in [2, 1] {
-            for post_div1 in (1..=7).rev() {
-                for post_div2 in (1..=7).rev() {
-                    if post_div1 >= post_div2 {
-                        // Calculate required feedback divider
-                        let fb_div_f =
-                            (post_div1 * post_div2) as f32 * target_freq * ref_div as f32
-                                / Self::CRYSTAL_MHZ;
-                        let fb_div = fb_div_f.round() as u8;
-
-                        if (0xa0..=0xef).contains(&fb_div) {
-                            // Calculate actual frequency with these settings
-                            let actual_freq = Self::CRYSTAL_MHZ * fb_div as f32
-                                / (ref_div as f32 * post_div1 as f32 * post_div2 as f32);
-                            let error = (target_freq - actual_freq).abs();
-
-                            if error < min_error && error < 1.0 {
-                                min_error = error;
-                                // Encode post dividers as per hardware format
-                                let post_div = ((post_div1 - 1) << 4) | (post_div2 - 1);
-                                best_config = PllConfig::new(fb_div, ref_div, post_div);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        best_config
-    }
+/// Calculate optimal PLL configuration for a target frequency.
+///
+/// **Deprecated**: Use [`ChipConfig::calculate_pll()`] instead. This free
+/// function exists for backward compatibility with existing code.
+///
+/// [`ChipConfig::calculate_pll()`]: super::chip_config::ChipConfig::calculate_pll
+#[deprecated(since = "0.2.0", note = "Use ChipConfig::calculate_pll() instead")]
+pub fn calculate_pll(freq: Frequency) -> PllConfig {
+    // Delegate to ChipConfig. Algorithm is identical for all chips,
+    // so any config works.
+    super::chip_config::bm1370().calculate_pll(freq)
 }
 
 /// PLL configuration for frequency control
@@ -1393,78 +1334,6 @@ mod init_tests {
     }
 
     #[test]
-    fn pll_calculation_produces_valid_frequencies() {
-        // Test cases from serial captures showing PLL values sent by esp-miner
-        // Note: esp-miner uses first-found algorithm while we find optimal settings
-        // Format: (target_mhz, [fb_div, ref_div, post_div] from esp-miner)
-        let test_cases = vec![
-            (62.5, [0xd2, 0x02, 0x65]),  // 62.50MHz
-            (75.0, [0xd2, 0x02, 0x64]),  // 75.00MHz
-            (100.0, [0xe0, 0x02, 0x63]), // 100.00MHz
-            (400.0, [0xe0, 0x02, 0x60]), // 400.00MHz
-            (500.0, [0xa2, 0x02, 0x30]), // 500.00MHz -> esp-miner gives 506.25MHz
-        ];
-
-        for (target_mhz, esp_miner_raw) in test_cases {
-            let freq = Frequency::from_mhz(target_mhz).unwrap();
-            let pll = freq.calculate_pll();
-
-            // Calculate actual frequencies for both esp-miner and our values
-            let esp_post_div1 = ((esp_miner_raw[2] >> 4) & 0xf) + 1;
-            let esp_post_div2 = (esp_miner_raw[2] & 0xf) + 1;
-            let esp_actual_mhz = 25.0 * esp_miner_raw[0] as f32
-                / (esp_miner_raw[1] as f32 * esp_post_div1 as f32 * esp_post_div2 as f32);
-
-            let our_post_div1 = ((pll.post_div >> 4) & 0xf) + 1;
-            let our_post_div2 = (pll.post_div & 0xf) + 1;
-            let our_actual_mhz = 25.0 * pll.fb_div as f32
-                / (pll.ref_div as f32 * our_post_div1 as f32 * our_post_div2 as f32);
-
-            // Calculate errors
-            let esp_error = (target_mhz - esp_actual_mhz).abs();
-            let our_error = (target_mhz - our_actual_mhz).abs();
-
-            println!("Target: {:.2}MHz", target_mhz);
-            println!(
-                "  esp-miner: fb={:#04x} ref={} post={:#04x} -> {:.2}MHz (error: {:.4}MHz)",
-                esp_miner_raw[0], esp_miner_raw[1], esp_miner_raw[2], esp_actual_mhz, esp_error
-            );
-            println!(
-                "  Our calc:  fb={:#04x} ref={} post={:#04x} -> {:.2}MHz (error: {:.4}MHz)",
-                pll.fb_div, pll.ref_div, pll.post_div, our_actual_mhz, our_error
-            );
-
-            // Verify our calculation produces valid PLL parameters
-            assert!(
-                pll.fb_div >= 0xa0 && pll.fb_div <= 0xef,
-                "fb_div out of range: {:#04x}",
-                pll.fb_div
-            );
-            assert!(
-                pll.ref_div == 1 || pll.ref_div == 2,
-                "ref_div invalid: {}",
-                pll.ref_div
-            );
-
-            // Verify our error is reasonable (within 1MHz)
-            assert!(
-                our_error < 1.0,
-                "Frequency error too large: {:.2}MHz for target {}MHz",
-                our_error,
-                target_mhz
-            );
-
-            // Our algorithm should produce equal or better results
-            // Allow small tolerance for floating point comparison
-            assert!(
-                our_error <= esp_error + 0.01,
-                "Our algorithm produced worse result than esp-miner for {}MHz",
-                target_mhz
-            );
-        }
-    }
-
-    #[test]
     fn nonce_range_configuration() {
         let protocol = BM13xxProtocol::new();
 
@@ -2611,6 +2480,7 @@ impl BM13xxProtocol {
     /// 1. Set PLL parameters for desired frequency
     /// 2. Enable version rolling if supported
     /// 3. Configure other chip-specific settings
+    #[allow(deprecated)] // Uses deprecated calculate_pll(); will be replaced by Sequencer
     pub fn single_chip_init(&self, frequency: Frequency) -> Vec<Command> {
         let mut commands = Vec::new();
 
@@ -2618,7 +2488,7 @@ impl BM13xxProtocol {
         commands.push(self.broadcast_write(Register::VersionMask(VersionMask::full_rolling())));
 
         // Configure PLL for desired frequency
-        let pll_config = frequency.calculate_pll();
+        let pll_config = calculate_pll(frequency);
         commands.push(self.broadcast_write(Register::PllDivider(pll_config)));
 
         commands
