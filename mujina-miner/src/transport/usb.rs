@@ -21,6 +21,9 @@ pub struct UsbDeviceInfo {
     pub vid: u16,
     /// USB product ID
     pub pid: u16,
+    /// USB device release number (bcdDevice), if available.
+    /// This is a BCD-encoded version number (e.g., 0x0500 = version 5.00).
+    pub bcd_device: Option<u16>,
     /// Device serial number (if available)
     pub serial_number: Option<String>,
     /// Manufacturer string (if available)
@@ -74,9 +77,34 @@ impl UsbDeviceInfo {
         product: Option<String>,
         device_path: String,
     ) -> Self {
+        Self::new_for_test_with_bcd(
+            vid,
+            pid,
+            None,
+            serial_number,
+            manufacturer,
+            product,
+            device_path,
+        )
+    }
+
+    /// Create a UsbDeviceInfo for testing purposes with bcd_device.
+    ///
+    /// Serial ports are not scanned and will be empty when accessed.
+    #[cfg(test)]
+    pub fn new_for_test_with_bcd(
+        vid: u16,
+        pid: u16,
+        bcd_device: Option<u16>,
+        serial_number: Option<String>,
+        manufacturer: Option<String>,
+        product: Option<String>,
+        device_path: String,
+    ) -> Self {
         Self {
             vid,
             pid,
+            bcd_device,
             serial_number,
             manufacturer,
             product,
