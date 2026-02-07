@@ -112,7 +112,7 @@ impl CpuHashThread {
 
 impl Drop for CpuHashThread {
     fn drop(&mut self) {
-        self.shutdown();
+        CpuHashThread::shutdown(self);
     }
 }
 
@@ -172,6 +172,11 @@ impl HashThread for CpuHashThread {
         response_rx
             .await
             .map_err(|_| HashThreadError::WorkAssignmentFailed("no response from thread".into()))?
+    }
+
+    async fn shutdown(&mut self) -> std::result::Result<(), HashThreadError> {
+        let _ = self.go_idle().await;
+        Ok(())
     }
 
     fn take_event_receiver(&mut self) -> Option<tokio_mpsc::Receiver<HashThreadEvent>> {

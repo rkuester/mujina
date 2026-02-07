@@ -847,6 +847,13 @@ impl Scheduler {
                 .await;
         }
 
+        // Shut down all threads (async cleanup before drop)
+        for (_, entry) in &mut self.threads {
+            if let Err(e) = entry.thread.shutdown().await {
+                warn!(error = %e, "Thread shutdown error");
+            }
+        }
+
         // Log final statistics
         let hashrate = self.measured_hashrate();
         self.stats.log_summary(hashrate);

@@ -236,6 +236,13 @@ pub trait HashThread: Send {
     /// Thread enters low-power mode, stops hashing.
     async fn go_idle(&mut self) -> std::result::Result<Option<HashTask>, HashThreadError>;
 
+    /// Permanently shut down the thread, releasing hardware resources.
+    ///
+    /// This compensates for Rust's lack of async Drop. Callers must invoke
+    /// this before dropping the thread to ensure async cleanup completes.
+    /// After shutdown, the thread cannot be used again.
+    async fn shutdown(&mut self) -> std::result::Result<(), HashThreadError>;
+
     /// Take ownership of the event receiver for this thread
     ///
     /// Called once by scheduler after thread creation. The scheduler uses this

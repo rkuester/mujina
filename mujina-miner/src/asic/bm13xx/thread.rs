@@ -225,6 +225,11 @@ impl HashThread for BM13xxThread {
             .map_err(|_| HashThreadError::WorkAssignmentFailed("no response from thread".into()))?
     }
 
+    async fn shutdown(&mut self) -> std::result::Result<(), HashThreadError> {
+        let _ = self.go_idle().await;
+        Ok(())
+    }
+
     fn take_event_receiver(&mut self) -> Option<mpsc::Receiver<HashThreadEvent>> {
         self.event_rx.take()
     }
