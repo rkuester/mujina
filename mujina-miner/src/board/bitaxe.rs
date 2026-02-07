@@ -1008,6 +1008,7 @@ inventory::submit! {
         pattern: crate::board::pattern::BoardPattern {
             vid: Match::Any,
             pid: Match::Any,
+            bcd_device: Match::Any,
             manufacturer: Match::Specific(StringMatch::Exact("OSMU")),
             product: Match::Specific(StringMatch::Exact("Bitaxe")),
             serial_pattern: Match::Any,
