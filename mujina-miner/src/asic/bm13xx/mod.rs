@@ -4,10 +4,12 @@
 //! communicating with BM13xx series mining chips (BM1366, BM1370, etc).
 
 pub mod chain;
+pub mod chain_config;
 pub mod chip_config;
 pub mod crc;
 pub mod error;
 pub mod protocol;
+pub mod sequencer;
 pub mod thread;
 pub mod topology;
 
