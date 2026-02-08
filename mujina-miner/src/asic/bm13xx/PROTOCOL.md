@@ -121,9 +121,26 @@ Assigns an address to a chip in the serial chain via daisy-chain forwarding.
 ```
 - Length: Always `0x05` (5 bytes excluding preamble)
 - Type/Flags: `0x40` (NOT broadcast - uses daisy-chain forwarding)
-- New_Addr: The address to assign (typically increments by 2: 0x00, 0x02, 0x04...)
+- New_Addr: The address to assign (see "Address Interval" below)
 - Reserved: Always `0x00` (no semantic meaning, possibly padding)
 - Example: `55 AA 40 05 04 00 15` (assign address 0x04)
+
+**Address Interval - Two Known Approaches:**
+
+Different implementations use different address spacing strategies:
+
+1. **Bitmain stock firmware**: Fixed increment of 2, always sends 128 commands
+   - Addresses: 0x00, 0x02, 0x04, ... 0xFE
+   - Observed in S19 J Pro and S21 Pro captures
+   - Sends all 128 commands regardless of actual chip count
+
+2. **esp-miner (Bitaxe)**: Dynamic interval based on chip count
+   - `address_interval = 256 / chip_count`
+   - Spreads addresses evenly across the 256-byte space
+   - Examples: 1 chip → 0x00; 12 chips → 0, 21, 42...; 126 chips → 0, 2, 4...
+
+It's unclear which approach is "correct" or if the chips care. Both work in
+practice. mujina-miner uses the esp-miner approach (dynamic interval).
 
 **How Daisy-Chain Addressing Works:**
 
@@ -202,11 +219,26 @@ components. This format is used by the chips mujina-miner supports.
 ```
 - **Preamble**: `0x55 0xAA` (2 bytes)
 - **Type/Flags**: `0x21` = TYPE=0 (work), BROADCAST=0, CMD=1
-- **Length**: `0x56` (86 decimal) = 82 bytes job_data + 2 bytes CRC16 + 2 bytes 
-for type/length
+- **Length**: `0x36` (54 decimal) - see "Length Byte Encoding" below
 - **Job_Data**: 82 bytes of mining work (see below)
 - **CRC16**: 16-bit CRC calculated over type/flags + length + job_data, stored in
 big-endian format (MSB first)
+
+**Length Byte Encoding:**
+
+The length byte does NOT represent the actual byte count of the payload. Two
+different encodings have been observed:
+
+- `0x36` (54): Used by S21 Pro (BM1370), S19J Pro (BM1362), and bm13xx-rs
+- `0x56` (86): Used by ESP-miner (Bitaxe)
+
+Both values produce an 88-byte total frame with identical job data content. The
+bm13xx-rs library computes the value as `frame_size - 32 - 2`, which equals
+`22 + (1 * 32)`---the same formula used for job_midstate with 1 midstate.
+This suggests the byte may encode a "midstate count equivalent" rather than an
+actual length.
+
+mujina-miner uses `0x36` to match industrial firmware captures.
 
 **Job_Data Structure (82 bytes):**
 ```
@@ -240,7 +272,7 @@ merkle_root[32] | prev_block_hash[32] | version[4] |
 
 **Example Job Packet:**
 ```
-55 AA 21 56                              # Preamble + Type + Length
+55 AA 21 36                              # Preamble + Type + Length
 18                                       # job_header: bits[6:3]=0b0011 (job_id field=3)
 01                                       # num_midstates = 1
 00 00 00 00                              # starting_nonce
@@ -351,10 +383,41 @@ Example BM1370 response: `AA 55 18 00 A6 40 02 99 22 F9 91`
 
 
 #### BM1362:
-- Similar 11-byte response format
-- Different field encoding than BM1370
+
+The BM1362 uses the same 11-byte nonce response format as BM1370, but the
+result_header byte encodes fields differently.
+
+**Result_Header field layout:**
+
+| Chip | job_id bits | Extraction |
+|------|-------------|------------|
+| BM1370 | 7-4 | `(result_header >> 4) & 0x0f` |
+| BM1362 | 6-3 | `(result_header >> 3) & 0x0f` |
+
+Both chips receive job_id in bits 6-3 of the job_header when a job is sent.
+The BM1370 shifts this value up by 1 bit when returning it in the nonce
+response; the BM1362 returns it in the same bit position.
+
+**Example:** If job_id=7 is sent (job_header=`0x38`, bits 6-3 = 0111):
+- BM1370 returns result_header with bits 7-4 = 0111 (e.g., `0x7x`)
+- BM1362 returns result_header with bits 6-3 = 0111 (e.g., `0x3x`)
+
+Applying the wrong extraction formula yields the wrong job_id:
+- result_header `0x3b` with BM1370 formula: `(0x3b >> 4) & 0x0f = 3`
+- result_header `0x3b` with BM1362 formula: `(0x3b >> 3) & 0x0f = 7`
+
+**Source:** emberone-miner reference implementation
+(`piaxe/bm1362.py:422-423`):
+```python
+def get_job_id_from_result(self, job_id):
+    return job_id & 0xf8  # Masks to bits 7-3
+```
+
+**Other fields:**
 - Midstate_Num may encode chip ID in multi-chip configurations
-- Example response: `AA 55 6D B8 8E E1 01 04 03 54 94`
+- Subcore_id appears to occupy bits 2-0 (3 bits)
+
+Example response: `AA 55 6D B8 8E E1 01 04 03 54 94`
 
 
 ### Special Response Types
@@ -539,11 +602,10 @@ Undocumented miscellaneous settings register:
 
 3. **Address Assignment**
    - Chain inactive command (0x53) puts chips in addressing mode
-   - Send SetChipAddress commands (0x40) with addresses incrementing by 2
+   - Send SetChipAddress commands (0x40) for each chip
    - Each command assigns address to first unaddressed chip via daisy-chain
      forwarding (see SetChipAddress command documentation for details)
-   - Typically send 128 address commands regardless of actual chip count
-   - Example sequence: 0x00, 0x02, 0x04, 0x06... up to 0xFE
+   - Address spacing varies by implementation (see "Address Interval" above)
 
 4. **Domain Configuration** (BM1370 chains)
    - Configure IO driver strength on domain-end chips
@@ -566,30 +628,162 @@ Undocumented miscellaneous settings register:
 
 ## Domain Management in Multi-Chip Chains
 
-Large chip chains are divided into domains for signal integrity:
+Large chip chains are divided into voltage domains. While domains primarily
+exist for power management (each domain has its own voltage regulator), they
+also require special serial bus configuration for signal integrity and
+contention avoidance.
 
-### Domain Structure
-- Chips grouped into domains (typically 5-7 chips per domain)
-- Special configuration for first and last chip in each domain
-- Stronger IO drivers on domain boundaries
+### Physical Architecture
+
+**Voltage Domains:**
+- Each domain contains a group of chips (typically 5 chips on S21 Pro)
+- Chips within a domain share a local voltage regulator (LDO)
+- Domain count varies: S21 Pro has 13 domains (65 chips / 5 per domain)
+
+**Serial Bus:**
+- All chips share a single serial daisy-chain regardless of voltage domains
+- CI (Command In) flows from host toward end of chain
+- RO (Response Out) flows from end of chain back to host
+- BI/BO (Busy In/Out) is a separate contention-avoidance signal chain
+
+### Contention Avoidance: The BI/BO Mechanism
+
+When multiple chips receive a broadcast command (e.g., "read ChipId"), they all
+want to respond. The BI (Busy Input) and BO (Busy Output) pins prevent response
+collisions:
+
+```
+BI/BO signal chain (flows toward host):
+
+Host <─── Chip 0 <─── Chip 1 <─── Chip 2 <─── ... <─── Chip 64
+          BI←BO       BI←BO       BI←BO               BO (unused)
+```
+
+**Protocol when a chip wants to respond:**
+1. Check BI pin---if HIGH, another chip is transmitting; wait for LOW
+2. Assert BO (goes HIGH) to signal "I'm about to transmit"
+3. Wait GAP_CNT clock cycles for BO to propagate to chips behind (toward host)
+4. Begin transmitting response on RO
+5. De-assert BO when transmission complete
+
+**Why GAP_CNT is necessary:**
+The BO signal takes time to propagate through the chain. Without waiting, a chip
+could start transmitting before chips closer to the host see the busy signal:
+
+```
+Without GAP_CNT wait (race condition):
+
+Chip 64: [Assert BO]──[Start TX immediately]───────────────────>
+                │
+BO propagation: ═══════════════════════════════════════════════>
+                      (takes time to reach Chip 0)
+                │
+Chip 0:         [BI still LOW]──[Starts TX!]──[BI finally HIGH]
+                                │
+                                └── COLLISION! Started before seeing BI
+```
+
+**GAP_CNT ensures BO propagates before TX begins:**
+
+```
+With GAP_CNT wait:
+
+Chip 64: [Assert BO]──[Wait GAP_CNT]──────────[Start TX]───────>
+                │
+BO propagation: ══════════════════════════════>
+                                              │
+Chip 0:         [BI goes HIGH]────────────────[Waits, sees BI]──>
+                                              │
+                                              └── No collision
+```
+
+### The GAP_CNT Formula
+
+GAP_CNT is configured via the UART Relay register (0x2C) on domain boundary
+chips. The value depends on how many chips are "behind" (toward host) that need
+to see the BO signal before transmission begins:
+
+```
+GAP_CNT = (chips_per_domain × domains_behind) + base_overhead
+        = domain_asic_cnt × (chain_domain_cnt - domain_index) + 14
+```
+
+Where:
+- `domain_index` = 0 for the domain nearest the host
+- `chain_domain_cnt` = total number of domains
+- `domain_asic_cnt` = chips per domain
+- `14` = base overhead (safety margin, internal chip delays)
+
+**Example: S21 Pro (65 chips, 13 domains of 5 chips each)**
+
+| Domain | Position | Chips Behind | GAP_CNT | Calculation |
+|--------|----------|--------------|---------|-------------|
+| 0 | Near host | 60 | 79 (0x4F) | 5 × (13-0) + 14 |
+| 6 | Middle | 30 | 49 (0x31) | 5 × (13-6) + 14 |
+| 12 | Far end | 0 | 19 (0x13) | 5 × (13-12) + 14 |
+
+Chips at the far end of the chain have fewer chips behind them, so they need
+less time for their BO signal to propagate---hence smaller GAP_CNT values.
 
 ### Domain-Specific Registers
 
+Configuration is applied only to domain boundary chips (first and last chip of
+each domain). Middle-of-domain chips use default settings.
+
 **IO Driver Strength (0x58):**
-- Normal chips: 0x00011111
-- Domain-end chips: 0x0001F111
+Controls output driver strength for various signals. Domain-end chips get
+stronger CLKO (clock out) drivers for signal integrity across boundaries.
+
+- All chips (broadcast): `0x00011111`
+- Domain-end chips: `0x0001F111` (CLKO field = 0xF instead of 0x1)
+
+Note: bm13xx-rs library uses CLKO=3 (`0x00013111`), but actual S21 Pro captures
+show CLKO=15 (`0x0001F111`). The difference may be product-specific.
 
 **UART Relay (0x2C):**
-- Configured on domain boundary chips
-- Values encode domain position and relay settings
+Configured on first and last chip of each domain. Controls signal regeneration
+and the GAP_CNT timing for contention avoidance.
+
+Register fields:
+- Bits 31-16: GAP_CNT (16-bit delay value)
+- Bit 1: RO_REL_EN (Response Out relay enable)
+- Bit 0: CO_REL_EN (Command Out relay enable)
+
+Domain boundary chips enable both relay bits (`0x____0003`).
 
 ### Example: S21 Pro Domain Configuration
+
 ```
-Domain 0: Chips 0x00-0x08 (relay: 0x004F0003)
-Domain 1: Chips 0x0A-0x12 (relay: 0x004A0003)
-Domain 2: Chips 0x14-0x1C (relay: 0x00450003)
-...
+Domain 12 (far from host): Chips 0x78-0x80
+  - First chip 0x78: UART Relay = 0x00130003 (GAP_CNT=19)
+  - Last chip 0x80:  UART Relay = 0x00130003, IO Driver = 0x0001F111
+
+Domain 6 (middle): Chips 0x3C-0x44
+  - First chip 0x3C: UART Relay = 0x00310003 (GAP_CNT=49)
+  - Last chip 0x44:  UART Relay = 0x00310003, IO Driver = 0x0001F111
+
+Domain 0 (near host): Chips 0x00-0x08
+  - First chip 0x00: UART Relay = 0x004F0003 (GAP_CNT=79)
+  - Last chip 0x08:  UART Relay = 0x004F0003, IO Driver = 0x0001F111
 ```
+
+### Chip Differences: BM1370 vs BM1362
+
+**BM1370 (S21 Pro, 65 chips):**
+- Full domain configuration with IO driver and UART relay settings
+- GAP_CNT formula applies as documented above
+- Required for 3 Mbaud operation
+
+**BM1362 (S19 J Pro, 126 chips):**
+- Simpler configuration: no domain-specific IO driver or UART relay
+- All chips receive identical register configuration
+- May have internal auto-compensation, or lower baud rate reduces need
+
+### References
+
+- bm13xx-rs library: `bm1370/src/lib.rs` (`set_baudrate_next` function)
+- S21 Pro captures: `~/mujina/captures/from-skot/bm1370/s21-pro-hexdump-analyze.txt`
+- S19 J Pro captures: `~/mujina/captures/from-skot/bm1362/s19jpro-hexdump-analyze.txt`
 
 ## Key Implementation Details
 
@@ -799,8 +993,8 @@ space partitioning:
 
 ### Chip Summary
 
-| Chip | Chip ID | Cores | Sub-cores | Job ID Bits | Used In |
-|------|---------|-------|-----------|-------------|----------|
-| BM1362 | 0x1362 | Unknown | Unknown | Unknown | Antminer S19 J Pro |
-| BM1370 | 0x1370 | 80 | 16 | 4+4 | Bitaxe Gamma, S21 Pro |
+| Chip | Chip ID | Cores | Sub-cores | Result_Header job_id | Used In |
+|------|---------|-------|-----------|----------------------|----------|
+| BM1362 | 0x1362 | Unknown | Unknown | bits 6-3 | Antminer S19 J Pro |
+| BM1370 | 0x1370 | 80 | 16 | bits 7-4 | Bitaxe Gamma, S21 Pro |
 
