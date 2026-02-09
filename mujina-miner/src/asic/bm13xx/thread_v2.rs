@@ -540,7 +540,7 @@ where
         // 2. Execute enumeration sequence (assigns addresses)
         self.execute_enumeration().await?;
 
-        // 3. Verify chip count - warn on mismatch but continue unless pathologically low
+        // 3. Verify chip count
         let responding = self.verify_chain().await;
         let min_required = min_viable_chip_count(expected_count);
         if responding < min_required {
@@ -566,8 +566,9 @@ where
 
         // 6. Ramp frequency to target (must be before per-chip config)
         // This matches emberone-miner's initialization order.
-        self.execute_frequency_ramp(protocol::Frequency::from_mhz(525.0))
-            .await?;
+        // TODO: Disabled for board bring-up testing.
+        // self.execute_frequency_ramp(protocol::Frequency::from_mhz(525.0))
+        //     .await?;
 
         // 7. Execute per-chip register configuration (Phase 2)
         // Enables cores at the target frequency set above.
@@ -632,6 +633,7 @@ where
     }
 
     /// Execute frequency ramp from initial PLL frequency to target.
+    #[expect(dead_code, reason = "disabled during board bring-up")]
     async fn execute_frequency_ramp(
         &mut self,
         target: protocol::Frequency,
@@ -1407,7 +1409,7 @@ mod tests {
                 )
                 .expect("Valid version template"),
                 bits: *esp_miner_job::wire_tx::NBITS,
-                share_target: crate::types::Difficulty::new(100).to_target(),
+                share_target: crate::types::Difficulty::from(100u64).to_target(),
                 time: *esp_miner_job::wire_tx::NTIME,
                 merkle_root: MerkleRootKind::Fixed(*esp_miner_job::wire_tx::MERKLE_ROOT),
             });
@@ -1416,7 +1418,7 @@ mod tests {
                 template,
                 en2_range: None,
                 en2: Some(Extranonce2::new(0, 1).unwrap()),
-                share_target: crate::types::Difficulty::new(100).to_target(),
+                share_target: crate::types::Difficulty::from(100u64).to_target(),
                 ntime: *esp_miner_job::wire_tx::NTIME,
                 share_tx,
             }
@@ -1564,7 +1566,7 @@ mod tests {
 
             // Difficulty should be significant (not 0.00)
             assert!(
-                u64::from(difficulty) > 1000,
+                difficulty.as_u64() > 1000,
                 "Hash difficulty {} should be significant (>1000)",
                 difficulty
             );
