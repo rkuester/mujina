@@ -167,10 +167,9 @@ impl<I2C: I2c> Tps546<I2C> {
         debug!("Power output turned off");
 
         // Configure ON_OFF_CONFIG immediately after turning off (esp-miner sequence)
-        // Using same configuration as esp-miner - both CONTROL pin and OPERATION command
+        // Match EmberOne test scripts: OPERATION command only, no CONTROL pin
         let on_off_config = pmbus::OnOffConfig::DELAY
             | pmbus::OnOffConfig::POLARITY
-            | pmbus::OnOffConfig::CP
             | pmbus::OnOffConfig::CMD
             | pmbus::OnOffConfig::PU;
         self.write_byte(PmbusCommand::OnOffConfig, on_off_config.bits())
