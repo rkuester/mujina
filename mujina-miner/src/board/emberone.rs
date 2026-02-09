@@ -192,7 +192,7 @@ impl EmberOne {
             vin_on: 11.0,
             vin_off: 10.5,
             vin_uv_warn_limit: 0.0, // Disabled due to TI bug
-            vin_ov_fault_limit: 13.0,
+            vin_ov_fault_limit: 14.0,
             vin_ov_fault_response: 0xB7, // Immediate shutdown, 6 retries
 
             // Output voltage configuration for BM1362 chain
