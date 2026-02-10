@@ -249,7 +249,7 @@ impl EmberOne {
                 tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
                 // Set initial output voltage for BM1362 chain
-                const DEFAULT_VOUT: f32 = 3.43;
+                const DEFAULT_VOUT: f32 = 3.0;
                 match tps546.set_vout(DEFAULT_VOUT).await {
                     Ok(()) => {
                         debug!("Core voltage set to {DEFAULT_VOUT}V");
