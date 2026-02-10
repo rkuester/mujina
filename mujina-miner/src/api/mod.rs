@@ -7,7 +7,7 @@
 //! The API binds to localhost only by default and does not require
 //! authentication for local access.
 
-mod v1;
+mod v0;
 
 use anyhow::Result;
 use axum::Router;
@@ -66,7 +66,7 @@ pub async fn serve(config: ApiConfig, shutdown: CancellationToken) -> Result<()>
 
 /// Build the application router with all API routes.
 fn build_router() -> Router {
-    Router::new().nest("/api/v1", v1::routes()).layer(
+    Router::new().nest("/api/v0", v0::routes()).layer(
         TraceLayer::new_for_http()
             .make_span_with(DefaultMakeSpan::new().level(Level::INFO))
             .on_response(DefaultOnResponse::new().level(Level::INFO)),
