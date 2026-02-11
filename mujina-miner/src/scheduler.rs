@@ -39,7 +39,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::{StreamExt, StreamMap};
 use tokio_util::sync::CancellationToken;
 
-use crate::api_client::types::MinerState;
+use crate::api_client::types::{MinerState, SourceState};
 use crate::asic::hash_thread::{HashTask, HashThread, HashThreadEvent, Share};
 use crate::job_source::{
     JobTemplate, MerkleRootKind, Share as SourceShare, SourceCommand, SourceEvent,
@@ -173,23 +173,48 @@ impl Scheduler {
         let total: u64 = self
             .threads
             .values()
-            .map(|t| t.capabilities().hashrate_estimate.0)
+            .map(|t| u64::from(t.capabilities().hashrate_estimate))
             .sum();
-        HashRate(total)
+        HashRate::from(total)
     }
 
     /// Calculates aggregate measured hashrate from all registered threads.
     ///
     /// Falls back to estimated hashrate if no measurements available yet.
     fn measured_hashrate(&self) -> HashRate {
-        let total: u64 = self.threads.values().map(|t| t.status().hashrate.0).sum();
-        let measured = HashRate(total);
+        let total: u64 = self
+            .threads
+            .values()
+            .map(|t| u64::from(t.status().hashrate))
+            .sum();
+        let measured = HashRate::from(total);
 
         // Fall back to estimate if no measurements yet
         if measured.is_zero() {
             self.estimated_hashrate()
         } else {
             measured
+        }
+    }
+
+    /// Build a [`MinerState`] snapshot from current scheduler state.
+    ///
+    /// The scheduler contributes aggregate stats and source info. Board
+    /// and thread details come from the backplane, not the scheduler, so
+    /// `boards` is left empty here.
+    fn compute_miner_state(&self) -> MinerState {
+        MinerState {
+            uptime_secs: self.stats.start_time.elapsed().as_secs(),
+            hashrate: u64::from(self.measured_hashrate()),
+            shares_submitted: self.stats.shares_submitted,
+            boards: vec![],
+            sources: self
+                .sources
+                .values()
+                .map(|s| SourceState {
+                    name: s.name.clone(),
+                })
+                .collect(),
         }
     }
 
@@ -599,6 +624,7 @@ impl Scheduler {
         running: CancellationToken,
         mut thread_rx: mpsc::Receiver<Box<dyn HashThread>>,
         mut source_reg_rx: mpsc::Receiver<SourceRegistration>,
+        miner_state_tx: watch::Sender<MinerState>,
     ) {
         // StreamMaps as locals (not in self) to avoid borrow conflicts in select!
         let mut source_events: SourceEventStream = StreamMap::new();
@@ -678,12 +704,13 @@ impl Scheduler {
                     self.handle_new_thread(thread, &mut thread_events, &mut share_channels).await;
                 }
 
-                // Periodic status logging
+                // Periodic status logging and state publishing
                 _ = status_interval.tick() => {
                     if first_status_tick {
                         first_status_tick = false;
                     } else {
                         self.stats.log_summary();
+                        let _ = miner_state_tx.send(self.compute_miner_state());
                     }
                 }
 
@@ -763,10 +790,12 @@ pub async fn task(
     running: CancellationToken,
     thread_rx: mpsc::Receiver<Box<dyn HashThread>>,
     source_reg_rx: mpsc::Receiver<SourceRegistration>,
-    _miner_state_tx: watch::Sender<MinerState>,
+    miner_state_tx: watch::Sender<MinerState>,
 ) {
     let mut scheduler = Scheduler::new();
-    scheduler.run(running, thread_rx, source_reg_rx).await;
+    scheduler
+        .run(running, thread_rx, source_reg_rx, miner_state_tx)
+        .await;
 }
 
 /// Format seconds as human-readable duration.
