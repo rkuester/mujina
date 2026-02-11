@@ -92,9 +92,7 @@ async fn create_cpu_board()
             "cpu-{}x{}%",
             config.thread_count, config.duty_percent
         )),
-        fans: Vec::new(),
-        temperatures: Vec::new(),
-        threads: Vec::new(),
+        ..Default::default()
     };
     let (state_tx, state_rx) = watch::channel(initial_state);
 

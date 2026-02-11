@@ -17,29 +17,42 @@ pub struct MinerState {
 }
 
 /// Board status.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct BoardState {
     pub model: String,
     pub serial: Option<String>,
     pub fans: Vec<Fan>,
     pub temperatures: Vec<TemperatureSensor>,
+    pub powers: Vec<PowerMeasurement>,
     pub threads: Vec<ThreadState>,
 }
 
 /// Fan status.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Fan {
-    pub label: String,
-    pub rpm: u32,
-    pub percent: u8,
-    pub target_percent: u8,
+    pub name: String,
+    /// Measured RPM, or null if the tachometer read failed.
+    pub rpm: Option<u32>,
+    /// Measured duty cycle, or null if the read failed.
+    pub percent: Option<u8>,
+    /// Target duty cycle, or null if the fan is in automatic mode.
+    pub target_percent: Option<u8>,
 }
 
 /// Temperature sensor reading.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct TemperatureSensor {
-    pub label: String,
-    pub temperature_c: f32,
+    pub name: String,
+    pub temperature_c: Option<f32>,
+}
+
+/// Voltage, current, and power from a single measurement point.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct PowerMeasurement {
+    pub name: String,
+    pub voltage_v: Option<f32>,
+    pub current_a: Option<f32>,
+    pub power_w: Option<f32>,
 }
 
 /// Per-thread runtime status.

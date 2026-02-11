@@ -950,9 +950,7 @@ async fn create_from_usb(
     let initial_state = BoardState {
         model: "Bitaxe Gamma".into(),
         serial: device.serial_number.clone(),
-        fans: Vec::new(),
-        temperatures: Vec::new(),
-        threads: Vec::new(),
+        ..Default::default()
     };
     let (state_tx, state_rx) = watch::channel(initial_state);
 

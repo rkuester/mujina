@@ -68,9 +68,7 @@ async fn create_from_usb(
     let initial_state = BoardState {
         model: "EmberOne".into(),
         serial: device.serial_number.clone(),
-        fans: Vec::new(),
-        temperatures: Vec::new(),
-        threads: Vec::new(),
+        ..Default::default()
     };
     let (state_tx, state_rx) = watch::channel(initial_state);
 
@@ -114,9 +112,7 @@ mod tests {
         let (state_tx, _state_rx) = watch::channel(BoardState {
             model: "EmberOne".into(),
             serial: device.serial_number.clone(),
-            fans: Vec::new(),
-            temperatures: Vec::new(),
-            threads: Vec::new(),
+            ..Default::default()
         });
 
         let board = EmberOne::new(device, state_tx);
