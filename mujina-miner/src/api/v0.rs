@@ -5,7 +5,7 @@
 
 use axum::{Json, Router, extract::Path, extract::State, http::StatusCode, routing::get};
 
-use super::SharedState;
+use super::server::SharedState;
 use crate::api_client::types::{BoardState, MinerState};
 
 /// Build the v0 API routes.
