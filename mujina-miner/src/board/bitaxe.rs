@@ -15,7 +15,7 @@ use tokio_stream::StreamExt;
 use tokio_util::codec::{FramedRead, FramedWrite};
 
 use crate::{
-    api_client::types::BoardState,
+    api_client::types::{BoardState, Fan, PowerMeasurement, TemperatureSensor},
     asic::{
         ChipInfo,
         bm13xx::{self, BM13xxProtocol, protocol::Command, thread::BM13xxThread},
@@ -142,8 +142,8 @@ pub struct BitaxeBoard {
     /// Serial number from USB device info
     serial_number: Option<String>,
     /// Channel for publishing board state to the API server.
-    #[expect(dead_code, reason = "will publish telemetry in a follow-up commit")]
-    state_tx: watch::Sender<BoardState>,
+    /// Taken by `spawn_stats_monitor` which publishes periodic snapshots.
+    state_tx: Option<watch::Sender<BoardState>>,
 }
 
 impl BitaxeBoard {
@@ -202,7 +202,7 @@ impl BitaxeBoard {
             thread_shutdown: None,
             stats_task_handle: None,
             serial_number,
-            state_tx,
+            state_tx: Some(state_tx),
         })
     }
 
@@ -689,7 +689,7 @@ impl BitaxeBoard {
         self.chip_infos.len()
     }
 
-    /// Spawn a task to periodically log management statistics
+    /// Spawn a task to periodically log and publish board telemetry.
     fn spawn_stats_monitor(&mut self) {
         // Clone data needed for the monitoring task
         let i2c = self.i2c.clone();
@@ -705,13 +705,19 @@ impl BitaxeBoard {
         let board_model = board_info.model.clone();
         let board_serial = board_info.serial_number.clone();
 
+        // Take the state sender so this task owns publishing
+        let state_tx = self
+            .state_tx
+            .take()
+            .expect("state_tx must be present when spawning stats monitor");
+
         let handle = tokio::spawn(async move {
             const STATS_INTERVAL: Duration = Duration::from_secs(30);
             let mut interval = tokio::time::interval(STATS_INTERVAL);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
             // Create fan controller for the stats task
-            let mut fan = Emc2101::new(i2c);
+            let mut fan_ctrl = Emc2101::new(i2c);
 
             // Discard first tick (fires immediately, ADC readings may not be settled)
             interval.tick().await;
@@ -719,91 +725,96 @@ impl BitaxeBoard {
             loop {
                 interval.tick().await;
 
-                // Read temperature
-                let temp = match fan.get_external_temperature().await {
-                    Ok(t) => format!("{:.1} degC", t),
-                    Err(_) => "N/A".to_string(),
+                // -- Read sensor values --
+
+                let asic_temp = fan_ctrl.get_external_temperature().await.ok();
+                let fan_percent = fan_ctrl.get_fan_speed().await.ok().map(u8::from);
+                let fan_rpm = fan_ctrl.get_rpm().await.ok();
+
+                let (vin_mv, vout_mv, iout_ma, power_mw, vr_temp) = {
+                    let mut reg = regulator.lock().await;
+                    (
+                        reg.get_vin().await.ok(),
+                        reg.get_vout().await.ok(),
+                        reg.get_iout().await.ok(),
+                        reg.get_power().await.ok(),
+                        reg.get_temperature().await.ok(),
+                    )
                 };
 
-                // Read fan speed
-                let fan_speed = match fan.get_fan_speed().await {
-                    Ok(speed_percent) => format!("{}%", u8::from(speed_percent)),
-                    Err(_) => "N/A".to_string(),
-                };
-
-                // Read fan RPM (if TACH is connected)
-                let fan_rpm = match fan.get_tach_count().await {
-                    Ok(count) => {
-                        trace!("TACH count: 0x{:04x}", count);
-                        match fan.get_rpm().await {
-                            Ok(rpm) if rpm > 0 => format!("{} RPM", rpm),
-                            Ok(_) => format!("0 RPM (TACH: 0x{:04x})", count),
-                            Err(_) => "N/A".to_string(),
-                        }
+                if let Some(mv) = vout_mv {
+                    let volts = mv as f32 / 1000.0;
+                    if volts < 1.0 {
+                        warn!("Core voltage low: {:.3}V", volts);
                     }
-                    Err(e) => {
-                        trace!("Failed to read TACH: {}", e);
-                        "N/A".to_string()
-                    }
-                };
-
-                // Read power stats using the shared regulator
-                let vin = match regulator.lock().await.get_vin().await {
-                    Ok(mv) => format!("{:.2}V", mv as f32 / 1000.0),
-                    Err(_) => "N/A".to_string(),
-                };
-
-                let vout = match regulator.lock().await.get_vout().await {
-                    Ok(mv) => {
-                        let volts = mv as f32 / 1000.0;
-                        if volts < 1.0 {
-                            warn!("Core voltage low: {:.3}V", volts);
-                        }
-                        format!("{:.3}V", volts)
-                    }
-                    Err(_) => "N/A".to_string(),
-                };
-
-                let iout = match regulator.lock().await.get_iout().await {
-                    Ok(ma) => format!("{:.2}A", ma as f32 / 1000.0),
-                    Err(_) => "N/A".to_string(),
-                };
-
-                let power_w = match regulator.lock().await.get_power().await {
-                    Ok(mw) => format!("{:.1}W", mw as f32 / 1000.0),
-                    Err(_) => "N/A".to_string(),
-                };
-
-                let vr_temp = match regulator.lock().await.get_temperature().await {
-                    Ok(t) => format!("{} degC", t),
-                    Err(_) => "N/A".to_string(),
-                };
-
-                // Check power status - critical faults will return error
-                if let Err(e) = regulator.lock().await.check_status().await {
-                    error!("CRITICAL: Power controller fault detected: {}", e);
-
-                    // Try to clear the fault once
-                    warn!("Attempting to clear power controller faults...");
-                    if let Err(clear_err) = regulator.lock().await.clear_faults().await {
-                        error!("Failed to clear faults: {}", clear_err);
-                    }
-
-                    // Continue monitoring
-                    continue;
                 }
+
+                // Check power status -- critical faults will return error
+                {
+                    let mut reg = regulator.lock().await;
+                    if let Err(e) = reg.check_status().await {
+                        error!("CRITICAL: Power controller fault detected: {}", e);
+
+                        warn!("Attempting to clear power controller faults...");
+                        if let Err(clear_err) = reg.clear_faults().await {
+                            error!("Failed to clear faults: {}", clear_err);
+                        }
+
+                        continue;
+                    }
+                }
+
+                // -- Publish BoardState --
+
+                let _ = state_tx.send(BoardState {
+                    model: board_model.clone(),
+                    serial: board_serial.clone(),
+                    fans: vec![Fan {
+                        name: "fan".into(),
+                        rpm: fan_rpm,
+                        percent: fan_percent,
+                        target_percent: Some(100),
+                    }],
+                    temperatures: vec![
+                        TemperatureSensor {
+                            name: "asic".into(),
+                            temperature_c: asic_temp,
+                        },
+                        TemperatureSensor {
+                            name: "vr".into(),
+                            temperature_c: vr_temp.map(|t| t as f32),
+                        },
+                    ],
+                    powers: vec![
+                        PowerMeasurement {
+                            name: "input".into(),
+                            voltage_v: vin_mv.map(|mv| mv as f32 / 1000.0),
+                            current_a: None,
+                            power_w: None,
+                        },
+                        PowerMeasurement {
+                            name: "core".into(),
+                            voltage_v: vout_mv.map(|mv| mv as f32 / 1000.0),
+                            current_a: iout_ma.map(|ma| ma as f32 / 1000.0),
+                            power_w: power_mw.map(|mw| mw as f32 / 1000.0),
+                        },
+                    ],
+                    threads: Vec::new(),
+                });
+
+                // -- Log summary --
 
                 info!(
                     board = %board_model,
                     serial = ?board_serial,
-                    asic_temp = %temp,
-                    fan_speed = %fan_speed,
-                    fan_rpm = %fan_rpm,
-                    vr_temp = %vr_temp,
-                    power = %power_w,
-                    current = %iout,
-                    vin = %vin,
-                    vout = %vout,
+                    asic_temp_c = ?asic_temp,
+                    fan_percent = ?fan_percent,
+                    fan_rpm = ?fan_rpm,
+                    vr_temp_c = ?vr_temp,
+                    power_w = ?power_mw.map(|mw| mw as f32 / 1000.0),
+                    current_a = ?iout_ma.map(|ma| ma as f32 / 1000.0),
+                    vin_v = ?vin_mv.map(|mv| mv as f32 / 1000.0),
+                    vout_v = ?vout_mv.map(|mv| mv as f32 / 1000.0),
                     "Board status."
                 );
             }
