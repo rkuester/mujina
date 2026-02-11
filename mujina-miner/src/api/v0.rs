@@ -4,15 +4,12 @@
 //! until the miner reaches 1.0.
 
 use axum::{Json, Router, extract::State, routing::get};
-use tokio::sync::watch;
 
+use super::SharedState;
 use crate::api_client::types::MinerState;
 
-/// Shared application state available to all handlers.
-type AppState = watch::Receiver<MinerState>;
-
 /// Build the v0 API routes.
-pub fn routes() -> Router<AppState> {
+pub fn routes() -> Router<SharedState> {
     Router::new()
         .route("/health", get(health))
         .route("/miner", get(get_miner))
@@ -24,6 +21,11 @@ async fn health() -> &'static str {
 }
 
 /// Return the current miner state snapshot.
-async fn get_miner(State(rx): State<AppState>) -> Json<MinerState> {
-    Json(rx.borrow().clone())
+///
+/// Combines scheduler data (hashrate, shares, sources) with board
+/// snapshots collected from each board's watch channel.
+async fn get_miner(State(state): State<SharedState>) -> Json<MinerState> {
+    let mut miner_state = state.miner_state_rx.borrow().clone();
+    miner_state.boards = state.board_registry.lock().unwrap().boards();
+    Json(miner_state)
 }

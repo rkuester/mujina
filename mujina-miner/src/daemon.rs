@@ -222,6 +222,11 @@ impl Daemon {
         // Miner state channel: scheduler publishes snapshots, API serves them.
         let (miner_state_tx, miner_state_rx) = watch::channel(MinerState::default());
 
+        // Board registration channel: boards send watch receivers here,
+        // the API server collects and serves them.
+        let (board_reg_tx, board_reg_rx) = mpsc::channel(10);
+        let _ = board_reg_tx; // TODO: pass to backplane when boards publish state
+
         // Start the scheduler
         self.tracker.spawn(scheduler::task(
             self.shutdown.clone(),
@@ -235,7 +240,7 @@ impl Daemon {
             let shutdown = self.shutdown.clone();
             async move {
                 let config = ApiConfig::default();
-                if let Err(e) = api::serve(config, shutdown, miner_state_rx).await {
+                if let Err(e) = api::serve(config, shutdown, miner_state_rx, board_reg_rx).await {
                     error!("API server error: {}", e);
                 }
             }
