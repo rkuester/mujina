@@ -3,10 +3,10 @@
 //! These types define the API contract shared between the server and
 //! clients.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// Full miner state snapshot.
-#[derive(Clone, Debug, Default, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct MinerState {
     pub uptime_secs: u64,
     /// Aggregate hashrate in hashes per second.
@@ -17,14 +17,14 @@ pub struct MinerState {
 }
 
 /// Board status.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct BoardState {
     pub name: String,
     pub threads: Vec<ThreadState>,
 }
 
 /// Per-thread runtime status.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ThreadState {
     pub name: String,
     /// Hashrate in hashes per second.
@@ -33,7 +33,7 @@ pub struct ThreadState {
 }
 
 /// Job source status.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct SourceState {
     pub name: String,
 }
