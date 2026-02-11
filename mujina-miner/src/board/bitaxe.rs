@@ -702,6 +702,10 @@ impl BitaxeBoard {
 
         // Capture board info for logging
         let board_info = self.board_info();
+        let board_name = format!(
+            "bitaxe-{}",
+            board_info.serial_number.as_deref().unwrap_or("unknown")
+        );
         let board_model = board_info.model.clone();
         let board_serial = board_info.serial_number.clone();
 
@@ -767,6 +771,7 @@ impl BitaxeBoard {
                 // -- Publish BoardState --
 
                 let _ = state_tx.send(BoardState {
+                    name: board_name.clone(),
                     model: board_model.clone(),
                     serial: board_serial.clone(),
                     fans: vec![Fan {
@@ -958,9 +963,11 @@ async fn create_from_usb(
     let control_port = tokio_serial::new(&serial_ports[0], 115200).open_native_async()?;
 
     // Create watch channel for board state, seeded with identity
+    let serial = device.serial_number.clone();
     let initial_state = BoardState {
+        name: format!("bitaxe-{}", serial.as_deref().unwrap_or("unknown")),
         model: "Bitaxe Gamma".into(),
-        serial: device.serial_number.clone(),
+        serial,
         ..Default::default()
     };
     let (state_tx, state_rx) = watch::channel(initial_state);

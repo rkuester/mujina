@@ -65,9 +65,11 @@ impl Board for EmberOne {
 async fn create_from_usb(
     device: UsbDeviceInfo,
 ) -> crate::error::Result<(Box<dyn Board + Send>, super::BoardRegistration)> {
+    let serial = device.serial_number.clone();
     let initial_state = BoardState {
+        name: format!("emberone-{}", serial.as_deref().unwrap_or("unknown")),
         model: "EmberOne".into(),
-        serial: device.serial_number.clone(),
+        serial,
         ..Default::default()
     };
     let (state_tx, state_rx) = watch::channel(initial_state);
@@ -110,6 +112,10 @@ mod tests {
         );
 
         let (state_tx, _state_rx) = watch::channel(BoardState {
+            name: format!(
+                "emberone-{}",
+                device.serial_number.as_deref().unwrap_or("unknown")
+            ),
             model: "EmberOne".into(),
             serial: device.serial_number.clone(),
             ..Default::default()

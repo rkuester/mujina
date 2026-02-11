@@ -19,6 +19,8 @@ pub struct MinerState {
 /// Board status.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct BoardState {
+    /// URL-friendly identifier (e.g. "bitaxe-e2f56f9b").
+    pub name: String,
     pub model: String,
     pub serial: Option<String>,
     pub fans: Vec<Fan>,

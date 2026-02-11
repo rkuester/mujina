@@ -86,12 +86,11 @@ async fn create_cpu_board()
         crate::error::Error::Config("CPU miner not configured (MUJINA_CPU_MINER not set)".into())
     })?;
 
+    let serial = format!("cpu-{}x{}%", config.thread_count, config.duty_percent);
     let initial_state = BoardState {
+        name: serial.clone(),
         model: "CPU Miner".into(),
-        serial: Some(format!(
-            "cpu-{}x{}%",
-            config.thread_count, config.duty_percent
-        )),
+        serial: Some(serial),
         ..Default::default()
     };
     let (state_tx, state_rx) = watch::channel(initial_state);
