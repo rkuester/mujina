@@ -43,9 +43,9 @@ impl Default for ApiConfig {
 pub async fn serve(
     config: ApiConfig,
     shutdown: CancellationToken,
-    _miner_state_rx: watch::Receiver<MinerState>,
+    miner_state_rx: watch::Receiver<MinerState>,
 ) -> Result<()> {
-    let app = build_router();
+    let app = build_router(miner_state_rx);
 
     let listener = TcpListener::bind(&config.bind_addr).await?;
     let actual_addr = listener.local_addr()?;
@@ -72,10 +72,13 @@ pub async fn serve(
 }
 
 /// Build the application router with all API routes.
-fn build_router() -> Router {
-    Router::new().nest("/api/v0", v0::routes()).layer(
-        TraceLayer::new_for_http()
-            .make_span_with(DefaultMakeSpan::new().level(Level::INFO))
-            .on_response(DefaultOnResponse::new().level(Level::INFO)),
-    )
+fn build_router(miner_state_rx: watch::Receiver<MinerState>) -> Router {
+    Router::new()
+        .nest("/api/v0", v0::routes())
+        .layer(
+            TraceLayer::new_for_http()
+                .make_span_with(DefaultMakeSpan::new().level(Level::INFO))
+                .on_response(DefaultOnResponse::new().level(Level::INFO)),
+        )
+        .with_state(miner_state_rx)
 }
