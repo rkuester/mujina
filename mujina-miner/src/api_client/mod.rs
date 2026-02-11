@@ -40,7 +40,12 @@ impl Client {
 
     /// Fetch the current miner state snapshot.
     pub async fn get_miner(&self) -> Result<MinerState> {
-        let url = format!("{}/api/v0/miner", self.base_url);
+        self.get_json("miner").await
+    }
+
+    /// GET a v0 API endpoint and deserialize the JSON response.
+    pub async fn get_json<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<T> {
+        let url = format!("{}/api/v0/{}", self.base_url, path);
         let response = self
             .http
             .get(&url)
@@ -54,7 +59,23 @@ impl Client {
         response
             .json()
             .await
-            .context("failed to parse miner state response")
+            .context("failed to parse API response")
+    }
+
+    /// GET a v0 API endpoint and return the raw response body.
+    pub async fn get_raw(&self, path: &str) -> Result<String> {
+        let url = format!("{}/api/v0/{}", self.base_url, path);
+        let response = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .context("failed to connect to miner API")?;
+        let status = response.status();
+        if !status.is_success() {
+            anyhow::bail!("API request failed: {}", status);
+        }
+        response.text().await.context("failed to read API response")
     }
 }
 
