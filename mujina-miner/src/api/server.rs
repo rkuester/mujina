@@ -110,3 +110,144 @@ pub(crate) fn build_router(
         )
         .with_state(state)
 }
+
+#[cfg(test)]
+mod tests {
+    use http::Request;
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    use super::*;
+    use crate::api_client::types::{BoardState, SourceState};
+    use crate::board::BoardRegistration;
+
+    /// Build a router with pre-registered boards. Returns the router and
+    /// a vec of watch senders (must be kept alive for the boards to remain
+    /// connected).
+    fn router_with_boards(
+        miner_state: MinerState,
+        board_states: Vec<BoardState>,
+    ) -> (Router, Vec<watch::Sender<BoardState>>) {
+        let (_miner_tx, miner_rx) = watch::channel(miner_state);
+
+        let mut registry = BoardRegistry::new();
+        let mut senders = Vec::new();
+        for state in board_states {
+            let (tx, rx) = watch::channel(state);
+            registry.push(BoardRegistration { state_rx: rx });
+            senders.push(tx);
+        }
+
+        (
+            build_router(miner_rx, Arc::new(Mutex::new(registry))),
+            senders,
+        )
+    }
+
+    async fn get(app: Router, uri: &str) -> (http::StatusCode, String) {
+        let req = Request::builder()
+            .uri(uri)
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        (status, String::from_utf8(body.to_vec()).unwrap())
+    }
+
+    #[tokio::test]
+    async fn health_returns_ok() {
+        let (app, _keep) = router_with_boards(MinerState::default(), vec![]);
+        let (status, body) = get(app.clone(), "/api/v0/health").await;
+        assert_eq!(status, 200);
+        assert_eq!(body, "OK");
+    }
+
+    #[tokio::test]
+    async fn miner_includes_boards_and_sources() {
+        let miner_state = MinerState {
+            uptime_secs: 42,
+            hashrate: 1_000_000,
+            shares_submitted: 5,
+            sources: vec![SourceState {
+                name: "pool".into(),
+            }],
+            ..Default::default()
+        };
+        let board = BoardState {
+            name: "test-board".into(),
+            model: "TestModel".into(),
+            ..Default::default()
+        };
+        let (app, _keep) = router_with_boards(miner_state, vec![board]);
+
+        let (status, body) = get(app.clone(), "/api/v0/miner").await;
+        assert_eq!(status, 200);
+
+        let state: MinerState = serde_json::from_str(&body).unwrap();
+        assert_eq!(state.uptime_secs, 42);
+        assert_eq!(state.hashrate, 1_000_000);
+        assert_eq!(state.shares_submitted, 5);
+        assert_eq!(state.boards.len(), 1);
+        assert_eq!(state.boards[0].name, "test-board");
+        assert_eq!(state.sources.len(), 1);
+        assert_eq!(state.sources[0].name, "pool");
+    }
+
+    #[tokio::test]
+    async fn boards_returns_list() {
+        let boards = vec![
+            BoardState {
+                name: "board-a".into(),
+                model: "A".into(),
+                ..Default::default()
+            },
+            BoardState {
+                name: "board-b".into(),
+                model: "B".into(),
+                ..Default::default()
+            },
+        ];
+        let (app, _keep) = router_with_boards(MinerState::default(), boards);
+
+        let (status, body) = get(app.clone(), "/api/v0/boards").await;
+        assert_eq!(status, 200);
+
+        let boards: Vec<BoardState> = serde_json::from_str(&body).unwrap();
+        assert_eq!(boards.len(), 2);
+        assert_eq!(boards[0].name, "board-a");
+        assert_eq!(boards[1].name, "board-b");
+    }
+
+    #[tokio::test]
+    async fn board_by_name_returns_match() {
+        let board = BoardState {
+            name: "bitaxe-abc123".into(),
+            model: "Bitaxe".into(),
+            serial: Some("abc123".into()),
+            ..Default::default()
+        };
+        let (app, _keep) = router_with_boards(MinerState::default(), vec![board]);
+
+        let (status, body) = get(app.clone(), "/api/v0/boards/bitaxe-abc123").await;
+        assert_eq!(status, 200);
+
+        let board: BoardState = serde_json::from_str(&body).unwrap();
+        assert_eq!(board.name, "bitaxe-abc123");
+        assert_eq!(board.serial, Some("abc123".into()));
+    }
+
+    #[tokio::test]
+    async fn board_by_name_returns_404_when_missing() {
+        let (app, _keep) = router_with_boards(MinerState::default(), vec![]);
+        let (status, _body) = get(app.clone(), "/api/v0/boards/nonexistent").await;
+        assert_eq!(status, 404);
+    }
+
+    #[tokio::test]
+    async fn unknown_route_returns_404() {
+        let (app, _keep) = router_with_boards(MinerState::default(), vec![]);
+        let (status, _body) = get(app.clone(), "/api/v0/nope").await;
+        assert_eq!(status, 404);
+    }
+}
