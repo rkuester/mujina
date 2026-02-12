@@ -4,9 +4,10 @@
 //! clients.
 
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 
 /// Full miner state snapshot.
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, ToSchema)]
 pub struct MinerState {
     pub uptime_secs: u64,
     /// Aggregate hashrate in hashes per second.
@@ -18,7 +19,7 @@ pub struct MinerState {
 }
 
 /// Board status.
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, ToSchema)]
 pub struct BoardState {
     /// URL-friendly identifier (e.g. "bitaxe-e2f56f9b").
     pub name: String,
@@ -31,7 +32,7 @@ pub struct BoardState {
 }
 
 /// Fan status.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
 pub struct Fan {
     pub name: String,
     /// Measured RPM, or null if the tachometer read failed.
@@ -43,14 +44,14 @@ pub struct Fan {
 }
 
 /// Temperature sensor reading.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
 pub struct TemperatureSensor {
     pub name: String,
     pub temperature_c: Option<f32>,
 }
 
 /// Voltage, current, and power from a single measurement point.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
 pub struct PowerMeasurement {
     pub name: String,
     pub voltage_v: Option<f32>,
@@ -59,7 +60,7 @@ pub struct PowerMeasurement {
 }
 
 /// Per-thread runtime status.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
 pub struct ThreadState {
     pub name: String,
     /// Hashrate in hashes per second.
@@ -72,21 +73,21 @@ pub struct ThreadState {
 /// All fields are optional; only those present in the request body are
 /// applied. Read-only fields like `uptime_secs` and `hashrate` are not
 /// included and cannot be set.
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, ToSchema)]
 pub struct MinerPatchRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub paused: Option<bool>,
 }
 
 /// Request body for setting a fan's target duty cycle.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
 pub struct SetFanTargetRequest {
     /// Target duty cycle percentage (0--100), or null for automatic control.
     pub target_percent: Option<u8>,
 }
 
 /// Job source status.
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, ToSchema)]
 pub struct SourceState {
     pub name: String,
     /// Connection URL (e.g. "stratum+tcp://pool:3333"), if applicable.
