@@ -409,7 +409,8 @@ Orchestrates the mining operation:
 ### API and Observability
 
 #### `api/`
-HTTP API server (new):
+HTTP API server (new).
+See [API documentation](api.md) for the contract and conventions.
 - Built on Axum (async web framework)
 - RESTful endpoints for status, control, configuration
 - WebSocket support for real-time updates

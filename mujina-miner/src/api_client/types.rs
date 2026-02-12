@@ -1,7 +1,9 @@
 //! API data transfer objects.
 //!
 //! These types define the API contract shared between the server and
-//! clients.
+//! clients (CLI, TUI). See `docs/api.md` (at the repository root)
+//! for the full API contract documentation, including conventions
+//! for null values and units.
 
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;

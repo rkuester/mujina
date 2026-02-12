@@ -52,6 +52,7 @@ Planned support:
 
 - [Architecture Overview](docs/architecture.md) - System design and component
   interaction
+- [REST API](docs/api.md) - API contract, conventions, and endpoints
 - [CPU Mining](docs/cpu-mining.md) - Run without hardware for development and
   testing
 - [Container Image](docs/container.md) - Build and run as a container
