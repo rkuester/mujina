@@ -6,7 +6,7 @@
 use axum::{Json, Router, extract::Path, extract::State, http::StatusCode, routing::get};
 
 use super::server::SharedState;
-use crate::api_client::types::{BoardState, MinerState};
+use crate::api_client::types::{BoardState, MinerState, SourceState};
 
 /// Build the v0 API routes.
 pub fn routes() -> Router<SharedState> {
@@ -15,6 +15,8 @@ pub fn routes() -> Router<SharedState> {
         .route("/miner", get(get_miner))
         .route("/boards", get(get_boards))
         .route("/boards/{name}", get(get_board))
+        .route("/sources", get(get_sources))
+        .route("/sources/{name}", get(get_source))
 }
 
 /// Health check endpoint.
@@ -55,6 +57,25 @@ async fn get_board(
         .boards()
         .into_iter()
         .find(|b| b.name == name)
+        .map(Json)
+        .ok_or(StatusCode::NOT_FOUND)
+}
+
+/// Return all registered job sources.
+async fn get_sources(State(state): State<SharedState>) -> Json<Vec<SourceState>> {
+    Json(state.miner_state().sources)
+}
+
+/// Return a single source by name, or 404 if not found.
+async fn get_source(
+    State(state): State<SharedState>,
+    Path(name): Path<String>,
+) -> Result<Json<SourceState>, StatusCode> {
+    state
+        .miner_state()
+        .sources
+        .into_iter()
+        .find(|s| s.name == name)
         .map(Json)
         .ok_or(StatusCode::NOT_FOUND)
 }

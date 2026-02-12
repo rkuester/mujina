@@ -246,6 +246,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sources_returns_list() {
+        let miner_state = MinerState {
+            sources: vec![
+                SourceState {
+                    name: "pool-a".into(),
+                    url: Some("stratum+tcp://a:3333".into()),
+                },
+                SourceState {
+                    name: "pool-b".into(),
+                    url: None,
+                },
+            ],
+            ..Default::default()
+        };
+        let (app, _keep) = router_with_boards(miner_state, vec![]);
+
+        let (status, body) = get(app.clone(), "/api/v0/sources").await;
+        assert_eq!(status, 200);
+
+        let sources: Vec<SourceState> = serde_json::from_str(&body).unwrap();
+        assert_eq!(sources.len(), 2);
+        assert_eq!(sources[0].name, "pool-a");
+        assert_eq!(sources[0].url.as_deref(), Some("stratum+tcp://a:3333"));
+        assert_eq!(sources[1].name, "pool-b");
+        assert_eq!(sources[1].url, None);
+    }
+
+    #[tokio::test]
+    async fn source_by_name_returns_match() {
+        let miner_state = MinerState {
+            sources: vec![SourceState {
+                name: "my-pool".into(),
+                url: Some("stratum+tcp://pool:3333".into()),
+            }],
+            ..Default::default()
+        };
+        let (app, _keep) = router_with_boards(miner_state, vec![]);
+
+        let (status, body) = get(app.clone(), "/api/v0/sources/my-pool").await;
+        assert_eq!(status, 200);
+
+        let source: SourceState = serde_json::from_str(&body).unwrap();
+        assert_eq!(source.name, "my-pool");
+        assert_eq!(source.url.as_deref(), Some("stratum+tcp://pool:3333"));
+    }
+
+    #[tokio::test]
+    async fn source_by_name_returns_404_when_missing() {
+        let (app, _keep) = router_with_boards(MinerState::default(), vec![]);
+        let (status, _body) = get(app.clone(), "/api/v0/sources/nonexistent").await;
+        assert_eq!(status, 404);
+    }
+
+    #[tokio::test]
     async fn unknown_route_returns_404() {
         let (app, _keep) = router_with_boards(MinerState::default(), vec![]);
         let (status, _body) = get(app.clone(), "/api/v0/nope").await;
