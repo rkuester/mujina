@@ -67,6 +67,17 @@ pub struct ThreadState {
     pub is_active: bool,
 }
 
+/// Writable fields for `PATCH /api/v0/miner`.
+///
+/// All fields are optional; only those present in the request body are
+/// applied. Read-only fields like `uptime_secs` and `hashrate` are not
+/// included and cannot be set.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct MinerPatchRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub paused: Option<bool>,
+}
+
 /// Request body for setting a fan's target duty cycle.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct SetFanTargetRequest {

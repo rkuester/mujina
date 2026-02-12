@@ -3,16 +3,25 @@
 //! Version 0 signals an unstable API -- breaking changes are expected
 //! until the miner reaches 1.0.
 
-use axum::{Json, Router, extract::Path, extract::State, http::StatusCode, routing::get};
+use axum::{
+    Json, Router,
+    extract::{Path, State},
+    http::StatusCode,
+    routing::get,
+};
+use std::time::Duration;
 
+use tokio::sync::oneshot;
+
+use super::commands::SchedulerCommand;
 use super::server::SharedState;
-use crate::api_client::types::{BoardState, MinerState, SourceState};
+use crate::api_client::types::{BoardState, MinerPatchRequest, MinerState, SourceState};
 
 /// Build the v0 API routes.
 pub fn routes() -> Router<SharedState> {
     Router::new()
         .route("/health", get(health))
-        .route("/miner", get(get_miner))
+        .route("/miner", get(get_miner).patch(patch_miner))
         .route("/boards", get(get_boards))
         .route("/boards/{name}", get(get_board))
         .route("/sources", get(get_sources))
@@ -25,13 +34,34 @@ async fn health() -> &'static str {
 }
 
 /// Return the current miner state snapshot.
-///
-/// Combines scheduler data (hashrate, shares, sources) with board
-/// snapshots collected from each board's watch channel.
 async fn get_miner(State(state): State<SharedState>) -> Json<MinerState> {
-    let mut miner_state = state.miner_state_rx.borrow().clone();
-    miner_state.boards = state.board_registry.lock().unwrap().boards();
-    Json(miner_state)
+    Json(state.miner_state())
+}
+
+/// Apply partial updates to the miner configuration.
+async fn patch_miner(
+    State(state): State<SharedState>,
+    Json(req): Json<MinerPatchRequest>,
+) -> Result<Json<MinerState>, StatusCode> {
+    if let Some(paused) = req.paused {
+        let (tx, rx) = oneshot::channel();
+        let cmd = if paused {
+            SchedulerCommand::PauseMining { reply: tx }
+        } else {
+            SchedulerCommand::ResumeMining { reply: tx }
+        };
+        state
+            .scheduler_cmd_tx
+            .send(cmd)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        // Result layers: timeout / channel-closed / command-error.
+        let Ok(Ok(Ok(()))) = tokio::time::timeout(Duration::from_secs(5), rx).await else {
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        };
+    }
+
+    Ok(Json(state.miner_state()))
 }
 
 /// Return all connected boards.

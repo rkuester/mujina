@@ -38,6 +38,20 @@ pub(crate) struct SharedState {
     pub scheduler_cmd_tx: mpsc::Sender<SchedulerCommand>,
 }
 
+impl SharedState {
+    /// Build a complete MinerState by combining scheduler data with board
+    /// snapshots from the registry.
+    pub fn miner_state(&self) -> MinerState {
+        let mut state = self.miner_state_rx.borrow().clone();
+        state.boards = self
+            .board_registry
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .boards();
+        state
+    }
+}
+
 /// Start the API server.
 ///
 /// This function starts the HTTP API server and runs until the provided
