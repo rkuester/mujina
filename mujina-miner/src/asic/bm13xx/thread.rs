@@ -23,7 +23,6 @@ use crate::{
     },
     tracing::prelude::*,
     types::{Difficulty, HashRate},
-    u256::U256,
 };
 
 /// Tracks tasks sent to chip hardware, indexed by chip_job_id.
@@ -898,14 +897,13 @@ async fn bm13xx_thread_actor<R, W>(
 
                                             // Validate against task share target
                                             if task.share_target.is_met_by(hash) {
-                                                let expected_hashes = U256::from(task.share_target.to_work());
                                                 let share = Share {
                                                     nonce,
                                                     hash,
                                                     version: full_version,
                                                     ntime: task.ntime,
                                                     extranonce2: task.en2,
-                                                    expected_hashes,
+                                                    expected_work: task.share_target.to_work(),
                                                 };
 
                                                 // Send via task's dedicated channel

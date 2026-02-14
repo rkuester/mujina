@@ -34,7 +34,6 @@ use crate::{
     job_source::MerkleRootKind,
     tracing::prelude::*,
     types::HashRate,
-    u256::U256,
 };
 
 /// Commands sent to the mining thread.
@@ -276,7 +275,7 @@ fn try_nonce(task: &HashTask, merkle_root: bitcoin::TxMerkleNode, nonce: u32) ->
             version: template.version.base(),
             ntime: task.ntime,
             extranonce2: task.en2,
-            expected_hashes: U256::from(task.share_target.to_work()),
+            expected_work: task.share_target.to_work(),
         })
     } else {
         None

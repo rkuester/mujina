@@ -447,7 +447,7 @@ impl Scheduler {
         );
 
         // Track hashes for hashrate measurement (see MiningStats doc)
-        self.stats.total_hashes += share.expected_hashes;
+        self.stats.total_hashes += U256::from(share.expected_work);
 
         // Check if share meets source threshold
         if task_entry.template.share_target.is_met_by(hash) {
@@ -898,9 +898,7 @@ fn format_duration(secs: u64) -> String {
 #[derive(Debug)]
 struct MiningStats {
     start_time: std::time::Instant,
-    /// Total hashes performed (accumulated across all shares).
-    ///
-    /// Uses U256 for overflow safety and to match Share::expected_hashes.
+    /// Total work accumulated across all shares (for hashrate calculation).
     total_hashes: U256,
     shares_submitted: u64,
 }

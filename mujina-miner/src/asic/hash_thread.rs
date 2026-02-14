@@ -37,7 +37,7 @@ use tokio::sync::mpsc;
 
 use crate::job_source::{Extranonce2, Extranonce2Range, JobTemplate};
 use crate::types::HashRate;
-use crate::u256::U256;
+use bitcoin::pow::Work;
 
 /// HashThread capabilities reported to scheduler for work assignment decisions.
 #[derive(Debug, Clone)]
@@ -335,12 +335,13 @@ pub struct Share {
     /// Extranonce2 value used (None for header-only mining in Stratum v2)
     pub extranonce2: Option<Extranonce2>,
 
-    /// Expected hashes this share represents for hashrate calculation.
+    /// Expected work this share represents for hashrate calculation.
     ///
-    /// Computed via `Target::to_work()`, which is `2^256 / target`. Using
-    /// threshold (not achieved) difficulty provides stable hashrate estimates;
-    /// achieved difficulty has high variance from lucky shares.
-    pub expected_hashes: U256,
+    /// Computed from the task's share target via `Target::to_work()`.
+    /// Uses the threshold target (not achieved difficulty) for stable
+    /// estimates; achieved difficulty has high variance from lucky
+    /// shares.
+    pub expected_work: Work,
 }
 
 impl From<(Share, String)> for crate::job_source::Share {
