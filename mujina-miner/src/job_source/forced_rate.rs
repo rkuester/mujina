@@ -14,6 +14,10 @@
 //! Shares are forwarded to the inner source regardless of whether they meet
 //! the pool's actual difficulty. The pool may accept (if configured with low
 //! mindiff) or reject them---either is valid for testing.
+//!
+//! Unreasonably fast rates (around 10 shares/sec/thread or more) may not
+//! be achieved because the scheduler's internal per-thread share filter
+//! caps the rate to prevent flooding.
 
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;

@@ -76,6 +76,10 @@ Shares found this way will likely be rejected by the pool as below-difficulty.
 That's fine---you're testing connectivity and submission flow, not earning
 rewards.
 
+Unreasonably fast rates (around 600 shares/min per thread or more)
+may not be achieved because the scheduler's internal share filter
+caps the per-thread rate to prevent flooding.
+
 ## Running Without a Pool
 
 Without `MUJINA_POOL_URL`, the miner uses a dummy job source that generates

@@ -10,11 +10,13 @@
 //! - Chip only reports nonces meeting this threshold
 //! - Set for frequent health signals (~1/sec at current hashrate)
 //!
-//! **Layer 2 - HashTask.share_target (thread-to-scheduler filter):**
-//! - Configured by scheduler when assigning work
-//! - Thread validates and sends shares meeting this via task's share channel
-//! - Controls message volume to scheduler
-//! - Allows per-thread difficulty adjustment
+//! **Layer 2 - HashTask.share_target (scheduler target, per-thread):**
+//! - Computed per thread from that thread's hashrate
+//! - Clamps source difficulty between a measurement floor (1
+//!   share/sec) and a flood ceiling (10 shares/sec)
+//! - Feeds per-thread hashrate estimators with frequent samples
+//! - Decoupled from pool difficulty so measurement works even
+//!   when pool difficulty is very high
 //!
 //! **Layer 3 - JobTemplate.share_target (scheduler-to-source filter):**
 //! - Set by pool via Stratum mining.set_difficulty
@@ -70,6 +72,26 @@ type ShareStream = StreamMap<TaskId, ReceiverStream<Share>>;
 /// Window duration for per-thread hashrate estimation.
 const HASHRATE_WINDOW: Duration = Duration::from_secs(5 * 60);
 
+/// Per-thread measurement floor: minimum share rate for hashrate
+/// estimation (1 share/sec).
+///
+/// When pool difficulty is high relative to a thread's hashrate,
+/// shares arrive too infrequently for the estimator to settle. The
+/// scheduler overrides with an easier target so each thread produces
+/// at least this many samples per second.
+const MEASUREMENT_SHARE_RATE: ShareRate = ShareRate::from_interval(Duration::from_secs(1));
+
+/// Per-thread flood ceiling: maximum share rate to bound scheduler
+/// processing and network traffic to the source (10 shares/sec).
+///
+/// This is deliberately much higher than a typical pool's target
+/// share rate (~0.3/sec for ckpool). Capping closer to the pool's
+/// target would mask the natural share flood that vardiff algorithms
+/// use to raise difficulty---the pool would see a well-behaved rate
+/// and never adjust. At 10/sec the pool sees a ~33x overshoot,
+/// giving vardiff a clear signal to converge quickly.
+const FLOOD_CAP_RATE: ShareRate = ShareRate::from_interval(Duration::from_millis(100));
+
 /// Scheduler-side bookkeeping for an active task.
 ///
 /// Each HashTask sent to a thread has a corresponding TaskEntry in the
@@ -104,9 +126,6 @@ pub struct SourceRegistration {
 
     /// Command sender for this source (SubmitShare, etc.)
     pub command_tx: mpsc::Sender<SourceCommand>,
-
-    /// Maximum average share submission rate for this source.
-    pub max_share_rate: Option<ShareRate>,
 }
 
 /// Internal scheduler tracking for a registered source.
@@ -123,9 +142,6 @@ struct SourceEntry {
 
     /// Last job received from this source (for assigning to newly-arriving threads)
     last_job: Option<Arc<JobTemplate>>,
-
-    /// Maximum average share submission rate for this source.
-    max_share_rate: Option<ShareRate>,
 }
 
 /// Whether to update alongside existing work or replace it.
@@ -235,27 +251,23 @@ impl Scheduler {
         }
     }
 
-    /// Compute the share_target for a HashTask.
+    /// Compute the per-thread scheduler target for HashTask.
     ///
-    /// Applies the source's rate limit (if any) to avoid flooding. Returns
-    /// the harder of the source's target or the rate-limited target.
-    fn compute_share_target(
-        max_share_rate: Option<ShareRate>,
-        hashrate: HashRate,
-        source_target: Target,
-    ) -> Target {
-        let Some(max_rate) = max_share_rate else {
-            return source_target;
-        };
-
+    /// Clamps the source's pool difficulty between a measurement floor
+    /// (1 share/sec) and a flood ceiling (10 shares/sec). When pool
+    /// difficulty falls outside this range, the scheduler target
+    /// overrides it; when inside, the source target passes through.
+    fn compute_scheduler_target(hashrate: HashRate, source_target: Target) -> Target {
         if hashrate.is_zero() {
             return source_target;
         }
 
-        let rate_limit_target = target_for_share_rate(max_rate, hashrate);
+        // 1 share/sec -> more hashes per share -> harder (lower) target
+        let hardest = target_for_share_rate(MEASUREMENT_SHARE_RATE, hashrate);
+        // 10 shares/sec -> fewer hashes per share -> easier (higher) target
+        let easiest = target_for_share_rate(FLOOD_CAP_RATE, hashrate);
 
-        // Return the harder target (smaller value = higher difficulty)
-        std::cmp::min(source_target, rate_limit_target)
+        source_target.clamp(hardest, easiest)
     }
 
     /// Collects hashrate command senders from all sources.
@@ -299,7 +311,6 @@ impl Scheduler {
             url: registration.url,
             command_tx: registration.command_tx,
             last_job: None,
-            max_share_rate: registration.max_share_rate,
         });
         source_events.insert(source_id, ReceiverStream::new(registration.event_rx));
         debug!(source_id = ?source_id, name = %registration.name, "Source registered");
@@ -366,15 +377,15 @@ impl Scheduler {
             .split(self.threads.len())
             .expect("Failed to split EN2 range among threads");
 
-        // Compute share_target with rate limiting applied
-        let max_share_rate = self.sources.get(source_id).and_then(|s| s.max_share_rate);
-        let hashrate = self.operational_hashrate();
-        let share_target =
-            Self::compute_share_target(max_share_rate, hashrate, template.share_target);
-
         // Assign work to all threads
         for ((thread_id, entry), en2_range) in self.threads.iter_mut().zip(en2_slices) {
             let starting_en2 = en2_range.iter().next();
+
+            let hashrate = entry
+                .hashrate
+                .settled_hashrate()
+                .unwrap_or(entry.thread.capabilities().hashrate_estimate);
+            let share_target = Self::compute_scheduler_target(hashrate, template.share_target);
 
             // Create share channel for this task
             let (share_tx, share_rx) = mpsc::channel(32);
@@ -552,8 +563,19 @@ impl Scheduler {
 
         self.last_thread_count = thread_events.len();
 
-        // Compute hashrate once for all sources
-        let hashrate = self.operational_hashrate();
+        // Hashrate is constant for a brand-new thread (estimator has no
+        // samples yet, so this always falls back to the static estimate).
+        // Compute once rather than repeating inside the source loop.
+        let thread_hashrate = {
+            let entry = self
+                .threads
+                .get_mut(thread_id)
+                .expect("Just inserted thread");
+            entry
+                .hashrate
+                .settled_hashrate()
+                .unwrap_or(entry.thread.capabilities().hashrate_estimate)
+        };
 
         // Assign cached jobs from all sources to the new thread
         for (source_id, source) in self.sources.iter() {
@@ -567,9 +589,8 @@ impl Scheduler {
                 MerkleRootKind::Fixed(_) => continue,
             };
 
-            // Compute share_target with rate limiting applied
             let share_target =
-                Self::compute_share_target(source.max_share_rate, hashrate, template.share_target);
+                Self::compute_scheduler_target(thread_hashrate, template.share_target);
 
             let (share_tx, share_rx) = mpsc::channel(32);
             let hash_task = HashTask {
@@ -586,7 +607,7 @@ impl Scheduler {
                 .get_mut(thread_id)
                 .expect("Just inserted thread");
             if let Err(e) = entry.thread.update_task(hash_task).await {
-                error!(thread = %entry.thread.name(), error = %e, "Failed to assign cached job");
+                error!(thread = %thread_name, error = %e, "Failed to assign cached job");
             } else {
                 let task_id = self.tasks.insert(TaskEntry {
                     source_id,
@@ -595,7 +616,7 @@ impl Scheduler {
                 });
                 share_channels.insert(task_id, ReceiverStream::new(share_rx));
                 debug!(
-                    thread = %entry.thread.name(),
+                    thread = %thread_name,
                     source = %source.name,
                     job_id = %template.id,
                     "Assigned cached job to new thread"
@@ -916,5 +937,77 @@ impl MiningStats {
             shares = self.shares_submitted,
             "Mining status."
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::Difficulty;
+
+    #[test]
+    fn scheduler_target_zero_hashrate_passthrough() {
+        let source_target = Difficulty::from(1024).to_target();
+        let result = Scheduler::compute_scheduler_target(HashRate::from(0), source_target);
+        assert_eq!(result, source_target);
+    }
+
+    #[test]
+    fn scheduler_target_passthrough_when_in_range() {
+        // Pick a source target that falls between the two bounds.
+        // At 1 TH/s the bounds span roughly difficulty 23 (easiest)
+        // to difficulty 233 (hardest). Difficulty 100 sits in between.
+        let hashrate = HashRate::from_terahashes(1.0);
+        let source_target = Difficulty::from(100).to_target();
+        let result = Scheduler::compute_scheduler_target(hashrate, source_target);
+        assert_eq!(result, source_target);
+    }
+
+    #[test]
+    fn scheduler_target_clamps_hard_source_to_easier() {
+        // Pool difficulty much higher than what our hashrate warrants.
+        // The scheduler should ease it to the measurement floor so the
+        // estimator gets samples.
+        let hashrate = HashRate::from_terahashes(1.0);
+        let very_hard = Difficulty::from(1_000_000).to_target();
+        let result = Scheduler::compute_scheduler_target(hashrate, very_hard);
+
+        let hardest = target_for_share_rate(MEASUREMENT_SHARE_RATE, hashrate);
+        assert_eq!(result, hardest, "should clamp to measurement floor");
+        assert!(result > very_hard, "clamped target should be easier");
+    }
+
+    #[test]
+    fn scheduler_target_clamps_easy_source_to_harder() {
+        // Pool difficulty absurdly low -- would flood the scheduler.
+        // The scheduler should harden it to the flood ceiling.
+        let hashrate = HashRate::from_terahashes(1.0);
+        let very_easy = Target::MAX;
+        let result = Scheduler::compute_scheduler_target(hashrate, very_easy);
+
+        let easiest = target_for_share_rate(FLOOD_CAP_RATE, hashrate);
+        assert_eq!(result, easiest, "should clamp to flood ceiling");
+        assert!(result < very_easy, "clamped target should be harder");
+    }
+
+    #[test]
+    fn scheduler_target_clamp_ordering_invariant() {
+        // Verify hardest <= easiest in Ord terms for several
+        // representative hashrates. This is the invariant that
+        // clamp(hardest, easiest) relies on to not panic.
+        for hashrate in [
+            HashRate::from_megahashes(5.0),
+            HashRate::from_gigahashes(500.0),
+            HashRate::from_terahashes(1.0),
+            HashRate::from_terahashes(100.0),
+        ] {
+            let hardest = target_for_share_rate(MEASUREMENT_SHARE_RATE, hashrate);
+            let easiest = target_for_share_rate(FLOOD_CAP_RATE, hashrate);
+            assert!(
+                hardest <= easiest,
+                "clamp invariant violated at {hashrate}: \
+                 hardest={hardest:?} easiest={easiest:?}"
+            );
+        }
     }
 }

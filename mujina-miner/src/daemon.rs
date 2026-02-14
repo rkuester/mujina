@@ -23,7 +23,7 @@ use crate::{
         stratum_v1::StratumV1Source,
     },
     scheduler::{self, SourceRegistration},
-    stratum_v1::{FLOOD_PREVENTION_CAP, PoolConfig as StratumPoolConfig},
+    stratum_v1::PoolConfig as StratumPoolConfig,
     transport::{CpuDeviceInfo, TransportEvent, UsbTransport, cpu as cpu_transport},
 };
 
@@ -164,7 +164,6 @@ impl Daemon {
                         url: Some(pool_url.clone()),
                         event_rx: source_event_rx,
                         command_tx: source_cmd_tx,
-                        max_share_rate: None, // Wrapper controls rate
                     })
                     .await?;
 
@@ -188,7 +187,6 @@ impl Daemon {
                         url: Some(pool_url),
                         event_rx: source_event_rx,
                         command_tx: source_cmd_tx,
-                        max_share_rate: Some(FLOOD_PREVENTION_CAP),
                     })
                     .await?;
 
@@ -215,7 +213,6 @@ impl Daemon {
                     url: None,
                     event_rx: source_event_rx,
                     command_tx: source_cmd_tx,
-                    max_share_rate: Some(FLOOD_PREVENTION_CAP),
                 })
                 .await?;
 
