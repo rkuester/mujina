@@ -5,7 +5,7 @@
 //! arithmetic without changing callers.
 
 use ruint::aliases::U256 as Ruint256;
-use std::ops::{AddAssign, Div, Mul};
+use std::ops::{AddAssign, Div, Mul, SubAssign};
 
 /// A 256-bit unsigned integer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -100,6 +100,12 @@ impl Mul<u64> for U256 {
 impl AddAssign for U256 {
     fn add_assign(&mut self, rhs: Self) {
         self.0 += rhs.0;
+    }
+}
+
+impl SubAssign for U256 {
+    fn sub_assign(&mut self, rhs: Self) {
+        self.0 -= rhs.0;
     }
 }
 

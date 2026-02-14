@@ -7,6 +7,7 @@
 mod bitcoin_impls;
 mod difficulty;
 mod hash_rate;
+mod hashrate_estimator;
 mod share_rate;
 
 use std::time::Duration;
@@ -18,6 +19,7 @@ pub use bitcoin::block::Header as BlockHeader;
 pub use bitcoin::{Amount, BlockHash, Network, Target, Transaction, TxOut, Work};
 pub use difficulty::Difficulty;
 pub use hash_rate::HashRate;
+pub use hashrate_estimator::HashrateEstimator;
 pub use share_rate::ShareRate;
 
 /// Calculate expected shares per second at given difficulty and hashrate.
