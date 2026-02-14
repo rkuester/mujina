@@ -3,6 +3,8 @@
 //! This module contains the main client that manages the connection lifecycle,
 //! protocol state, and event emission.
 
+use std::time::Duration;
+
 use super::connection::Connection;
 use super::error::{StratumError, StratumResult};
 use super::messages::{ClientCommand, ClientEvent, JsonRpcMessage, SubmitParams};
@@ -136,15 +138,16 @@ impl StratumV1Client {
     /// handling notifications along the way, until the response arrives.
     /// This handles Stratum's message interleaving during the setup phase.
     ///
-    /// Times out after 30 seconds if no response is received. Responds immediately
-    /// to shutdown requests.
+    /// Times out after `timeout_dur` if no response is received. Responds
+    /// immediately to shutdown requests.
     async fn send_request(
         &mut self,
         conn: &mut Connection,
         method: &str,
         params: serde_json::Value,
+        timeout_dur: Duration,
     ) -> StratumResult<JsonRpcMessage> {
-        use tokio::time::{Duration, timeout};
+        use tokio::time::timeout;
 
         let id = self.next_id();
 
@@ -153,8 +156,7 @@ impl StratumV1Client {
         conn.write_message(&msg).await?;
 
         // Loop until we get our response, handling notifications along the way
-        // Timeout after 30s to handle unresponsive pools
-        timeout(Duration::from_secs(30), async {
+        timeout(timeout_dur, async {
             loop {
                 tokio::select! {
                     // Read message from pool
@@ -225,6 +227,7 @@ impl StratumV1Client {
                     ["version-rolling"],
                     {"version-rolling.mask": "1fffe000"}
                 ]),
+                Duration::from_secs(30),
             )
             .await;
 
@@ -297,7 +300,12 @@ impl StratumV1Client {
         use serde_json::json;
 
         let response = self
-            .send_request(conn, "mining.subscribe", json!([&self.config.user_agent]))
+            .send_request(
+                conn,
+                "mining.subscribe",
+                json!([&self.config.user_agent]),
+                Duration::from_secs(30),
+            )
             .await?;
 
         // Parse response
@@ -357,6 +365,7 @@ impl StratumV1Client {
                 conn,
                 "mining.authorize",
                 json!([&self.config.username, &self.config.password]),
+                Duration::from_secs(30),
             )
             .await?;
 
@@ -417,7 +426,12 @@ impl StratumV1Client {
         // Convert to Stratum JSON format
         let submit_json = params.to_stratum_json();
         let response = self
-            .send_request(conn, "mining.submit", Value::Array(submit_json))
+            .send_request(
+                conn,
+                "mining.submit",
+                Value::Array(submit_json),
+                Duration::from_secs(30),
+            )
             .await?;
 
         // Parse response and emit appropriate event
