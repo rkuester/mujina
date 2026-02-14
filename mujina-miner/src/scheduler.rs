@@ -246,6 +246,10 @@ impl Scheduler {
                 .map(|s| SourceState {
                     name: s.name.clone(),
                     url: s.url.clone(),
+                    difficulty: s
+                        .last_job
+                        .as_ref()
+                        .map(|j| Difficulty::from_target(j.share_target).as_u64()),
                 })
                 .collect(),
         }

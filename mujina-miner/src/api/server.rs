@@ -198,6 +198,7 @@ mod tests {
             sources: vec![SourceState {
                 name: "pool".into(),
                 url: Some("stratum+tcp://localhost:3333".into()),
+                ..Default::default()
             }],
             ..Default::default()
         };
@@ -278,10 +279,12 @@ mod tests {
                 SourceState {
                     name: "pool-a".into(),
                     url: Some("stratum+tcp://a:3333".into()),
+                    ..Default::default()
                 },
                 SourceState {
                     name: "pool-b".into(),
                     url: None,
+                    ..Default::default()
                 },
             ],
             ..Default::default()
@@ -305,6 +308,7 @@ mod tests {
             sources: vec![SourceState {
                 name: "my-pool".into(),
                 url: Some("stratum+tcp://pool:3333".into()),
+                ..Default::default()
             }],
             ..Default::default()
         };

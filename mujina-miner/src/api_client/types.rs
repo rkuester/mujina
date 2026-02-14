@@ -95,4 +95,7 @@ pub struct SourceState {
     /// Connection URL (e.g. "stratum+tcp://pool:3333"), if applicable.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
+    /// Current share difficulty set by the source.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub difficulty: Option<u64>,
 }
