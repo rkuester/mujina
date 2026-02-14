@@ -47,10 +47,9 @@ use crate::job_source::{
 };
 use crate::tracing::prelude::*;
 use crate::types::{
-    Difficulty, HashRate, ShareRate, Target, expected_time_to_share_from_target,
+    Difficulty, HashRate, HashrateEstimator, ShareRate, Target, expected_time_to_share_from_target,
     target_for_share_rate,
 };
-use crate::u256::U256;
 
 /// Unique identifier for a job source, assigned by the scheduler.
 type SourceId = slotmap::DefaultKey;
@@ -67,6 +66,9 @@ type TaskId = slotmap::DefaultKey;
 type SourceEventStream = StreamMap<SourceId, ReceiverStream<SourceEvent>>;
 type ThreadEventStream = StreamMap<ThreadId, ReceiverStream<HashThreadEvent>>;
 type ShareStream = StreamMap<TaskId, ReceiverStream<Share>>;
+
+/// Window duration for per-thread hashrate estimation.
+const HASHRATE_WINDOW: Duration = Duration::from_secs(5 * 60);
 
 /// Scheduler-side bookkeeping for an active task.
 ///
@@ -135,6 +137,12 @@ enum AssignMode {
     Replace,
 }
 
+/// Scheduler-side bookkeeping for a hash thread.
+struct ThreadEntry {
+    thread: Box<dyn HashThread>,
+    hashrate: HashrateEstimator,
+}
+
 /// Core scheduler state.
 ///
 /// StreamMaps are kept separate (in `run()`) to avoid borrow conflicts with
@@ -145,7 +153,7 @@ struct Scheduler {
     sources: SlotMap<SourceId, SourceEntry>,
 
     /// Thread storage
-    threads: SlotMap<ThreadId, Box<dyn HashThread>>,
+    threads: SlotMap<ThreadId, ThreadEntry>,
 
     /// Task bookkeeping (maps tasks to sources/threads)
     tasks: SlotMap<TaskId, TaskEntry>,
@@ -176,36 +184,32 @@ impl Scheduler {
         }
     }
 
-    /// Calculates aggregate hashrate estimate from all registered threads.
+    /// Aggregate measured hashrate from per-thread estimators.
     ///
-    /// Uses static estimates from capabilities. Useful for initial hashrate
-    /// before measurements are available.
-    fn estimated_hashrate(&self) -> HashRate {
-        let total: u64 = self
-            .threads
-            .values()
-            .map(|t| u64::from(t.capabilities().hashrate_estimate))
-            .sum();
-        HashRate::from(total)
+    /// Returns the truth: zero if no shares have been recorded yet.
+    fn measured_hashrate(&mut self) -> HashRate {
+        self.threads
+            .values_mut()
+            .map(|entry| entry.hashrate.hashrate())
+            .sum()
     }
 
-    /// Calculates aggregate measured hashrate from all registered threads.
+    /// Aggregate hashrate for operational decisions.
     ///
-    /// Falls back to estimated hashrate if no measurements available yet.
-    fn measured_hashrate(&self) -> HashRate {
-        let total: u64 = self
-            .threads
-            .values()
-            .map(|t| u64::from(t.status().hashrate))
-            .sum();
-        let measured = HashRate::from(total);
-
-        // Fall back to estimate if no measurements yet
-        if measured.is_zero() {
-            self.estimated_hashrate()
-        } else {
-            measured
-        }
+    /// Per thread, uses measured hashrate if the estimator has settled,
+    /// otherwise falls back to the static capability estimate. Suitable
+    /// for broadcasting to sources and difficulty warnings, where a zero
+    /// value at startup would be unhelpful.
+    fn operational_hashrate(&mut self) -> HashRate {
+        self.threads
+            .values_mut()
+            .map(|entry| {
+                entry
+                    .hashrate
+                    .settled_hashrate()
+                    .unwrap_or(entry.thread.capabilities().hashrate_estimate)
+            })
+            .sum()
     }
 
     /// Build a [`MinerState`] snapshot from current scheduler state.
@@ -213,7 +217,7 @@ impl Scheduler {
     /// The scheduler contributes aggregate stats and source info. Board
     /// and thread details come from the backplane, not the scheduler, so
     /// `boards` is left empty here.
-    fn compute_miner_state(&self) -> MinerState {
+    fn compute_miner_state(&mut self) -> MinerState {
         MinerState {
             uptime_secs: self.stats.start_time.elapsed().as_secs(),
             hashrate: u64::from(self.measured_hashrate()),
@@ -301,7 +305,7 @@ impl Scheduler {
         debug!(source_id = ?source_id, name = %registration.name, "Source registered");
 
         // Send current hashrate estimate to the new source
-        let hashrate = self.measured_hashrate();
+        let hashrate = self.operational_hashrate();
         let _ = self.sources[source_id]
             .command_tx
             .send(SourceCommand::UpdateHashRate(hashrate))
@@ -346,7 +350,7 @@ impl Scheduler {
 
         // Check if difficulty is reasonable for our hashrate (once per source)
         if !self.difficulty_warned_sources.contains(&source_id) {
-            let hashrate = self.measured_hashrate();
+            let hashrate = self.operational_hashrate();
             if warn_if_difficulty_too_high(&template, hashrate, &source_name) {
                 self.difficulty_warned_sources.insert(source_id);
             }
@@ -364,12 +368,12 @@ impl Scheduler {
 
         // Compute share_target with rate limiting applied
         let max_share_rate = self.sources.get(source_id).and_then(|s| s.max_share_rate);
-        let hashrate = self.measured_hashrate();
+        let hashrate = self.operational_hashrate();
         let share_target =
             Self::compute_share_target(max_share_rate, hashrate, template.share_target);
 
         // Assign work to all threads
-        for ((thread_id, thread), en2_range) in self.threads.iter_mut().zip(en2_slices) {
+        for ((thread_id, entry), en2_range) in self.threads.iter_mut().zip(en2_slices) {
             let starting_en2 = en2_range.iter().next();
 
             // Create share channel for this task
@@ -385,12 +389,12 @@ impl Scheduler {
             };
 
             let result = match mode {
-                AssignMode::Update => thread.update_task(hash_task).await,
-                AssignMode::Replace => thread.replace_task(hash_task).await,
+                AssignMode::Update => entry.thread.update_task(hash_task).await,
+                AssignMode::Replace => entry.thread.replace_task(hash_task).await,
             };
 
             if let Err(e) = result {
-                error!(thread = %thread.name(), error = %e, "Failed to assign task");
+                error!(thread = %entry.thread.name(), error = %e, "Failed to assign task");
             } else {
                 let task_id = self.tasks.insert(TaskEntry {
                     source_id,
@@ -446,8 +450,10 @@ impl Scheduler {
             "Share found"
         );
 
-        // Track hashes for hashrate measurement (see MiningStats doc)
-        self.stats.total_hashes += U256::from(share.expected_work);
+        // Feed share work to per-thread hashrate estimator
+        if let Some(entry) = self.threads.get_mut(task_entry.thread_id) {
+            entry.hashrate.record(share.expected_work);
+        }
 
         // Check if share meets source threshold
         if task_entry.template.share_target.is_met_by(hash) {
@@ -490,7 +496,7 @@ impl Scheduler {
         let thread_name = self
             .threads
             .get(thread_id)
-            .map(|t| t.name())
+            .map(|entry| entry.thread.name())
             .unwrap_or("unknown");
 
         match event {
@@ -529,12 +535,15 @@ impl Scheduler {
             .expect("Thread missing event receiver");
 
         let thread_name = thread.name().to_string();
-        let thread_id = self.threads.insert(thread);
+        let thread_id = self.threads.insert(ThreadEntry {
+            thread,
+            hashrate: HashrateEstimator::new(HASHRATE_WINDOW),
+        });
         thread_events.insert(thread_id, ReceiverStream::new(event_rx));
         debug!(thread = %thread_name, "Thread registered");
 
         // Broadcast updated hashrate to all sources
-        let hashrate = self.measured_hashrate();
+        let hashrate = self.operational_hashrate();
         let senders = self.hashrate_senders();
         broadcast_hashrate(senders, hashrate).await;
 
@@ -544,7 +553,7 @@ impl Scheduler {
         self.last_thread_count = thread_events.len();
 
         // Compute hashrate once for all sources
-        let hashrate = self.measured_hashrate();
+        let hashrate = self.operational_hashrate();
 
         // Assign cached jobs from all sources to the new thread
         for (source_id, source) in self.sources.iter() {
@@ -572,12 +581,12 @@ impl Scheduler {
                 share_tx,
             };
 
-            let thread = self
+            let entry = self
                 .threads
                 .get_mut(thread_id)
                 .expect("Just inserted thread");
-            if let Err(e) = thread.update_task(hash_task).await {
-                error!(thread = %thread.name(), error = %e, "Failed to assign cached job");
+            if let Err(e) = entry.thread.update_task(hash_task).await {
+                error!(thread = %entry.thread.name(), error = %e, "Failed to assign cached job");
             } else {
                 let task_id = self.tasks.insert(TaskEntry {
                     source_id,
@@ -586,7 +595,7 @@ impl Scheduler {
                 });
                 share_channels.insert(task_id, ReceiverStream::new(share_rx));
                 debug!(
-                    thread = %thread.name(),
+                    thread = %entry.thread.name(),
                     source = %source.name,
                     job_id = %template.id,
                     "Assigned cached job to new thread"
@@ -624,7 +633,7 @@ impl Scheduler {
         self.last_thread_count = current_count;
 
         // Broadcast updated hashrate to all sources
-        let hashrate = self.measured_hashrate();
+        let hashrate = self.operational_hashrate();
         let senders = self.hashrate_senders();
         broadcast_hashrate(senders, hashrate).await;
 
@@ -749,7 +758,8 @@ impl Scheduler {
                     if first_status_tick {
                         first_status_tick = false;
                     } else {
-                        self.stats.log_summary();
+                        let hashrate = self.measured_hashrate();
+                        self.stats.log_summary(hashrate);
                     }
                 }
 
@@ -763,7 +773,7 @@ impl Scheduler {
                     if first_hashrate_tick {
                         first_hashrate_tick = false;
                     } else {
-                        let hashrate = self.measured_hashrate();
+                        let hashrate = self.operational_hashrate();
                         let senders = self.hashrate_senders();
                         broadcast_hashrate(senders, hashrate).await;
                     }
@@ -783,7 +793,8 @@ impl Scheduler {
         }
 
         // Log final statistics
-        self.stats.log_summary();
+        let hashrate = self.measured_hashrate();
+        self.stats.log_summary(hashrate);
 
         debug!("Scheduler shutdown complete");
     }
@@ -873,33 +884,10 @@ fn format_duration(secs: u64) -> String {
     }
 }
 
-/// Mining statistics tracker
-///
-/// # Hashrate Calculation Methodology
-///
-/// We calculate hashrate using **threshold difficulty**, not achieved difficulty.
-///
-/// ## Statistical Model
-///
-/// - Chip hashes at constant rate (what we want to measure)
-/// - Shares meeting threshold D_t arrive as Poisson process
-/// - Achieved difficulty follows exponential distribution (memoryless)
-/// - Each share represents expected work: D_t * 2^32 hashes
-///
-/// ## Comparison to Pool Statistics
-///
-/// Mining pools (like hydrapool) use achieved difficulty because they don't
-/// control miner thresholds. We control our threshold, so we can use it
-/// directly for more stable estimates.
-///
-/// Using achieved difficulty introduces high variance from outliers. One lucky
-/// difficulty-10M share would dominate the average, incorrectly inflating
-/// hashrate estimates. Threshold-based calculation is variance-minimizing.
+/// Mining statistics tracker.
 #[derive(Debug)]
 struct MiningStats {
     start_time: std::time::Instant,
-    /// Total work accumulated across all shares (for hashrate calculation).
-    total_hashes: U256,
     shares_submitted: u64,
 }
 
@@ -907,21 +895,19 @@ impl Default for MiningStats {
     fn default() -> Self {
         Self {
             start_time: std::time::Instant::now(),
-            total_hashes: U256::ZERO,
             shares_submitted: 0,
         }
     }
 }
 
 impl MiningStats {
-    fn log_summary(&self) {
+    fn log_summary(&self, hashrate: HashRate) {
         let elapsed = self.start_time.elapsed();
 
-        let hashrate_str = if self.total_hashes != U256::ZERO && elapsed.as_secs() > 0 {
-            let rate = HashRate((self.total_hashes / elapsed.as_secs()).saturating_to_u64());
-            rate.to_human_readable()
-        } else {
+        let hashrate_str = if hashrate.is_zero() {
             "--".to_string()
+        } else {
+            hashrate.to_human_readable()
         };
 
         info!(
