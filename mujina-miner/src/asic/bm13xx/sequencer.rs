@@ -176,15 +176,19 @@ impl Sequencer {
 
     /// Build frequency ramp sequence from initial PLL frequency to target.
     ///
-    /// Ramps in 6.25 MHz steps with 100ms delay between each step, matching
+    /// Ramps in 6.25 MHz steps with 150ms delay between each step, matching
     /// esp-miner's frequency transition algorithm. The initial frequency is
     /// ~56.25 MHz (set during register configuration).
     ///
+    /// Returns `(Frequency, Step)` pairs so the caller can compute the
+    /// matching voltage for each step when coordinating a voltage-frequency
+    /// ramp.
+    ///
     /// The target frequency is clamped to `chip_config.max_freq`.
-    pub fn build_frequency_ramp(&self, target: Frequency) -> Vec<Step> {
+    pub fn build_frequency_ramp(&self, target: Frequency) -> Vec<(Frequency, Step)> {
         const INITIAL_FREQ_MHZ: f32 = 56.25;
         const STEP_MHZ: f32 = 6.25;
-        const STEP_DELAY: Duration = Duration::from_millis(100);
+        const STEP_DELAY: Duration = Duration::from_millis(150);
 
         let mut steps = vec![];
 
@@ -197,46 +201,52 @@ impl Sequencer {
         }
 
         // Start with initial frequency (emberone-miner does this explicitly)
-        let initial_pll = self
-            .chip_config
-            .calculate_pll(Frequency::from_mhz(INITIAL_FREQ_MHZ));
-        steps.push(Step::with_delay(
-            Command::WriteRegister {
-                broadcast: true,
-                chip_address: 0x00,
-                register: Register::PllDivider(initial_pll),
-            },
-            STEP_DELAY,
+        let initial_freq = Frequency::from_mhz(INITIAL_FREQ_MHZ);
+        let initial_pll = self.chip_config.calculate_pll(initial_freq);
+        steps.push((
+            initial_freq,
+            Step::with_delay(
+                Command::WriteRegister {
+                    broadcast: true,
+                    chip_address: 0x00,
+                    register: Register::PllDivider(initial_pll),
+                },
+                STEP_DELAY,
+            ),
         ));
 
         // Step from initial to target in 6.25 MHz increments
         let mut current_mhz = INITIAL_FREQ_MHZ + STEP_MHZ;
         while current_mhz < target_mhz {
-            let pll = self
-                .chip_config
-                .calculate_pll(Frequency::from_mhz(current_mhz));
-            steps.push(Step::with_delay(
+            let freq = Frequency::from_mhz(current_mhz);
+            let pll = self.chip_config.calculate_pll(freq);
+            steps.push((
+                freq,
+                Step::with_delay(
+                    Command::WriteRegister {
+                        broadcast: true,
+                        chip_address: 0x00,
+                        register: Register::PllDivider(pll),
+                    },
+                    STEP_DELAY,
+                ),
+            ));
+            current_mhz += STEP_MHZ;
+        }
+
+        // Final step: set exact target frequency
+        let final_freq = Frequency::from_mhz(target_mhz);
+        let pll = self.chip_config.calculate_pll(final_freq);
+        steps.push((
+            final_freq,
+            Step::with_delay(
                 Command::WriteRegister {
                     broadcast: true,
                     chip_address: 0x00,
                     register: Register::PllDivider(pll),
                 },
                 STEP_DELAY,
-            ));
-            current_mhz += STEP_MHZ;
-        }
-
-        // Final step: set exact target frequency
-        let pll = self
-            .chip_config
-            .calculate_pll(Frequency::from_mhz(target_mhz));
-        steps.push(Step::with_delay(
-            Command::WriteRegister {
-                broadcast: true,
-                chip_address: 0x00,
-                register: Register::PllDivider(pll),
-            },
-            STEP_DELAY,
+            ),
         ));
 
         steps
@@ -701,8 +711,12 @@ mod tests {
         // That's 1 (initial) + 37 intermediate steps + 1 final = 39
         assert_eq!(steps.len(), 39, "Expected 39 frequency ramp steps");
 
-        // Verify all steps are PLL writes with delay
-        for step in &steps {
+        // Verify all steps are PLL writes with delay and have frequency paired
+        for (freq, step) in &steps {
+            assert!(
+                freq.mhz() > 0.0,
+                "Each step should have a positive frequency"
+            );
             assert!(
                 matches!(
                     &step.command,
@@ -716,6 +730,16 @@ mod tests {
             );
             assert!(step.wait_after.is_some(), "Each step should have a delay");
         }
+
+        // First step should be at initial frequency, last at target
+        assert!(
+            (steps.first().unwrap().0.mhz() - 56.25).abs() < 0.01,
+            "First step should be at ~56.25 MHz"
+        );
+        assert!(
+            (steps.last().unwrap().0.mhz() - 290.0).abs() < 0.01,
+            "Last step should be at ~290 MHz"
+        );
     }
 
     #[test]
@@ -750,6 +774,12 @@ mod tests {
             steps_600.len(),
             steps_525.len(),
             "Requesting above max should clamp to max"
+        );
+
+        // Last frequency in both should be 525 MHz (the max)
+        assert!(
+            (steps_600.last().unwrap().0.mhz() - 525.0).abs() < 0.01,
+            "Clamped ramp should end at max frequency"
         );
     }
 }

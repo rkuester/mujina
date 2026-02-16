@@ -319,6 +319,39 @@ impl ChipJobs {
     }
 }
 
+/// Settle time after changing the voltage regulator target, before adjusting
+/// frequency. Allows the regulator output to reach the new setpoint.
+const VOLTAGE_SETTLE_DELAY: Duration = Duration::from_millis(50);
+
+/// Maximum total output voltage for the TPS546 on EmberOne.
+const VOUT_MAX: f32 = 4.0;
+
+/// Compute the total supply voltage needed for a given frequency and chip count.
+///
+/// Near-threshold CMOS (like the BM1362 at 7nm) needs more voltage as clock
+/// frequency increases -- faster switching requires more drive current and
+/// timing margin. The relationship is approximately linear in the operating
+/// range.
+///
+/// Interpolates between two known-good operating points and returns
+/// V_per_chip * chip_count, capped at VOUT_MAX.
+fn voltage_for_frequency(freq: protocol::Frequency, chip_count: usize) -> f32 {
+    // Known-good operating points (per-chip voltage):
+    //   - Low: confirmed stable in our testing
+    //   - High: from reference implementations
+    const LOW_FREQ_MHZ: f32 = 56.25;
+    const LOW_VOLTAGE: f32 = 0.25;
+    const HIGH_FREQ_MHZ: f32 = 500.0;
+    const HIGH_VOLTAGE: f32 = 0.32;
+
+    // V/MHz -- derived from the two operating points
+    const SLOPE: f32 = (HIGH_VOLTAGE - LOW_VOLTAGE) / (HIGH_FREQ_MHZ - LOW_FREQ_MHZ);
+
+    let v_per_chip = LOW_VOLTAGE + SLOPE * (freq.mhz() - LOW_FREQ_MHZ);
+
+    (v_per_chip * chip_count as f32).min(VOUT_MAX)
+}
+
 /// Absolute timeout for chip count verification after address assignment.
 ///
 /// This is a safety ceiling, not the expected wait time. Normal completion
@@ -566,9 +599,8 @@ where
 
         // 6. Ramp frequency to target (must be before per-chip config)
         // This matches emberone-miner's initialization order.
-        // TODO: Disabled for board bring-up testing.
-        // self.execute_frequency_ramp(protocol::Frequency::from_mhz(525.0))
-        //     .await?;
+        self.execute_frequency_ramp(protocol::Frequency::from_mhz(328.125))
+            .await?;
 
         // 7. Execute per-chip register configuration (Phase 2)
         // Enables cores at the target frequency set above.
@@ -632,8 +664,11 @@ where
             .await
     }
 
-    /// Execute frequency ramp from initial PLL frequency to target.
-    #[expect(dead_code, reason = "disabled during board bring-up")]
+    /// Execute coordinated voltage-frequency ramp to target.
+    ///
+    /// At each step, the voltage regulator is adjusted first (leading the
+    /// frequency change), then the PLL command is sent. This ensures chips
+    /// always have sufficient voltage for the frequency they're running at.
     async fn execute_frequency_ramp(
         &mut self,
         target: protocol::Frequency,
@@ -643,12 +678,63 @@ where
             debug!("No frequency ramp needed");
             return Ok(());
         }
+
+        let chip_count = self.chain.chip_count();
+        let has_regulator = self.peripherals.voltage_regulator.is_some();
+
         info!(
             steps = steps.len(),
             target_mhz = target.mhz(),
+            coordinated = has_regulator,
             "Ramping frequency"
         );
-        self.execute_sequence(steps, "frequency ramp").await
+
+        for (freq, step) in &steps {
+            // 1. Set voltage (lead the frequency change)
+            if let Some(ref regulator) = self.peripherals.voltage_regulator {
+                let target_v = voltage_for_frequency(*freq, chip_count);
+                regulator
+                    .lock()
+                    .await
+                    .set_voltage(target_v)
+                    .await
+                    .map_err(|e| {
+                        HashThreadError::InitializationFailed(format!(
+                            "Failed to set voltage to {:.2}V: {}",
+                            target_v, e
+                        ))
+                    })?;
+
+                // Brief settle time for voltage regulator
+                time::sleep(VOLTAGE_SETTLE_DELAY).await;
+            }
+
+            // 2. Set frequency
+            self.chip_tx.send(step.command.clone()).await.map_err(|e| {
+                HashThreadError::InitializationFailed(format!(
+                    "Failed to send frequency ramp command: {:?}",
+                    e
+                ))
+            })?;
+
+            // 3. Wait for PLL to lock
+            if let Some(delay) = step.wait_after {
+                time::sleep(delay).await;
+            }
+        }
+
+        if has_regulator {
+            let final_v = voltage_for_frequency(steps.last().unwrap().0, chip_count);
+            info!(
+                target_mhz = target.mhz(),
+                voltage = format!("{:.2}V", final_v),
+                "Frequency ramp complete"
+            );
+        } else {
+            info!(target_mhz = target.mhz(), "Frequency ramp complete");
+        }
+
+        Ok(())
     }
 
     /// Verify all chips respond to a broadcast query.

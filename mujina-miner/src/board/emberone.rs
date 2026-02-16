@@ -19,7 +19,7 @@ use crate::{
     asic::{
         bm13xx::{
             self,
-            chain_config::{ChainConfig, ChainPeripherals},
+            chain_config::{ChainConfig, ChainPeripherals, VoltageRegulator},
             chip_config, thread_v2,
             topology::TopologySpec,
         },
@@ -248,44 +248,44 @@ impl EmberOne {
                 // Delay before setting voltage
                 tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
-                // Set initial output voltage for BM1362 chain
-                const DEFAULT_VOUT: f32 = 3.0;
-                match tps546.set_vout(DEFAULT_VOUT).await {
-                    Ok(()) => {
-                        debug!("Core voltage set to {DEFAULT_VOUT}V");
+                // Initial voltage matches the V-f curve at the initial PLL
+                // frequency (~56.25 MHz). See thread_v2::voltage_for_frequency().
+                const DEFAULT_VOUT: f32 = 3.04;
 
-                        // Wait for voltage to stabilize
-                        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                tps546.set_vout_target(DEFAULT_VOUT).await.map_err(|e| {
+                    BoardError::InitializationFailed(format!("Failed to set core voltage: {}", e))
+                })?;
+                tps546.clear_faults().await.map_err(|e| {
+                    BoardError::InitializationFailed(format!("Failed to clear faults: {}", e))
+                })?;
+                tps546.enable_output().await.map_err(|e| {
+                    BoardError::InitializationFailed(format!("Failed to enable output: {}", e))
+                })?;
 
-                        // Verify voltage readback
-                        match tps546.get_vout().await {
-                            Ok(mv) => {
-                                let volts = mv as f32 / 1000.0;
-                                info!("Core voltage readback: {:.3}V", volts);
+                debug!("Core voltage set to {DEFAULT_VOUT}V");
 
-                                // Verify voltage is in expected range
-                                if (volts - DEFAULT_VOUT).abs() > 0.2 {
-                                    warn!(
-                                        "Core voltage {:.3}V differs from target {:.1}V",
-                                        volts, DEFAULT_VOUT
-                                    );
-                                }
-                            }
-                            Err(e) => warn!("Failed to read core voltage: {}", e),
-                        }
+                // Wait for voltage to stabilize
+                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
-                        // Dump configuration for debugging
-                        if let Err(e) = tps546.dump_configuration().await {
-                            warn!("Failed to dump TPS546 configuration: {}", e);
+                // Verify voltage readback
+                match tps546.get_vout().await {
+                    Ok(mv) => {
+                        let volts = mv as f32 / 1000.0;
+                        info!("Core voltage readback: {:.3}V", volts);
+
+                        if (volts - DEFAULT_VOUT).abs() > 0.2 {
+                            warn!(
+                                "Core voltage {:.3}V differs from target {:.1}V",
+                                volts, DEFAULT_VOUT
+                            );
                         }
                     }
-                    Err(e) => {
-                        error!("Failed to set initial core voltage: {}", e);
-                        return Err(BoardError::InitializationFailed(format!(
-                            "Failed to set core voltage: {}",
-                            e
-                        )));
-                    }
+                    Err(e) => warn!("Failed to read core voltage: {}", e),
+                }
+
+                // Dump configuration for debugging
+                if let Err(e) = tps546.dump_configuration().await {
+                    warn!("Failed to dump TPS546 configuration: {}", e);
                 }
 
                 self.regulator = Some(Arc::new(Mutex::new(tps546)));
@@ -315,12 +315,10 @@ impl Board for EmberOne {
     }
 
     async fn shutdown(&mut self) -> Result<(), BoardError> {
-        // Turn off core voltage (regulator may still be enabled until hash thread
-        // shuts down)
         if let Some(ref regulator) = self.regulator {
-            match regulator.lock().await.set_vout(0.0).await {
+            match regulator.lock().await.disable_output().await {
                 Ok(()) => debug!("Core voltage turned off"),
-                Err(e) => warn!("Failed to turn off core voltage: {}", e),
+                Err(e) => warn!("Failed to disable output: {}", e),
             }
         }
 
@@ -365,6 +363,14 @@ impl Board for EmberOne {
             None => "EmberOne".to_string(),
         };
 
+        // Wire voltage regulator for coordinated V-f ramping
+        let voltage_regulator: Option<Arc<Mutex<dyn VoltageRegulator + Send>>> =
+            self.regulator.as_ref().map(|reg| {
+                Arc::new(Mutex::new(EmberOneVoltageRegulator {
+                    tps546: Arc::clone(reg),
+                })) as Arc<Mutex<dyn VoltageRegulator + Send>>
+            });
+
         // Build chain configuration for EmberOne: 12 BM1362 chips, each in its own domain
         let config = ChainConfig {
             name: thread_name,
@@ -376,7 +382,7 @@ impl Board for EmberOne {
                     power_enable_pin,
                     io_power_enable_pin,
                 })),
-                voltage_regulator: None,
+                voltage_regulator,
             },
         };
 
@@ -386,6 +392,23 @@ impl Board for EmberOne {
         })?;
 
         Ok(vec![Box::new(thread)])
+    }
+}
+
+/// Adapter implementing [`VoltageRegulator`] for EmberOne's TPS546 power controller.
+///
+/// Delegates to [`Tps546::set_vout_target()`] which writes the VOUT_COMMAND register
+/// without changing the output enable state. The voltage regulator is already
+/// enabled during board initialization; the ramp only adjusts the target.
+struct EmberOneVoltageRegulator {
+    tps546: Arc<Mutex<Tps546<BitaxeRawI2c>>>,
+}
+
+#[async_trait]
+impl VoltageRegulator for EmberOneVoltageRegulator {
+    async fn set_voltage(&mut self, volts: f32) -> anyhow::Result<()> {
+        self.tps546.lock().await.set_vout_target(volts).await?;
+        Ok(())
     }
 }
 
