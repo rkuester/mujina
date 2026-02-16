@@ -48,5 +48,6 @@ mod error;
 mod messages;
 
 pub use client::{PoolConfig, StratumV1Client};
+pub use connection::Transport;
 pub use error::{StratumError, StratumResult};
 pub use messages::{ClientCommand, ClientEvent, JobNotification, SubmitParams};

@@ -320,7 +320,7 @@ impl SubmitParams {
 /// Standard JSON-RPC libraries expect spec compliance, creating impedance
 /// mismatch. This lightweight custom type (80 lines) fits Stratum's quirks
 /// exactly without adapter layers.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum JsonRpcMessage {
     /// Request or notification from client or server
@@ -357,10 +357,6 @@ impl JsonRpcMessage {
     }
 
     /// Create a notification (request without ID).
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "will be used as client matures")
-    )]
     pub fn notification(method: impl Into<String>, params: Value) -> Self {
         JsonRpcMessage::Request {
             id: None,
@@ -370,10 +366,6 @@ impl JsonRpcMessage {
     }
 
     /// Get the message ID if present.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "will be used as client matures")
-    )]
     pub fn id(&self) -> Option<u64> {
         match self {
             JsonRpcMessage::Request { id, .. } => *id,
@@ -382,19 +374,11 @@ impl JsonRpcMessage {
     }
 
     /// Check if this is a notification (request without ID).
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "will be used as client matures")
-    )]
     pub fn is_notification(&self) -> bool {
         matches!(self, JsonRpcMessage::Request { id: None, .. })
     }
 
     /// Get the method name for requests.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "will be used as client matures")
-    )]
     pub fn method(&self) -> Option<&str> {
         match self {
             JsonRpcMessage::Request { method, .. } => Some(method),

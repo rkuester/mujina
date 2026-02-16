@@ -2,7 +2,10 @@
 //!
 //! Stratum v1 uses newline-delimited JSON over TCP. This module provides a
 //! wrapper around tokio's TCP stream that handles buffered reading and writing
-//! of complete JSON-RPC messages.
+//! of complete JSON-RPC messages. The [`Transport`] trait abstracts message
+//! I/O, allowing channel-based mocks for deterministic testing.
+
+use async_trait::async_trait;
 
 use super::error::{StratumError, StratumResult};
 use super::messages::JsonRpcMessage;
@@ -11,7 +14,22 @@ use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tracing::{debug, trace};
 
-/// Buffered connection for Stratum protocol.
+/// Message-level I/O for Stratum protocol.
+///
+/// Abstracts reading and writing JSON-RPC messages so the client can
+/// run over TCP (production) or channels (tests).
+#[async_trait]
+pub trait Transport: Send {
+    /// Read one complete JSON-RPC message.
+    ///
+    /// Returns `None` on clean connection close (EOF).
+    async fn read_message(&mut self) -> StratumResult<Option<JsonRpcMessage>>;
+
+    /// Write a JSON-RPC message.
+    async fn write_message(&mut self, msg: &JsonRpcMessage) -> StratumResult<()>;
+}
+
+/// Buffered TCP connection for Stratum protocol.
 ///
 /// Wraps a TCP stream with buffered readers/writers optimized for
 /// line-delimited JSON messages. Messages are automatically serialized
@@ -62,13 +80,11 @@ impl Connection {
 
         Ok(Self::new(stream))
     }
+}
 
-    /// Read one complete JSON-RPC message.
-    ///
-    /// Reads a newline-delimited line from the stream and deserializes it as
-    /// JSON-RPC. Returns `None` if the connection is closed cleanly. Skips
-    /// empty lines automatically.
-    pub async fn read_message(&mut self) -> StratumResult<Option<JsonRpcMessage>> {
+#[async_trait]
+impl Transport for Connection {
+    async fn read_message(&mut self) -> StratumResult<Option<JsonRpcMessage>> {
         loop {
             self.line_buf.clear();
 
@@ -99,11 +115,7 @@ impl Connection {
         }
     }
 
-    /// Write a JSON-RPC message.
-    ///
-    /// Serializes the message to JSON and writes it with a trailing newline.
-    /// Flushes the write buffer to ensure delivery.
-    pub async fn write_message(&mut self, msg: &JsonRpcMessage) -> StratumResult<()> {
+    async fn write_message(&mut self, msg: &JsonRpcMessage) -> StratumResult<()> {
         let json = serde_json::to_string(msg)?;
         trace!(tx = %json, "Sending message");
 

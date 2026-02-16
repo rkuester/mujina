@@ -5,7 +5,7 @@
 
 use std::time::Duration;
 
-use super::connection::Connection;
+use super::connection::{Connection, Transport};
 use super::error::{StratumError, StratumResult};
 use super::messages::{ClientCommand, ClientEvent, JsonRpcMessage, SubmitParams};
 use tokio::sync::mpsc;
@@ -141,7 +141,7 @@ impl StratumV1Client {
     /// immediately to shutdown requests.
     async fn send_request(
         &mut self,
-        conn: &mut Connection,
+        conn: &mut dyn Transport,
         method: &str,
         params: serde_json::Value,
         timeout_dur: Duration,
@@ -213,7 +213,7 @@ impl StratumV1Client {
     /// we gracefully fall back to mining without version rolling.
     async fn configure_version_rolling(
         &mut self,
-        conn: &mut Connection,
+        conn: &mut dyn Transport,
     ) -> StratumResult<Option<u32>> {
         use serde_json::json;
 
@@ -293,7 +293,7 @@ impl StratumV1Client {
     /// notifications. (TODO: Does this still use a router?)
     async fn subscribe(
         &mut self,
-        conn: &mut Connection,
+        conn: &mut dyn Transport,
         authorized_mask: Option<u32>,
     ) -> StratumResult<()> {
         use serde_json::json;
@@ -356,7 +356,7 @@ impl StratumV1Client {
     ///
     /// Sends `mining.authorize` with username and password. Uses the message
     /// router to handle interleaved notifications.
-    async fn authorize(&mut self, conn: &mut Connection) -> StratumResult<()> {
+    async fn authorize(&mut self, conn: &mut dyn Transport) -> StratumResult<()> {
         use serde_json::json;
 
         let response = self
@@ -408,7 +408,7 @@ impl StratumV1Client {
     /// `mining.set_difficulty` notifications that arrive in response.
     async fn suggest_difficulty(
         &mut self,
-        conn: &mut Connection,
+        conn: &mut dyn Transport,
         difficulty: u64,
     ) -> StratumResult<()> {
         use serde_json::json;
@@ -444,7 +444,11 @@ impl StratumV1Client {
     ///
     /// Sends `mining.submit` and waits for acceptance/rejection. Emits
     /// ShareAccepted or ShareRejected events based on pool response.
-    async fn submit(&mut self, conn: &mut Connection, params: SubmitParams) -> StratumResult<bool> {
+    async fn submit(
+        &mut self,
+        conn: &mut dyn Transport,
+        params: SubmitParams,
+    ) -> StratumResult<bool> {
         use serde_json::Value;
 
         let job_id = params.job_id.clone();
@@ -625,19 +629,25 @@ impl StratumV1Client {
         Ok(())
     }
 
-    /// Run the client (main event loop).
+    /// Connect to the pool and run the client.
     ///
-    /// Connects to the pool, subscribes, authorizes, and then enters the main
-    /// event loop to handle notifications and submit shares.
-    ///
-    /// Uses a separate reader task to handle the message router pattern,
-    /// allowing requests to wait for responses while processing interleaved
-    /// notifications.
-    pub async fn run(mut self) -> StratumResult<()> {
-        use tracing::{debug, info, warn};
+    /// Establishes a TCP connection then delegates to
+    /// [`run_with_transport`](Self::run_with_transport).
+    pub async fn run(self) -> StratumResult<()> {
+        let conn = Connection::connect(&self.config.url).await?;
+        self.run_with_transport(conn).await
+    }
 
-        // Connect
-        let mut conn = Connection::connect(&self.config.url).await?;
+    /// Run the client over a pre-established transport.
+    ///
+    /// Performs the Stratum handshake (configure, subscribe, authorize),
+    /// then enters the main event loop to handle notifications and
+    /// submit shares.
+    pub(crate) async fn run_with_transport(
+        mut self,
+        mut conn: impl Transport,
+    ) -> StratumResult<()> {
+        use tracing::{debug, info, warn};
 
         // Configure version rolling (before subscribe)
         let authorized_mask = self.configure_version_rolling(&mut conn).await?;
@@ -1200,7 +1210,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_submit_share_accepted() {
-        use super::super::connection::Connection;
+        use super::super::connection::{Connection, Transport};
         use serde_json::json;
         use tokio::net::TcpListener;
 
@@ -1255,7 +1265,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_submit_share_rejected_with_error() {
-        use super::super::connection::Connection;
+        use super::super::connection::{Connection, Transport};
         use serde_json::json;
         use tokio::net::TcpListener;
 
@@ -1309,7 +1319,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_submit_share_rejected_with_false_result() {
-        use super::super::connection::Connection;
+        use super::super::connection::{Connection, Transport};
         use serde_json::json;
         use tokio::net::TcpListener;
 
