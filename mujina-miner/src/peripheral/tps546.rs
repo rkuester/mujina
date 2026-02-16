@@ -570,6 +570,45 @@ impl<I2C: I2c> Tps546<I2C> {
         Ok(())
     }
 
+    /// Write the VOUT_COMMAND register without changing output state.
+    ///
+    /// Validates the voltage against the configured vout_min/vout_max range,
+    /// encodes to Linear16, and writes the VOUT_COMMAND register. Does not
+    /// enable or disable the output.
+    pub async fn set_vout_target(&mut self, volts: f32) -> Result<()> {
+        if volts < self.config.vout_min || volts > self.config.vout_max {
+            bail!(Tps546Error::VoltageOutOfRange(
+                volts,
+                self.config.vout_min,
+                self.config.vout_max
+            ));
+        }
+
+        let value = self.encode_voltage(volts).await?;
+        self.write_word(PmbusCommand::VoutCommand, value).await?;
+        debug!("VOUT_COMMAND set to {:.2}V", volts);
+        Ok(())
+    }
+
+    /// Enable the output (OPERATION = ON).
+    pub async fn enable_output(&mut self) -> Result<()> {
+        self.write_byte(PmbusCommand::Operation, pmbus::Operation::On.as_u8())
+            .await?;
+        debug!("Output enabled");
+        Ok(())
+    }
+
+    /// Disable the output immediately (OPERATION = OFF).
+    pub async fn disable_output(&mut self) -> Result<()> {
+        self.write_byte(
+            PmbusCommand::Operation,
+            pmbus::Operation::OffImmediate.as_u8(),
+        )
+        .await?;
+        debug!("Output disabled");
+        Ok(())
+    }
+
     /// Set output voltage
     pub async fn set_vout(&mut self, volts: f32) -> Result<()> {
         if volts == 0.0 {
