@@ -1,9 +1,7 @@
-//! TPS546D24A Power Management Controller Driver
+//! TPS546 Power Management Controller Driver
 //!
-//! This module provides a driver for the Texas Instruments TPS546D24A
-//! synchronous buck converter with PMBus interface.
-//!
-//! Datasheet: <https://www.ti.com/lit/ds/symlink/tps546d24a.pdf>
+//! This module provides a driver for the Texas Instruments TPS546
+//! family of synchronous buck converters with PMBus interface.
 
 use anyhow::{Result, bail};
 use thiserror::Error;
@@ -133,7 +131,7 @@ pub enum Tps546Error {
     FaultDetected(String),
 }
 
-/// TPS546D24A driver
+/// TPS546 driver
 pub struct Tps546<I2C> {
     i2c: I2C,
     config: Tps546Config,
@@ -153,7 +151,7 @@ impl<I2C: I2c> Tps546<I2C> {
 
     /// Initialize the TPS546
     pub async fn init(&mut self) -> Result<()> {
-        debug!("Initializing TPS546D24A power regulator");
+        debug!("Initializing TPS546 power regulator");
 
         // First verify device ID to ensure I2C communication is working
         self.verify_device_id().await?;
@@ -861,7 +859,7 @@ impl<I2C: I2c> Tps546<I2C> {
 
     /// Dump the complete TPS546 configuration for debugging
     pub async fn dump_configuration(&mut self) -> Result<()> {
-        debug!("=== TPS546D24A Configuration Dump ===");
+        debug!("=== TPS546 Configuration Dump ===");
 
         // Voltage Configuration
         debug!("--- Voltage Configuration ---");
