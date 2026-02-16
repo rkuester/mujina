@@ -429,31 +429,31 @@ impl BitaxeBoard {
 
                 // Set initial output voltage, default for BM1370 from esp-miner
                 const DEFAULT_VOUT: f32 = 1.10;
-                match tps546.set_vout(DEFAULT_VOUT).await {
-                    Ok(()) => {
-                        debug!("Core voltage set to {DEFAULT_VOUT}V");
 
-                        // Wait for voltage to stabilize
-                        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                tps546.set_vout_target(DEFAULT_VOUT).await.map_err(|e| {
+                    BoardError::InitializationFailed(format!("Failed to set core voltage: {}", e))
+                })?;
+                tps546.clear_faults().await.map_err(|e| {
+                    BoardError::InitializationFailed(format!("Failed to clear faults: {}", e))
+                })?;
+                tps546.enable_output().await.map_err(|e| {
+                    BoardError::InitializationFailed(format!("Failed to enable output: {}", e))
+                })?;
 
-                        // Verify voltage
-                        match tps546.get_vout().await {
-                            Ok(mv) => debug!("Core voltage readback: {:.3}V", mv as f32 / 1000.0),
-                            Err(e) => warn!("Failed to read core voltage: {}", e),
-                        }
+                debug!("Core voltage set to {DEFAULT_VOUT}V");
 
-                        // Dump complete configuration for debugging
-                        if let Err(e) = tps546.dump_configuration().await {
-                            warn!("Failed to dump TPS546 configuration: {}", e);
-                        }
-                    }
-                    Err(e) => {
-                        error!("Failed to set initial core voltage: {}", e);
-                        return Err(BoardError::InitializationFailed(format!(
-                            "Failed to set core voltage: {}",
-                            e
-                        )));
-                    }
+                // Wait for voltage to stabilize
+                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+                // Verify voltage
+                match tps546.get_vout().await {
+                    Ok(mv) => debug!("Core voltage readback: {:.3}V", mv as f32 / 1000.0),
+                    Err(e) => warn!("Failed to read core voltage: {}", e),
+                }
+
+                // Dump complete configuration for debugging
+                if let Err(e) = tps546.dump_configuration().await {
+                    warn!("Failed to dump TPS546 configuration: {}", e);
                 }
 
                 self.regulator = Some(Arc::new(Mutex::new(tps546)));
@@ -870,9 +870,9 @@ impl Board for BitaxeBoard {
 
         // Turn off core voltage
         if let Some(ref regulator) = self.regulator {
-            match regulator.lock().await.set_vout(0.0).await {
+            match regulator.lock().await.disable_output().await {
                 Ok(()) => debug!("Core voltage turned off"),
-                Err(e) => warn!("Failed to turn off core voltage: {}", e),
+                Err(e) => warn!("Failed to disable output: {}", e),
             }
         }
 
