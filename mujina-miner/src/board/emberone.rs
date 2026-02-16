@@ -292,11 +292,13 @@ impl EmberOne {
                 Ok(())
             }
             Err(e) => {
-                error!("Failed to initialize TPS546 power controller: {}", e);
-                Err(BoardError::InitializationFailed(format!(
-                    "Power controller init failed: {}",
+                let msg = format!(
+                    "Failed to initialize TPS546 power controller: {}. \
+                     Is input voltage connected?",
                     e
-                )))
+                );
+                error!("{}", msg);
+                Err(BoardError::InitializationFailed(msg))
             }
         }
     }
