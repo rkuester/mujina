@@ -52,4 +52,6 @@ pub use connection::{Connector, TcpConnector, Transport};
 #[cfg(test)]
 pub(crate) use connection::{MockConnector, MockTransport, MockTransportHandle};
 pub use error::{StratumError, StratumResult};
+#[cfg(test)]
+pub(crate) use messages::JsonRpcMessage;
 pub use messages::{ClientCommand, ClientEvent, JobNotification, SubmitParams};
