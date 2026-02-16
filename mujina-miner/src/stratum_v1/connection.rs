@@ -127,6 +127,77 @@ impl Transport for Connection {
     }
 }
 
+/// Channel-based transport for deterministic testing.
+///
+/// Backed by tokio mpsc channels rather than TCP, so it works with
+/// `tokio::time::pause()` without triggering auto-advance on real I/O.
+/// Create a pair with [`MockTransport::pair()`]; the transport is the
+/// client's side, the handle is the test's side.
+#[cfg(test)]
+pub(crate) struct MockTransport {
+    rx: tokio::sync::mpsc::UnboundedReceiver<JsonRpcMessage>,
+    tx: tokio::sync::mpsc::UnboundedSender<JsonRpcMessage>,
+}
+
+/// Test-side handle for a [`MockTransport`].
+///
+/// Use `send()` to feed messages to the client and `recv()` to read
+/// messages the client wrote.
+#[cfg(test)]
+pub(crate) struct MockTransportHandle {
+    tx: tokio::sync::mpsc::UnboundedSender<JsonRpcMessage>,
+    rx: tokio::sync::mpsc::UnboundedReceiver<JsonRpcMessage>,
+}
+
+#[cfg(test)]
+impl MockTransport {
+    /// Create a linked (transport, handle) pair.
+    pub fn pair() -> (Self, MockTransportHandle) {
+        let (client_tx, handle_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (handle_tx, client_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let transport = MockTransport {
+            rx: client_rx,
+            tx: client_tx,
+        };
+        let handle = MockTransportHandle {
+            tx: handle_tx,
+            rx: handle_rx,
+        };
+        (transport, handle)
+    }
+}
+
+#[cfg(test)]
+#[async_trait]
+impl Transport for MockTransport {
+    async fn read_message(&mut self) -> StratumResult<Option<JsonRpcMessage>> {
+        match self.rx.recv().await {
+            Some(msg) => Ok(Some(msg)),
+            None => Ok(None),
+        }
+    }
+
+    async fn write_message(&mut self, msg: &JsonRpcMessage) -> StratumResult<()> {
+        self.tx
+            .send(msg.clone())
+            .map_err(|_| StratumError::Disconnected)
+    }
+}
+
+#[cfg(test)]
+impl MockTransportHandle {
+    /// Send a message to the client.
+    pub fn send(&self, msg: JsonRpcMessage) {
+        self.tx.send(msg).expect("transport dropped");
+    }
+
+    /// Receive a message the client wrote.
+    pub async fn recv(&mut self) -> JsonRpcMessage {
+        self.rx.recv().await.expect("transport dropped")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
