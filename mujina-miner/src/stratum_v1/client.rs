@@ -1210,35 +1210,23 @@ mod tests {
 
     #[tokio::test]
     async fn test_submit_share_accepted() {
-        use super::super::connection::{Connection, Transport};
+        use super::super::connection::MockTransport;
         use serde_json::json;
-        use tokio::net::TcpListener;
 
         let (mut client, mut event_rx) = test_client();
 
-        // Create mock server
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
+        let (mut transport, mut handle) = MockTransport::pair();
 
         tokio::spawn(async move {
-            let (socket, _) = listener.accept().await.unwrap();
-            let mut conn = Connection::new(socket);
+            let msg = handle.recv().await;
 
-            // Read the submit request
-            let msg = conn.read_message().await.unwrap().unwrap();
-
-            // Send acceptance response
             let response = JsonRpcMessage::Response {
                 id: msg.id().unwrap(),
                 result: Some(json!(true)),
                 error: None,
             };
-            conn.write_message(&response).await.unwrap();
+            handle.send(response);
         });
-
-        // Connect to mock server
-        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let mut conn = Connection::new(stream);
 
         let params = SubmitParams {
             username: "worker".to_string(),
@@ -1249,7 +1237,7 @@ mod tests {
             version_bits: Some(0x20000000),
         };
 
-        let accepted = client.submit(&mut conn, params).await.unwrap();
+        let accepted = client.submit(&mut transport, params).await.unwrap();
         assert!(accepted);
 
         // Verify ShareAccepted event was emitted
@@ -1265,34 +1253,23 @@ mod tests {
 
     #[tokio::test]
     async fn test_submit_share_rejected_with_error() {
-        use super::super::connection::{Connection, Transport};
+        use super::super::connection::MockTransport;
         use serde_json::json;
-        use tokio::net::TcpListener;
 
         let (mut client, mut event_rx) = test_client();
 
-        // Create mock server
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
+        let (mut transport, mut handle) = MockTransport::pair();
 
         tokio::spawn(async move {
-            let (socket, _) = listener.accept().await.unwrap();
-            let mut conn = Connection::new(socket);
+            let msg = handle.recv().await;
 
-            // Read the submit request
-            let msg = conn.read_message().await.unwrap().unwrap();
-
-            // Send rejection response with error
             let response = JsonRpcMessage::Response {
                 id: msg.id().unwrap(),
                 result: None,
                 error: Some(json!([23, "Low difficulty share", null])),
             };
-            conn.write_message(&response).await.unwrap();
+            handle.send(response);
         });
-
-        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let mut conn = Connection::new(stream);
 
         let params = SubmitParams {
             username: "worker".to_string(),
@@ -1303,7 +1280,7 @@ mod tests {
             version_bits: None,
         };
 
-        let accepted = client.submit(&mut conn, params).await.unwrap();
+        let accepted = client.submit(&mut transport, params).await.unwrap();
         assert!(!accepted);
 
         // Verify ShareRejected event was emitted with reason
@@ -1319,33 +1296,24 @@ mod tests {
 
     #[tokio::test]
     async fn test_submit_share_rejected_with_false_result() {
-        use super::super::connection::{Connection, Transport};
+        use super::super::connection::MockTransport;
         use serde_json::json;
-        use tokio::net::TcpListener;
 
         let (mut client, mut event_rx) = test_client();
 
-        // Create mock server
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
+        let (mut transport, mut handle) = MockTransport::pair();
 
         tokio::spawn(async move {
-            let (socket, _) = listener.accept().await.unwrap();
-            let mut conn = Connection::new(socket);
+            let msg = handle.recv().await;
 
-            let msg = conn.read_message().await.unwrap().unwrap();
-
-            // Send rejection as false result (some pools do this)
+            // Some pools send false result instead of error
             let response = JsonRpcMessage::Response {
                 id: msg.id().unwrap(),
                 result: Some(json!(false)),
                 error: None,
             };
-            conn.write_message(&response).await.unwrap();
+            handle.send(response);
         });
-
-        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let mut conn = Connection::new(stream);
 
         let params = SubmitParams {
             username: "worker".to_string(),
@@ -1356,7 +1324,7 @@ mod tests {
             version_bits: None,
         };
 
-        let accepted = client.submit(&mut conn, params).await.unwrap();
+        let accepted = client.submit(&mut transport, params).await.unwrap();
         assert!(!accepted);
 
         // Verify ShareRejected event was emitted
