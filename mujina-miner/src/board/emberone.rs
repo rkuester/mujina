@@ -169,19 +169,19 @@ impl EmberOne {
         Ok(())
     }
 
-    /// Initialize the TPS546D24S voltage regulator with EmberOne configuration.
+    /// Initialize the TPS546 voltage regulator with EmberOne configuration.
     ///
     /// Configuration values are based on the EmberOne Python reference implementation.
     async fn init_power_controller(&mut self) -> Result<(), BoardError> {
         debug!(
-            "Initializing TPS546D24S voltage regulator at address 0x{:02X}",
+            "Initializing TPS546 voltage regulator at address 0x{:02X}",
             tps546::constants::DEFAULT_ADDRESS
         );
 
         // Clone I2C bus for the power controller
         let power_i2c = self.i2c.clone();
 
-        // EmberOne TPS546D24S configuration
+        // EmberOne TPS546 configuration
         // Values from emberone-miner Python config
         let config = Tps546Config {
             // Phase and frequency
@@ -292,7 +292,7 @@ impl EmberOne {
                 Ok(())
             }
             Err(e) => {
-                error!("Failed to initialize TPS546D24S power controller: {}", e);
+                error!("Failed to initialize TPS546 power controller: {}", e);
                 Err(BoardError::InitializationFailed(format!(
                     "Power controller init failed: {}",
                     e
