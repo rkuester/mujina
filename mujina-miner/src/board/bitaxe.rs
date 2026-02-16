@@ -361,7 +361,7 @@ impl BitaxeBoard {
         // Clone the I2C bus for the power controller
         let power_i2c = self.i2c.clone();
 
-        // Bitaxe Gamma power configuration for TPS546D24A
+        // Bitaxe Gamma power configuration for TPS546
         let config = Tps546Config {
             // Phase and frequency
             phase: 0x00,
@@ -460,7 +460,7 @@ impl BitaxeBoard {
                 Ok(())
             }
             Err(e) => {
-                error!("Failed to initialize TPS546D24A power controller: {}", e);
+                error!("Failed to initialize TPS546 power controller: {}", e);
                 Err(BoardError::InitializationFailed(format!(
                     "Power controller init failed: {}",
                     e
