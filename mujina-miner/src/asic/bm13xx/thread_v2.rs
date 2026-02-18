@@ -352,20 +352,13 @@ fn voltage_for_frequency(freq: protocol::Frequency, chip_count: usize) -> f32 {
     (v_per_chip * chip_count as f32).min(VOUT_MAX)
 }
 
-/// Absolute timeout for chip count verification after address assignment.
+/// Per-chip timeout during chain verification.
 ///
-/// This is a safety ceiling, not the expected wait time. Normal completion
-/// happens when `INTER_RESPONSE_TIMEOUT` expires after all responses arrive.
-/// Two seconds is generous: a 65-chip chain at 115200 baud transmits all
-/// responses in ~50ms.
-const VERIFICATION_TIMEOUT: Duration = Duration::from_secs(2);
-
-/// Inter-response timeout during verification.
-///
-/// After each response, we wait this long for another. When it expires with
-/// no new response, verification is complete. 250ms accommodates slow chips
-/// and bus propagation while keeping total verification time reasonable.
-const INTER_RESPONSE_TIMEOUT: Duration = Duration::from_millis(250);
+/// When polling each chip individually, this is how long to wait for a single
+/// response before declaring the chip unresponsive. At 115200 baud, an 11-byte
+/// response takes ~1ms on the wire; 100ms is generous headroom for USB
+/// buffering and chip processing.
+const PER_CHIP_TIMEOUT: Duration = Duration::from_millis(100);
 
 /// Convert HashTask to JobFullFormat for chip hardware.
 ///
@@ -721,6 +714,20 @@ where
             if let Some(delay) = step.wait_after {
                 time::sleep(delay).await;
             }
+
+            // 4. Health check: verify all chips still respond
+            let responding = self.verify_chain().await;
+            if responding < chip_count {
+                let target_v = voltage_for_frequency(*freq, chip_count);
+                warn!(
+                    freq_mhz = freq.mhz(),
+                    voltage = format!("{:.2}V", target_v),
+                    v_per_chip = format!("{:.3}V", target_v / chip_count as f32),
+                    expected = chip_count,
+                    responding,
+                    "Chips lost during ramp"
+                );
+            }
         }
 
         if has_regulator {
@@ -737,66 +744,61 @@ where
         Ok(())
     }
 
-    /// Verify all chips respond to a broadcast query.
+    /// Verify all chips respond by polling each one individually.
     ///
-    /// Sends a broadcast ReadRegister(ChipId) and counts responses. Compares
-    /// to expected chip count from the Chain model.
+    /// Sends an addressed ReadRegister(ChipId) to each chip in sequence and
+    /// waits for a single response. Individual reads avoid the contention and
+    /// decoder-desync problems that plague broadcast reads after PLL changes.
     ///
     /// Returns the number of chips that responded.
     async fn verify_chain(&mut self) -> usize {
         let expected_count = self.chain.chip_count();
+        let addresses: Vec<u8> = self.chain.chips().map(|(_, chip)| chip.address).collect();
 
-        // Send broadcast ChipId query
-        if let Err(e) = self
-            .chip_tx
-            .send(Command::ReadRegister {
-                broadcast: true,
-                chip_address: 0x00,
-                register_address: RegisterAddress::ChipId,
-            })
-            .await
-        {
-            error!(error = ?e, "Failed to send verification query");
-            return 0;
-        }
-
-        // Collect responses with timeout
         let mut responding_count: usize = 0;
-        let start = time::Instant::now();
 
-        loop {
-            let remaining = VERIFICATION_TIMEOUT
-                .checked_sub(start.elapsed())
-                .unwrap_or(Duration::ZERO);
-            if remaining.is_zero() {
-                break;
+        for &addr in &addresses {
+            // Drain any stale responses before each query
+            while self.response_rx.try_recv().is_ok() {}
+
+            if let Err(e) = self
+                .chip_tx
+                .send(Command::ReadRegister {
+                    broadcast: false,
+                    chip_address: addr,
+                    register_address: RegisterAddress::ChipId,
+                })
+                .await
+            {
+                error!(error = ?e, "Failed to send verification query");
+                return responding_count;
             }
 
-            tokio::select! {
-                response = self.response_rx.recv() => {
-                    match response {
-                        Some(Ok(protocol::Response::ReadRegister {
-                            register: Register::ChipId { .. },
-                            ..
-                        })) => {
-                            responding_count += 1;
-                            // Early exit if we've found all expected chips
-                            if responding_count >= expected_count {
-                                break;
+            // Wait for a single response
+            let got_response = loop {
+                tokio::select! {
+                    response = self.response_rx.recv() => {
+                        match response {
+                            Some(Ok(protocol::Response::ReadRegister {
+                                register: Register::ChipId { .. },
+                                ..
+                            })) => break true,
+                            Some(Ok(_)) | Some(Err(_)) => {
+                                // Ignore non-ChipId responses and errors,
+                                // keep waiting for the real response.
+                                continue;
                             }
+                            None => break false,
                         }
-                        Some(Ok(_)) => {
-                            // Ignore other responses
-                        }
-                        Some(Err(e)) => {
-                            warn!(error = %e, "Error during chain verification");
-                        }
-                        None => break,
+                    }
+                    _ = time::sleep(PER_CHIP_TIMEOUT) => {
+                        break false;
                     }
                 }
-                _ = time::sleep(INTER_RESPONSE_TIMEOUT.min(remaining)) => {
-                    break;
-                }
+            };
+
+            if got_response {
+                responding_count += 1;
             }
         }
 
