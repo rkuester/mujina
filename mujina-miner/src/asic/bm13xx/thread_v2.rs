@@ -127,7 +127,7 @@ impl BM13xxThread {
             name,
             command_tx: cmd_tx,
             capabilities: HashThreadCapabilities {
-                hashrate_estimate: HashRate::from_terahashes(0.0),
+                hashrate_estimate: HashRate::from_terahashes(1.0), // Stub; estimator takes over
             },
             status,
             event_rx: Some(evt_rx),
