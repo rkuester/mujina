@@ -342,7 +342,7 @@ fn voltage_for_frequency(freq: protocol::Frequency, chip_count: usize) -> f32 {
     const LOW_FREQ_MHZ: f32 = 56.25;
     const LOW_VOLTAGE: f32 = 0.25625;
     const HIGH_FREQ_MHZ: f32 = 500.0;
-    const HIGH_VOLTAGE: f32 = 0.25625;
+    const HIGH_VOLTAGE: f32 = 0.3; // 3.6V total across 12 chips
 
     // V/MHz -- derived from the two operating points
     const SLOPE: f32 = (HIGH_VOLTAGE - LOW_VOLTAGE) / (HIGH_FREQ_MHZ - LOW_FREQ_MHZ);
@@ -595,7 +595,7 @@ where
         self.execute_reg_config_perchip().await?;
 
         // 7. Ramp frequency to target (flat voltage throughout)
-        self.execute_frequency_ramp(protocol::Frequency::from_mhz(175.0))
+        self.execute_frequency_ramp(protocol::Frequency::from_mhz(500.0))
             .await?;
 
         self.chip_state = ChipState::Initialized;
