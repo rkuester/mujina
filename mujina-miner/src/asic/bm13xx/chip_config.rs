@@ -58,12 +58,15 @@ impl ChipConfig {
     /// Calculate optimal PLL configuration for target frequency.
     ///
     /// Searches for PLL divider values that produce the closest match to
-    /// the target frequency. Validated against S19 J Pro (BM1362) and S21 Pro
-    /// (BM1370) serial captures---both chips use identical PLL parameters.
+    /// the target frequency. When multiple configs achieve the same
+    /// accuracy, prefers the one with the lowest VCO frequency to stay
+    /// in the VCO's optimal range (~2000-2300 MHz). Validated against
+    /// S19 J Pro (BM1362) and S21 Pro (BM1370) serial captures.
     pub fn calculate_pll(&self, freq: Frequency) -> PllConfig {
         let target_freq = freq.mhz();
         let mut best_config = PllConfig::new(0xa0, 2, 0x55); // Default
         let mut min_error = f32::MAX;
+        let mut best_vco = f32::MAX;
 
         // Search for optimal PLL settings
         // ref_divider: 1 or 2
@@ -86,9 +89,13 @@ impl ChipConfig {
                             let actual_freq = CRYSTAL_MHZ * fb_div as f32
                                 / (ref_div as f32 * post_div1 as f32 * post_div2 as f32);
                             let error = (target_freq - actual_freq).abs();
+                            let vco = CRYSTAL_MHZ * fb_div as f32 / ref_div as f32;
 
-                            if error < min_error && error < 1.0 {
+                            if error < 1.0
+                                && (error < min_error || (error == min_error && vco < best_vco))
+                            {
                                 min_error = error;
+                                best_vco = vco;
                                 // Encode post dividers as per hardware format
                                 let post_div = ((post_div1 - 1) << 4) | (post_div2 - 1);
                                 best_config = PllConfig::new(fb_div, ref_div, post_div);
