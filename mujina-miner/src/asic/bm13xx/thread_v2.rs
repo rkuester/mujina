@@ -321,7 +321,7 @@ impl ChipJobs {
 
 /// Settle time after changing the voltage regulator target, before adjusting
 /// frequency. Allows the regulator output to reach the new setpoint.
-const VOLTAGE_SETTLE_DELAY: Duration = Duration::from_millis(50);
+const VOLTAGE_SETTLE_DELAY: Duration = Duration::from_millis(1500);
 
 /// Maximum total output voltage for the TPS546 on EmberOne.
 const VOUT_MAX: f32 = 4.0;
@@ -340,9 +340,9 @@ fn voltage_for_frequency(freq: protocol::Frequency, chip_count: usize) -> f32 {
     //   - Low: confirmed stable in our testing
     //   - High: from reference implementations
     const LOW_FREQ_MHZ: f32 = 56.25;
-    const LOW_VOLTAGE: f32 = 0.25;
+    const LOW_VOLTAGE: f32 = 0.25625;
     const HIGH_FREQ_MHZ: f32 = 500.0;
-    const HIGH_VOLTAGE: f32 = 0.32;
+    const HIGH_VOLTAGE: f32 = 0.25625;
 
     // V/MHz -- derived from the two operating points
     const SLOPE: f32 = (HIGH_VOLTAGE - LOW_VOLTAGE) / (HIGH_FREQ_MHZ - LOW_FREQ_MHZ);
@@ -590,14 +590,13 @@ where
         // 5. Execute broadcast register configuration (Phase 1)
         self.execute_reg_config_broadcast().await?;
 
-        // 6. Ramp frequency to target (must be before per-chip config)
-        // This matches emberone-miner's initialization order.
-        self.execute_frequency_ramp(protocol::Frequency::from_mhz(328.125))
-            .await?;
-
-        // 7. Execute per-chip register configuration (Phase 2)
-        // Enables cores at the target frequency set above.
+        // 6. Execute per-chip register configuration (Phase 2)
+        // Enables cores before frequency ramp (experimenting with order).
         self.execute_reg_config_perchip().await?;
+
+        // 7. Ramp frequency to target (flat voltage throughout)
+        self.execute_frequency_ramp(protocol::Frequency::from_mhz(175.0))
+            .await?;
 
         self.chip_state = ChipState::Initialized;
         debug!(chip_count = responding, "Chain initialized");

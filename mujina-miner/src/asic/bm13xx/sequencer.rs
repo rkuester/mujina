@@ -188,7 +188,7 @@ impl Sequencer {
     pub fn build_frequency_ramp(&self, target: Frequency) -> Vec<(Frequency, Step)> {
         const INITIAL_FREQ_MHZ: f32 = 56.25;
         const STEP_MHZ: f32 = 6.25;
-        const STEP_DELAY: Duration = Duration::from_millis(150);
+        const STEP_DELAY: Duration = Duration::from_millis(1500);
 
         let mut steps = vec![];
 
