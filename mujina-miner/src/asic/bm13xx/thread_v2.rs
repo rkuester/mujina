@@ -321,7 +321,7 @@ impl ChipJobs {
 
 /// Settle time after changing the voltage regulator target, before adjusting
 /// frequency. Allows the regulator output to reach the new setpoint.
-const VOLTAGE_SETTLE_DELAY: Duration = Duration::from_millis(1500);
+const VOLTAGE_SETTLE_DELAY: Duration = Duration::from_millis(100);
 
 /// Maximum total output voltage for the TPS546 on EmberOne.
 const VOUT_MAX: f32 = 4.0;
