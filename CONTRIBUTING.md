@@ -177,6 +177,23 @@ mod tests {
 }
 ```
 
+#### Documenting Known Bugs with `#[should_panic]`
+
+When a bug is found in already-pushed code, we sometimes add a test
+that asserts the correct behavior and mark it `#[should_panic]`
+with a brief comment. This documents the bug and keeps CI green.
+The fix then removes the `#[should_panic]` annotation in a
+separate commit, turning the test into a normal regression test.
+
+```rust
+#[test]
+#[should_panic] // known bug: brief description
+fn descriptive_name() {
+    // Assert the *correct* behavior here.
+    // The test "passes" because the bug causes a panic.
+}
+```
+
 ### Documentation
 
 - Add doc comments to all public items
