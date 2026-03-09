@@ -1,12 +1,24 @@
 //! Hashrate measurement type.
+//!
+//! Represents a per-miner hashrate in hashes per second, stored as
+//! u64. This covers up to ~18.4 EH/s, which is well beyond any
+//! single miner's capability. Not intended for representing
+//! aggregate network hashrate.
+//!
+//! Arithmetic follows Rust's default overflow behavior: panics in
+//! debug builds, wraps in release builds.
 
 use std::iter::Sum;
 use std::ops::Add;
 use std::time::Duration;
 
-/// Hashrate measurement.
+/// Per-miner hashrate in hashes per second.
+///
+/// Stored as u64, covering up to ~18.4 EH/s. Constructors from
+/// f64 (e.g., `from_terahashes`) saturate to `u64::MAX` for
+/// out-of-range values.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
-pub struct HashRate(pub u64); // hashes per second
+pub struct HashRate(pub u64);
 
 impl HashRate {
     /// Create from megahashes per second
