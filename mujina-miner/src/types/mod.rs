@@ -68,13 +68,17 @@ pub fn expected_time_to_share_from_target(target: Target, hashrate: HashRate) ->
 ///
 /// A hash is valid if hash < target. With hashes uniform over [0, 2^256),
 /// expected hashes per share = 2^256 / target, so target = 2^256 / hashes_per_share.
+///
+/// The returned target may exceed `Target::MAX` (Bitcoin difficulty-1,
+/// ~2^224) at low hashrates. This is fine for scheduler use -- it
+/// just means every hash qualifies as a share.
 pub fn target_for_share_rate(rate: ShareRate, hashrate: HashRate) -> Target {
     let hashes_per_share = hashrate.hashes_in(rate.as_interval());
-    if hashes_per_share <= 1 {
-        return Target::MAX;
+    if hashes_per_share <= 1.0 {
+        Target::from(U256::MAX)
+    } else {
+        Target::from(U256::MAX / hashes_per_share)
     }
-
-    Target::from(U256::MAX / hashes_per_share)
 }
 
 #[cfg(test)]

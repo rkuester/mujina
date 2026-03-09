@@ -45,8 +45,13 @@ impl HashRate {
     }
 
     /// Expected number of hashes in the given duration.
-    pub fn hashes_in(&self, duration: Duration) -> u128 {
-        self.0 as u128 * duration.as_nanos() / 1_000_000_000
+    ///
+    /// Returns a fractional count because this is a statistical
+    /// expectation (e.g., 0.5 hashes in 100 ms at 5 H/s). Exact for
+    /// hashrates up to ~9 PH/s (2^53 H/s); above that, rounding
+    /// errors are bounded by ~10^-16 relative.
+    pub fn hashes_in(&self, duration: Duration) -> f64 {
+        self.0 as f64 * duration.as_secs_f64()
     }
 
     /// Format as human-readable string with appropriate units

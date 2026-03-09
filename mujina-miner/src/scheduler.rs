@@ -1012,7 +1012,6 @@ mod tests {
     /// Regression test: compute_scheduler_target produces a result
     /// without panicking across a wide range of hashrates.
     #[test]
-    #[should_panic] // known bug: integer truncation in target_for_share_rate
     fn scheduler_target_across_hashrates() {
         let source_target = Difficulty::from(1).to_target();
         for hashrate in [
