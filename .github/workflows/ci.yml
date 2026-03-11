@@ -34,7 +34,25 @@ jobs:
         if: steps.image-cache.outputs.cache-hit == 'true'
         run: podman load -i /tmp/mujina-build.tar
 
+      # Cache compiled dependencies to speed up builds. The key
+      # includes the toolchain (Containerfile) so a compiler bump
+      # invalidates stale artifacts. restore-keys lets a partial
+      # hit (new dependency added) still warm the cache.
+      - uses: actions/cache@v4
+        with:
+          path: target
+          key: cargo-target-${{ hashFiles('build.Containerfile') }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-target-${{ hashFiles('build.Containerfile') }}-
+
       - run: just ci
+
+      # Prune project crate artifacts before the cache saves,
+      # keeping only compiled dependencies.
+      - name: Prune project artifacts from target cache
+        run: |
+          find target -name 'mujina*' -delete 2>/dev/null || true
+          find target -name 'libmujina*' -delete 2>/dev/null || true
 
       - name: Save build image for cache
         if: steps.image-cache.outputs.cache-hit != 'true'
