@@ -41,6 +41,10 @@ in-container *args: build-image
         {{BUILD_IMAGE}}:{{BUILD_TAG}} \
         just {{args}}
 
+# The CI pipeline. This is what GitHub Actions runs.
+[group('ci')]
+ci: (in-container "checks")
+
 [group('container')]
 container-build tag=`git rev-parse --abbrev-ref HEAD`:
     podman build -t mujina-minerd:{{tag}} -f Containerfile .

@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  checks:
+    name: checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: extractions/setup-just@v2
+
+      # Cache the build toolchain image as a portable tar archive.
+      # Podman's overlay storage can't be cached directly (tar fails
+      # on overlay whiteout files), so we round-trip through podman
+      # save/load. The cache key is the hash of build.Containerfile.
+      # The image is tagged with a short hash of the Containerfile so
+      # that build-image in the justfile recognizes it and skips the
+      # build.
+      - uses: actions/cache@v4
+        id: image-cache
+        with:
+          path: /tmp/mujina-build.tar
+          key: build-image-${{ hashFiles('build.Containerfile') }}
+
+      - name: Load cached build image
+        if: steps.image-cache.outputs.cache-hit == 'true'
+        run: podman load -i /tmp/mujina-build.tar
+
+      - run: just ci
+
+      - name: Save build image for cache
+        if: steps.image-cache.outputs.cache-hit != 'true'
+        run: |
+          TAG=$(sha256sum build.Containerfile | cut -c1-12)
+          podman save -o /tmp/mujina-build.tar "mujina-build:$TAG"
