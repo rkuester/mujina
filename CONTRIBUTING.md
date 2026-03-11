@@ -105,8 +105,10 @@ will be accepted with a high degree of certainty.
 ### Prerequisites
 
 - Rust toolchain (stable)
+- [just](https://just.systems/) command runner
 - Linux development environment
 - Git
+- Optional: [Podman](https://podman.io/) for reproducing CI locally
 - Optional: Hardware for testing (Bitaxe boards, etc.)
 
 ### Setting Up Your Development Environment
@@ -147,9 +149,28 @@ will be accepted with a high degree of certainty.
 2. Follow the project's module structure
 3. Add tests for new functionality
 4. Update documentation as needed
-5. Ensure all tests pass: `cargo test`
-6. Run clippy: `cargo clippy -- -D warnings`
-7. Format your code: `cargo fmt`
+5. Run all checks before committing:
+   ```bash
+   just checks
+   ```
+   This runs `cargo fmt --check`, `cargo clippy`, and `cargo test`
+   using your local Rust toolchain.
+
+#### Reproducing CI locally
+
+Pull requests are gated on CI that runs inside a Podman container
+with a pinned Rust toolchain. If `just checks` passes locally but
+CI fails (or vice versa), you can run the same checks in the same
+container CI uses:
+
+```bash
+just ci
+```
+
+This builds a toolchain container from `build.Containerfile` and
+runs `just checks` inside it. The container image is cached
+locally and only rebuilds when the Containerfile changes. Podman
+is required for this step but not for regular development.
 
 ### Testing
 
