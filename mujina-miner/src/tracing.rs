@@ -1,8 +1,7 @@
 //! Provide tracing, tailored to this program.
 //!
-//! At startup, the program should call one of the init_* functions at startup
-//! to install a tracing subscriber (i.e., something that emits events to a
-//! log).
+//! At startup, the program should call [`init`] to install a tracing subscriber
+//! (i.e., something that emits events to a log).
 //!
 //! The rest of program the can include `use tracing::prelude::*` for convenient
 //! access to the `trace!()`, `debug!()`, `info!()`, `warn!()`, and `error!()`
@@ -23,88 +22,102 @@ use tracing_subscriber::{
     registry::LookupSpan,
 };
 
-#[cfg(target_os = "linux")]
-use std::{env, io, os::unix::io::AsRawFd};
-
-#[cfg(target_os = "linux")]
-use nix::libc;
-
-#[cfg(target_os = "linux")]
-use tracing_journald;
-
 pub mod prelude {
     #[allow(unused_imports)]
     pub use tracing::{debug, error, info, trace, warn};
 }
 
-#[cfg(target_os = "linux")]
-use prelude::*;
-
-/// Check if stderr is connected to systemd journal by validating JOURNAL_STREAM.
-///
-/// Per systemd documentation, programs should parse the device and inode numbers
-/// from JOURNAL_STREAM and compare them against stderr's file descriptor to
-/// detect I/O redirection and ensure the connection is genuine.
-///
-/// See: https://www.freedesktop.org/software/systemd/man/latest/systemd.exec.html#%24JOURNAL_STREAM
-#[cfg(target_os = "linux")]
-fn stderr_is_journal_stream() -> bool {
-    let journal_stream = match env::var("JOURNAL_STREAM") {
-        Ok(val) => val,
-        Err(_) => return false,
-    };
-
-    // Parse "device:inode" format
-    let parts: Vec<&str> = journal_stream.split(':').collect();
-    if parts.len() != 2 {
-        return false;
-    }
-
-    let expected_dev: u64 = match parts[0].parse() {
-        Ok(dev) => dev,
-        Err(_) => return false,
-    };
-
-    let expected_ino: u64 = match parts[1].parse() {
-        Ok(ino) => ino,
-        Err(_) => return false,
-    };
-
-    // Get actual device and inode from stderr
-    let stderr = io::stderr();
-    let fd = stderr.as_raw_fd();
-
-    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
-    if unsafe { libc::fstat(fd, &mut stat) } != 0 {
-        return false;
-    }
-
-    stat.st_dev == expected_dev && stat.st_ino == expected_ino
-}
-
 /// Initialize logging.
 ///
-/// If running under systemd, use journald; otherwise fall
-/// back to stdout.
-pub fn init_journald_or_stdout() {
-    #[cfg(target_os = "linux")]
-    {
-        if stderr_is_journal_stream() {
-            if let Ok(layer) = tracing_journald::layer() {
-                tracing_subscriber::registry().with(layer).init();
-                return;
-            } else {
-                error!("Failed to initialize journald logging, using stdout.");
-            }
+/// If running under systemd, use journald; otherwise fall back to
+/// stdout.
+pub fn init() {
+    if !journald::try_init() {
+        init_stdout();
+    }
+}
+
+#[cfg(target_os = "linux")]
+mod journald {
+    use std::env;
+    use std::io;
+    use std::os::unix::io::AsRawFd;
+
+    use nix::libc;
+    use tracing_subscriber::prelude::*;
+
+    use super::prelude::*;
+
+    /// If running under systemd journal, install a journald subscriber
+    /// and return `true`. Otherwise return `false`.
+    pub fn try_init() -> bool {
+        if !stderr_is_journal_stream() {
+            return false;
+        }
+
+        if let Ok(layer) = tracing_journald::layer() {
+            tracing_subscriber::registry().with(layer).init();
+            true
+        } else {
+            error!("Failed to initialize journald logging, using stdout.");
+            false
         }
     }
 
-    use_stdout();
+    /// Check if stderr is connected to systemd journal by validating
+    /// JOURNAL_STREAM.
+    ///
+    /// Per systemd documentation, programs should parse the device and
+    /// inode numbers from JOURNAL_STREAM and compare them against
+    /// stderr's file descriptor to detect I/O redirection and ensure
+    /// the connection is genuine.
+    ///
+    /// See: https://www.freedesktop.org/software/systemd/man/latest/systemd.exec.html#%24JOURNAL_STREAM
+    fn stderr_is_journal_stream() -> bool {
+        let journal_stream = match env::var("JOURNAL_STREAM") {
+            Ok(val) => val,
+            Err(_) => return false,
+        };
+
+        // Parse "device:inode" format
+        let parts: Vec<&str> = journal_stream.split(':').collect();
+        if parts.len() != 2 {
+            return false;
+        }
+
+        let expected_dev: u64 = match parts[0].parse() {
+            Ok(dev) => dev,
+            Err(_) => return false,
+        };
+
+        let expected_ino: u64 = match parts[1].parse() {
+            Ok(ino) => ino,
+            Err(_) => return false,
+        };
+
+        // Get actual device and inode from stderr
+        let stderr = io::stderr();
+        let fd = stderr.as_raw_fd();
+
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstat(fd, &mut stat) } != 0 {
+            return false;
+        }
+
+        stat.st_dev == expected_dev && stat.st_ino == expected_ino
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+mod journald {
+    pub fn try_init() -> bool {
+        false
+    }
 }
 
 // Log to stdout, filtering according to environment variable RUST_LOG,
 // overriding the default level (ERROR) to INFO.
-fn use_stdout() {
+fn init_stdout() {
     let env_filter = EnvFilter::builder()
         .with_default_directive(LevelFilter::INFO.into())
         .with_env_var("RUST_LOG")
