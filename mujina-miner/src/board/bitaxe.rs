@@ -265,10 +265,6 @@ impl BitaxeBoard {
         Ok(())
     }
 
-    /// Discover chips connected to this board.
-    ///
-    /// Sends broadcast ReadRegister commands and collects responses
-    /// to identify all chips on the serial bus.
     /// Send a configuration command to the chips.
     ///
     /// This is used during initialization to configure PLL, version rolling, etc.
