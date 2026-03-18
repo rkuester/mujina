@@ -109,6 +109,12 @@ Hashimoto and contributors for the pattern!
    ```bash
    just setup-hooks
    ```
+   The pre-commit hook checks whitespace and Rust formatting
+   before each commit. If you need to bypass it (e.g., committing
+   a work-in-progress), use:
+   ```bash
+   git commit --no-verify
+   ```
 5. Create a branch:
    ```bash
    git checkout -b fix-double-free-on-shutdown
