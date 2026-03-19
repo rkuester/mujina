@@ -107,7 +107,7 @@ Hashimoto and contributors for the pattern!
    ```
 4. **Setup git hooks** (highly recommended):
    ```bash
-   ./scripts/setup-hooks.sh
+   just setup-hooks
    ```
 5. Create a branch:
    ```bash

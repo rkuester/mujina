@@ -68,6 +68,9 @@ container-push tag=`git rev-parse --abbrev-ref HEAD`:
     podman tag mujina-minerd:{{tag}} ghcr.io/256foundation/mujina-minerd:{{tag}}
     podman push ghcr.io/256foundation/mujina-minerd:{{tag}}
 
+# Configure git to use the project's .githooks directory
 [group('setup')]
-hooks:
-    ./scripts/setup-hooks.sh
+setup-hooks:
+    git config core.hooksPath .githooks
+    @echo "Git hooks configured to use .githooks/"
+    @ls .githooks/ | sed 's/^/  - /'
