@@ -96,6 +96,55 @@ pub struct SourceTelemetry {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
     /// Current share difficulty set by the source.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_opt_f64_as_integer_when_whole"
+    )]
     pub difficulty: Option<f64>,
+}
+
+/// Serialize an `Option<f64>` so that whole numbers appear without a
+/// fractional part (e.g. `2328` instead of `2328.0`).
+fn serialize_opt_f64_as_integer_when_whole<S: serde::Serializer>(
+    value: &Option<f64>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    match value {
+        None => serializer.serialize_none(),
+        Some(v) if v.fract() == 0.0 && v.is_finite() => serializer.serialize_i64(*v as i64),
+        Some(v) => serializer.serialize_f64(*v),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn whole_difficulty_serializes_as_integer() {
+        let source = SourceTelemetry {
+            difficulty: Some(2048.0),
+            ..Default::default()
+        };
+        let json: serde_json::Value = serde_json::to_value(&source).unwrap();
+        assert!(
+            json["difficulty"].is_u64(),
+            "expected integer, got {}",
+            json["difficulty"]
+        );
+    }
+
+    #[test]
+    fn fractional_difficulty_serializes_as_float() {
+        let source = SourceTelemetry {
+            difficulty: Some(2048.5),
+            ..Default::default()
+        };
+        let json: serde_json::Value = serde_json::to_value(&source).unwrap();
+        assert!(
+            json["difficulty"].is_f64(),
+            "expected float, got {}",
+            json["difficulty"]
+        );
+    }
 }
