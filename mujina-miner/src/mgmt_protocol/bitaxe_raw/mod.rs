@@ -32,6 +32,7 @@
 pub mod channel;
 pub mod gpio;
 pub mod i2c;
+pub mod led;
 
 use crate::tracing::prelude::*;
 use bytes::{BufMut, BytesMut};
@@ -102,6 +103,8 @@ pub enum Page {
     GPIO = 0x06,
     /// ADC operations (voltage monitoring)
     ADC = 0x07,
+    /// LED operations (SK6812 RGB)
+    LED = 0x08,
 }
 
 /// I2C commands
@@ -115,6 +118,13 @@ pub enum I2CCommand {
 }
 
 // Note: For GPIO page, the command byte is the pin number itself
+
+/// LED commands
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum LEDCommand {
+    SetRGB = 0x10,
+}
 
 /// ADC commands
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
