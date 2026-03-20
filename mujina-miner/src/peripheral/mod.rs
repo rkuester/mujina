@@ -6,5 +6,6 @@
 //! over the hw_trait interfaces.
 
 pub mod emc2101;
+pub mod led;
 pub mod pmbus;
 pub mod tps546;
