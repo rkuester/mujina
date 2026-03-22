@@ -29,6 +29,7 @@ use crate::{
     mgmt_protocol::{
         ControlChannel,
         bitaxe_raw::{
+            ResponseFormat,
             gpio::{BitaxeRawGpioController, BitaxeRawGpioPin},
             i2c::BitaxeRawI2c,
         },
@@ -177,8 +178,8 @@ impl BitaxeBoard {
         serial_number: Option<String>,
         telemetry_tx: watch::Sender<BoardTelemetry>,
     ) -> Result<Self> {
-        // Create control channel and I2C controller
-        let control_channel = ControlChannel::new(control);
+        // Bitaxe runs original bitaxe-raw firmware (v0 response format)
+        let control_channel = ControlChannel::new(control, ResponseFormat::V0);
         let i2c = BitaxeRawI2c::new(control_channel.clone());
 
         // Create SerialStream for data channel at initial baud rate

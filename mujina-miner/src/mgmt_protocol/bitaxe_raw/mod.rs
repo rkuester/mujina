@@ -10,46 +10,24 @@
 //! a request-response packet structure. Each request includes an ID that is
 //! echoed in the response for correlation.
 //!
-//! ## Packet Format
+//! Two response formats exist; see [`ResponseFormat`] for details.
+//!
+//! ## Request Packet Format
 //!
 //! ```text
-//! Request:  [Length:2 LE] [ID:1] [Bus:1] [Page:1] [Command:1] [Data:N]
-//! Response: [Length:2 LE] [ID:1] [Data:N]
+//! [Length:2 LE] [ID:1] [Bus:1] [Page:1] [Command:1] [Data:N]
 //! ```
 //!
-//! **Length field encoding differs between requests and responses:**
-//! - **Requests**: Length = total packet size (all fields including length itself)
-//! - **Responses**: Length = data bytes only (not including length field or ID)
-//!   - Response packet size = 2 (length field) + 1 (ID) + length
+//! Length = total packet size (all fields including length itself).
 //!
 //! ## Pages
 //!
 //! - `0x05` - I2C operations (peripheral communication)
 //! - `0x06` - GPIO operations (ASIC reset, status pins)
 //! - `0x07` - ADC operations (voltage monitoring)
+//! - `0x08` - LED operations (SK6812 RGB)
 //!
 //! The bus field is always `0x00` in current firmware.
-//!
-//! ## GPIO Operations
-//!
-//! For GPIO, the command byte is the pin number itself:
-//! - Write: `[pin] [0x00 or 0x01]` (low/high)
-//! - Read: `[pin]` -> Response: `[0x00 or 0x01]`
-//!
-//! ## I2C Operations
-//!
-//! Standard I2C operations with 7-bit addressing:
-//! - Write: `[addr] [data...]`
-//! - Read: `[addr] [read_len]` -> Response: `[data...]`
-//! - Write-Read: `[addr] [write_data...] [read_len]` -> Response: `[data...]`
-//!
-//! ## Error Responses (v0)
-//!
-//! Protocol v0 intends to signal errors with a `0xFF` marker as
-//! the first data byte, but that position is shared with normal
-//! response payload. A command that legitimately returns `0xFF` as
-//! its first byte is indistinguishable from an error, so error
-//! detection is not reliable at the framing level.
 
 pub mod channel;
 pub mod gpio;
@@ -74,6 +52,45 @@ impl fmt::Display for HexBytes<'_> {
         Ok(())
     }
 }
+
+/// Response frame format version.
+///
+/// The bitaxe-raw protocol has two response formats that differ in
+/// framing and error signaling. The caller selects the variant based
+/// on knowledge of the board, e.g., the firmware version reported
+/// via USB `bcdDevice`.
+///
+/// ## V0 (original)
+///
+/// ```text
+/// [Length:2 LE] [ID:1] [Data:N]
+/// ```
+///
+/// Length = number of data bytes only (excludes length field and ID).
+/// Total packet size = length + 3.
+///
+/// Protocol v0 intends to signal errors with a `0xFF` marker as
+/// the first data byte, but that position is shared with normal
+/// response payload. A command that legitimately returns `0xFF` as
+/// its first byte is indistinguishable from an error, so error
+/// detection is not reliable at the framing level.
+///
+/// ## V1
+///
+/// ```text
+/// [Length:2 LE] [ID:1] [Status:1] [Data:N]
+/// ```
+///
+/// Length = total packet size (same convention as requests). Status
+/// is `0x00` for success, or an [`ErrorCode`] value for errors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResponseFormat {
+    V0,
+    V1,
+}
+
+/// Success status code in v1 responses.
+const STATUS_OK: u8 = 0x00;
 
 /// Control protocol pages
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -220,7 +237,7 @@ impl Response {
     /// command that legitimately returns `0xFF` as its first byte
     /// (e.g., an LED command echoing R=255) is indistinguishable from
     /// an error response, so we cannot reliably detect errors here.
-    pub fn parse(bytes: &[u8]) -> Result<Self, io::Error> {
+    fn parse_v0(bytes: &[u8]) -> Result<Self, io::Error> {
         if bytes.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -238,6 +255,51 @@ impl Response {
         })
     }
 
+    /// Parse a v1 response from bytes (after the length field is
+    /// stripped).
+    ///
+    /// V1 has an explicit status byte: `0x00` for success, otherwise
+    /// an [`ErrorCode`] value.
+    fn parse_v1(bytes: &[u8]) -> Result<Self, io::Error> {
+        if bytes.len() < 2 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "v1 response too short (need ID + status)",
+            ));
+        }
+
+        let id = bytes[0];
+        let status = bytes[1];
+        let payload = &bytes[2..];
+
+        if status == STATUS_OK {
+            return Ok(Response {
+                id,
+                data: payload.to_vec(),
+                error: None,
+            });
+        }
+
+        let code = ErrorCode::try_from(status).map_err(|unknown| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Unknown error code: 0x{:02x}", unknown),
+            )
+        })?;
+
+        let message = if code == ErrorCode::Custom && !payload.is_empty() {
+            Some(String::from_utf8_lossy(payload).to_string())
+        } else {
+            None
+        };
+
+        Ok(Response {
+            id,
+            data: vec![],
+            error: Some(ResponseError { code, message }),
+        })
+    }
+
     /// Check if this is an error response
     pub fn is_error(&self) -> bool {
         self.error.is_some()
@@ -251,14 +313,15 @@ impl Response {
 
 /// Tokio codec for the control protocol
 pub struct ControlCodec {
-    /// Maximum packet size to prevent memory allocation issues
+    format: ResponseFormat,
     max_length: usize,
 }
 
-impl Default for ControlCodec {
-    fn default() -> Self {
+impl ControlCodec {
+    pub fn new(format: ResponseFormat) -> Self {
         Self {
-            max_length: 4096, // Reasonable max for control packets
+            format,
+            max_length: 4096,
         }
     }
 }
@@ -269,17 +332,17 @@ impl Decoder for ControlCodec {
 
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
         if src.len() < 2 {
-            // Not enough data for length field
             return Ok(None);
         }
 
-        // Peek at length without consuming
         let length_field = u16::from_le_bytes([src[0], src[1]]) as usize;
 
-        // In bitaxe-raw, the length field contains the length of the response data only,
-        // NOT including the 2-byte length field itself or the 1-byte ID.
-        // Total packet size = 2 (length) + 1 (ID) + length_field
-        let total_packet_size = 2 + 1 + length_field;
+        // V0: length = data bytes only, total = length + 3
+        // V1: length = total packet size
+        let total_packet_size = match self.format {
+            ResponseFormat::V0 => 2 + 1 + length_field,
+            ResponseFormat::V1 => length_field,
+        };
 
         if total_packet_size > self.max_length {
             return Err(io::Error::new(
@@ -289,17 +352,16 @@ impl Decoder for ControlCodec {
         }
 
         if src.len() < total_packet_size {
-            // Not enough data for complete packet
             return Ok(None);
         }
 
-        // Consume the complete packet
         let packet_data = src.split_to(total_packet_size);
-
-        // Skip the 2-byte length field
         let response_data = &packet_data[2..];
 
-        let response = Response::parse(response_data)?;
+        let response = match self.format {
+            ResponseFormat::V0 => Response::parse_v0(response_data)?,
+            ResponseFormat::V1 => Response::parse_v1(response_data)?,
+        };
 
         trace!(
             id = response.id,
@@ -367,16 +429,42 @@ mod tests {
     }
 
     #[test]
-    fn test_response_parsing() {
-        let response = Response::parse(&[0x42, 0x01]).unwrap();
+    fn v0_response_parsing() {
+        let response = Response::parse_v0(&[0x42, 0x01]).unwrap();
         assert_eq!(response.id, 0x42);
         assert_eq!(response.data, vec![0x01]);
         assert!(!response.is_error());
 
         // Data starting with 0xFF is valid payload, not an error
-        let response = Response::parse(&[0x42, 0xff, 0x00, 0x00]).unwrap();
+        let response = Response::parse_v0(&[0x42, 0xff, 0x00, 0x00]).unwrap();
         assert_eq!(response.id, 0x42);
         assert_eq!(response.data, vec![0xff, 0x00, 0x00]);
         assert!(!response.is_error());
+    }
+
+    #[test]
+    fn v1_response_parsing() {
+        // Success: status 0x00
+        let response = Response::parse_v1(&[0x42, 0x00, 0x01]).unwrap();
+        assert_eq!(response.id, 0x42);
+        assert_eq!(response.data, vec![0x01]);
+        assert!(!response.is_error());
+
+        // Success with data starting with 0xFF (valid payload, not an error)
+        let response = Response::parse_v1(&[0x42, 0x00, 0xff, 0x00, 0x00]).unwrap();
+        assert_eq!(response.data, vec![0xff, 0x00, 0x00]);
+        assert!(!response.is_error());
+
+        // Error: InvalidCommand
+        let response = Response::parse_v1(&[0x42, 0x11]).unwrap();
+        assert_eq!(response.id, 0x42);
+        assert!(response.is_error());
+        assert_eq!(response.error().unwrap().code, ErrorCode::InvalidCommand);
+
+        // Error with message
+        let response = Response::parse_v1(&[0x42, 0xff, b'b', b'a', b'd']).unwrap();
+        assert!(response.is_error());
+        assert_eq!(response.error().unwrap().code, ErrorCode::Custom);
+        assert_eq!(response.error().unwrap().message.as_deref(), Some("bad"));
     }
 }

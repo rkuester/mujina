@@ -13,7 +13,7 @@ use tokio_serial::SerialStream;
 use tokio_stream::StreamExt;
 use tokio_util::codec::{FramedRead, FramedWrite};
 
-use super::{ControlCodec, Packet, Response};
+use super::{ControlCodec, Packet, Response, ResponseFormat};
 
 /// Control channel for bitaxe-raw protocol communication.
 ///
@@ -32,12 +32,15 @@ struct ControlChannelInner {
 
 impl ControlChannel {
     /// Create a new control channel from a serial stream.
-    pub fn new(stream: SerialStream) -> Self {
+    ///
+    /// The `format` parameter selects the response framing and error
+    /// signaling variant. See [`ResponseFormat`] for details.
+    pub fn new(stream: SerialStream, format: ResponseFormat) -> Self {
         let (reader, writer) = tokio::io::split(stream);
         Self {
             inner: Arc::new(Mutex::new(ControlChannelInner {
-                writer: FramedWrite::new(writer, ControlCodec::default()),
-                reader: FramedRead::new(reader, ControlCodec::default()),
+                writer: FramedWrite::new(writer, ControlCodec::new(format)),
+                reader: FramedRead::new(reader, ControlCodec::new(format)),
                 next_id: 0,
             })),
         }
