@@ -43,10 +43,13 @@
 //! - Read: `[addr] [read_len]` -> Response: `[data...]`
 //! - Write-Read: `[addr] [write_data...] [read_len]` -> Response: `[data...]`
 //!
-//! ## Error Responses
+//! ## Error Responses (v0)
 //!
-//! Errors are indicated by a response data field starting with `0xFF` followed
-//! by an error code. See [`ErrorCode`] for defined error types.
+//! Protocol v0 intends to signal errors with a `0xFF` marker as
+//! the first data byte, but that position is shared with normal
+//! response payload. A command that legitimately returns `0xFF` as
+//! its first byte is indistinguishable from an error, so error
+//! detection is not reliable at the framing level.
 
 pub mod channel;
 pub mod gpio;
@@ -71,9 +74,6 @@ impl fmt::Display for HexBytes<'_> {
         Ok(())
     }
 }
-
-/// Error response marker
-const ERROR_MARKER: u8 = 0xff;
 
 /// Control protocol pages
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -211,7 +211,15 @@ pub struct ResponseError {
 }
 
 impl Response {
-    /// Parse a response from bytes
+    /// Parse a v0 response from bytes (after the length field is
+    /// stripped).
+    ///
+    /// All responses are treated as success. Protocol v0 intends to
+    /// signal errors with a `0xFF` marker as the first data byte, but
+    /// that position is also where normal payload data lives. A
+    /// command that legitimately returns `0xFF` as its first byte
+    /// (e.g., an LED command echoing R=255) is indistinguishable from
+    /// an error response, so we cannot reliably detect errors here.
     pub fn parse(bytes: &[u8]) -> Result<Self, io::Error> {
         if bytes.is_empty() {
             return Err(io::Error::new(
@@ -220,37 +228,14 @@ impl Response {
             ));
         }
 
-        // Length is already consumed by the codec
         let id = bytes[0];
-        let data = &bytes[1..];
+        let data = bytes[1..].to_vec();
 
-        // Check for error response
-        if data.len() >= 2 && data[0] == ERROR_MARKER {
-            let code = ErrorCode::try_from(data[1]).map_err(|unknown| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("Unknown error code: 0x{:02x}", unknown),
-                )
-            })?;
-
-            let message = if code == ErrorCode::Custom && data.len() > 2 {
-                Some(String::from_utf8_lossy(&data[2..]).to_string())
-            } else {
-                None
-            };
-
-            Ok(Response {
-                id,
-                data: vec![],
-                error: Some(ResponseError { code, message }),
-            })
-        } else {
-            Ok(Response {
-                id,
-                data: data.to_vec(),
-                error: None,
-            })
-        }
+        Ok(Response {
+            id,
+            data,
+            error: None,
+        })
     }
 
     /// Check if this is an error response
@@ -383,18 +368,15 @@ mod tests {
 
     #[test]
     fn test_response_parsing() {
-        // Success response with data
-        let response_bytes = vec![0x42, 0x01]; // id=0x42, data=[0x01]
-        let response = Response::parse(&response_bytes).unwrap();
+        let response = Response::parse(&[0x42, 0x01]).unwrap();
         assert_eq!(response.id, 0x42);
         assert_eq!(response.data, vec![0x01]);
         assert!(!response.is_error());
 
-        // Error response
-        let error_bytes = vec![0x42, 0xff, 0x11]; // id=0x42, error marker, invalid command
-        let response = Response::parse(&error_bytes).unwrap();
+        // Data starting with 0xFF is valid payload, not an error
+        let response = Response::parse(&[0x42, 0xff, 0x00, 0x00]).unwrap();
         assert_eq!(response.id, 0x42);
-        assert!(response.is_error());
-        assert_eq!(response.error().unwrap().code, ErrorCode::InvalidCommand);
+        assert_eq!(response.data, vec![0xff, 0x00, 0x00]);
+        assert!(!response.is_error());
     }
 }
