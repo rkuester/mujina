@@ -174,9 +174,12 @@ pub struct Packet {
 
 impl Packet {
     /// Create a new packet with default bus (0x00)
-    pub fn new(id: u8, page: Page, command: u8, data: Vec<u8>) -> Self {
+    ///
+    /// The packet ID is left unset; [`ControlChannel::send_packet`]
+    /// assigns it before transmission.
+    pub fn new(page: Page, command: u8, data: Vec<u8>) -> Self {
         Self {
-            id,
+            id: 0,
             bus: 0x00,
             page,
             command,

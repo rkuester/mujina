@@ -37,7 +37,7 @@ impl RgbLed for BitaxeRawLed {
         let g = scale(color.g, brightness);
         let b = scale(color.b, brightness);
         trace!(r, g, b, "LED set");
-        let packet = Packet::new(0, Page::LED, LEDCommand::SetRGB as u8, vec![r, g, b]);
+        let packet = Packet::new(Page::LED, LEDCommand::SetRGB as u8, vec![r, g, b]);
         self.channel.send_packet(packet).await?;
         Ok(())
     }
@@ -49,17 +49,11 @@ mod tests {
 
     #[test]
     fn led_set_rgb_packet_encoding() {
-        let packet = Packet::new(
-            0x42,
-            Page::LED,
-            LEDCommand::SetRGB as u8,
-            vec![0xff, 0x80, 0x00],
-        );
+        let packet = Packet::new(Page::LED, LEDCommand::SetRGB as u8, vec![0xff, 0x80, 0x00]);
         let encoded = packet.encode();
 
         assert_eq!(encoded[0], 0x09); // length low: 6 header + 3 data
         assert_eq!(encoded[1], 0x00); // length high
-        assert_eq!(encoded[2], 0x42); // id
         assert_eq!(encoded[3], 0x00); // bus
         assert_eq!(encoded[4], 0x08); // LED page
         assert_eq!(encoded[5], 0x10); // SetRGB command
