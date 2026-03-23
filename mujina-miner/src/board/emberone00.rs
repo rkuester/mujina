@@ -3,16 +3,25 @@
 //! The emberOne/00 has 12 BM1362 ASIC chips, communicating via USB
 //! using the bitaxe-raw protocol (same as Bitaxe boards).
 
-use anyhow::{Result, bail};
+use crate::tracing::prelude::*;
+use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use tokio::sync::watch;
+use tokio_serial::SerialPortBuilderExt;
 
 use super::{
     Board, BoardDescriptor, BoardInfo,
     pattern::{BoardPattern, Match, StringMatch},
 };
 use crate::{
-    api_client::types::BoardTelemetry, asic::hash_thread::HashThread, transport::UsbDeviceInfo,
+    api_client::types::BoardTelemetry,
+    asic::hash_thread::HashThread,
+    mgmt_protocol::{
+        ControlChannel,
+        bitaxe_raw::{ResponseFormat, led::BitaxeRawLed},
+    },
+    peripheral::led::{CalibratedLed, ColorProfile, Status, StatusLed},
+    transport::UsbDeviceInfo,
 };
 
 // Register this board type with the inventory system
@@ -31,10 +40,45 @@ inventory::submit! {
     }
 }
 
-// Factory function to create an emberOne/00 board from USB device info
+/// Select response format based on firmware version in bcdDevice.
+///
+/// Firmware minor >= 1 uses v1 response format with explicit
+/// status byte. Older firmware uses v0.
+fn response_format(bcd_device: Option<u16>) -> ResponseFormat {
+    match bcd_device {
+        Some(bcd) if (bcd & 0x00F0) >= 0x0010 => ResponseFormat::V1,
+        _ => ResponseFormat::V0,
+    }
+}
+
 async fn create_from_usb(
     device: UsbDeviceInfo,
 ) -> Result<(Box<dyn Board + Send>, super::BoardRegistration)> {
+    let serial_ports = device.serial_ports()?;
+    if serial_ports.len() != 2 {
+        bail!(
+            "emberOne/00 requires exactly 2 serial ports, found {}",
+            serial_ports.len()
+        );
+    }
+
+    debug!(
+        serial = ?device.serial_number,
+        control = %serial_ports[0],
+        data = %serial_ports[1],
+        "Opening emberOne/00 serial ports"
+    );
+
+    let control_port = tokio_serial::new(&serial_ports[0], 115200)
+        .open_native_async()
+        .context("failed to open control port")?;
+    let format = response_format(device.bcd_device);
+    let channel = ControlChannel::new(control_port, format);
+
+    let led = BitaxeRawLed::new(channel.clone());
+    let led = CalibratedLed::new(Box::new(led), ColorProfile::SK6812);
+    let status_led = StatusLed::new(Box::new(led), Status::Initializing);
+
     let serial = device.serial_number.clone();
     let initial_telemetry = BoardTelemetry {
         name: format!("emberone00-{}", serial.as_deref().unwrap_or("unknown")),
@@ -44,7 +88,12 @@ async fn create_from_usb(
     };
     let (telemetry_tx, telemetry_rx) = watch::channel(initial_telemetry);
 
-    let board = EmberOne00::new(device, telemetry_tx);
+    let board = EmberOne00 {
+        device_info: device,
+        channel,
+        status_led,
+        telemetry_tx,
+    };
 
     let registration = super::BoardRegistration { telemetry_rx };
     Ok((Box::new(board), registration))
@@ -53,6 +102,8 @@ async fn create_from_usb(
 /// emberOne/00 hash board
 pub struct EmberOne00 {
     device_info: UsbDeviceInfo,
+    channel: ControlChannel,
+    status_led: StatusLed,
 
     /// Channel for publishing board telemetry to the API server.
     #[expect(dead_code, reason = "will publish telemetry in a follow-up commit")]
@@ -70,6 +121,7 @@ impl Board for EmberOne00 {
     }
 
     async fn shutdown(&mut self) -> Result<()> {
+        self.status_led.off().await;
         Ok(())
     }
 
@@ -78,34 +130,8 @@ impl Board for EmberOne00 {
     }
 }
 
-impl EmberOne00 {
-    /// Create a new emberOne/00 board instance.
-    pub fn new(device_info: UsbDeviceInfo, telemetry_tx: watch::Sender<BoardTelemetry>) -> Self {
-        Self {
-            device_info,
-            telemetry_tx,
-        }
-    }
-}
-
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn board_info_propagates_serial_number() {
-        let device = UsbDeviceInfo {
-            serial_number: Some("S12345".to_string()),
-            device_path: "/sys/devices/test".to_string(),
-            ..Default::default()
-        };
-
-        let (telemetry_tx, _) = watch::channel(BoardTelemetry::default());
-        let board = EmberOne00::new(device, telemetry_tx);
-
-        assert_eq!(board.board_info().serial_number.as_deref(), Some("S12345"),);
-    }
-}
+mod tests {}
 
 #[cfg(test)]
 mod integration_tests;
