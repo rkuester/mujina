@@ -13,6 +13,24 @@ for easy reference in code reviews and discussions.
 3. **Simplicity** - Prefer simple solutions over complex ones
 4. **Documentation** - Document why, not what
 
+### Minimize Scope [G.scope](#G.scope)
+
+Define constants, types, and helpers at the narrowest scope that
+covers their use. A constant used in one function belongs in that
+function, not at the top of the file. This keeps related things
+together and makes it clear what depends on what.
+
+```rust
+// Good: constant scoped to the function that uses it
+async fn apply_status(&mut self) {
+    const FAULT_BLINK_PHASE: Duration = Duration::from_millis(500);
+    // ...
+}
+
+// Bad: constant at file scope when only one function uses it
+const FAULT_BLINK_PHASE: Duration = Duration::from_millis(500);
+```
+
 ## Error Handling
 
 ### Application Error Handling [E.anyhow](#E.anyhow)
