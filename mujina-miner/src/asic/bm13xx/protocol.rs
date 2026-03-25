@@ -10,6 +10,7 @@
 //! - Unify endianness handling across different frame types
 
 use bitcoin::hashes::Hash;
+use bitcoin::pow::Work;
 use bitvec::prelude::*;
 use bytes::{Buf, BufMut, BytesMut};
 use std::{fmt, io};
@@ -306,6 +307,16 @@ impl Log2Difficulty {
     /// The log2 of the difficulty (e.g., 8 for difficulty 256).
     pub const fn exponent(&self) -> u8 {
         self.exponent
+    }
+
+    /// Expected work per nonce at this difficulty.
+    ///
+    /// A nonce that passes the ASIC's difficulty filter represents
+    /// this many hashes of work on average.
+    pub fn to_work(&self) -> Work {
+        Difficulty::from(1_u64 << self.exponent)
+            .to_target()
+            .to_work()
     }
 }
 
@@ -2368,6 +2379,15 @@ mod log2_difficulty_tests {
     fn display() {
         let diff = Log2Difficulty::from_difficulty(Difficulty::from(256_u64));
         assert_eq!(format!("{diff}"), "2^8");
+    }
+
+    #[test]
+    fn to_work_matches_target_to_work() {
+        // Log2Difficulty's to_work should agree with computing work
+        // from the equivalent target directly.
+        let diff = Log2Difficulty::from_difficulty(Difficulty::from(256_u64));
+        let expected = Difficulty::from(256_u64).to_target().to_work();
+        assert_eq!(diff.to_work(), expected);
     }
 }
 

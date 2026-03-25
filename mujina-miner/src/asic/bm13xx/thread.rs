@@ -7,6 +7,7 @@
 //! The thread is implemented as an actor task that monitors the serial bus for
 //! chip responses, filters shares, and manages work assignment.
 
+use std::cmp::max;
 use std::sync::{Arc, RwLock};
 
 use anyhow::{Context as _, Result, anyhow};
@@ -232,7 +233,11 @@ impl HashThread for BM13xxThread {
 /// Initialize BM13xx chip for mining.
 ///
 /// Enables chip, configures all registers, and ramps frequency to target.
-async fn initialize_chip<W>(chip_commands: &mut W, peripherals: &mut BoardPeripherals) -> Result<()>
+async fn initialize_chip<W>(
+    chip_commands: &mut W,
+    peripherals: &mut BoardPeripherals,
+    asic_difficulty: Log2Difficulty,
+) -> Result<()>
 where
     W: Sink<protocol::Command> + Unpin,
     W::Error: std::fmt::Debug,
@@ -333,11 +338,8 @@ where
     )
     .await?;
 
-    // Ticket mask: ~1 nonce/sec at 1 TH/s
-    let log2_diff = Log2Difficulty::from_difficulty(
-        ShareRate::per_second(1.0).to_difficulty(HashRate::from_terahashes(1.0)),
-    );
-    let ticket_mask = TicketMask::new(log2_diff);
+    // Ticket mask
+    let ticket_mask = TicketMask::new(asic_difficulty);
 
     send_reg(chip_commands, true, Register::TicketMask(ticket_mask)).await?;
     send_reg(
@@ -612,6 +614,11 @@ async fn bm13xx_thread_actor<R, W>(
         warn!(error = %e, "Failed to disable ASIC on startup");
     }
 
+    // ASIC ticket mask difficulty: ~1 nonce/sec at 1 TH/s
+    let asic_difficulty = Log2Difficulty::from_difficulty(
+        ShareRate::per_second(1.0).to_difficulty(HashRate::from_terahashes(1.0)),
+    );
+
     let mut chip_initialized = false;
     let mut current_task: Option<HashTask> = None;
     let mut chip_jobs = ChipJobTracker::new();
@@ -656,7 +663,7 @@ async fn bm13xx_thread_actor<R, W>(
 
                         if !chip_initialized {
                             trace!("Initializing chip on first assignment.");
-                            if let Err(e) = initialize_chip(&mut chip_commands, &mut peripherals).await {
+                            if let Err(e) = initialize_chip(&mut chip_commands, &mut peripherals, asic_difficulty).await {
                                 error!(error = %e, "Chip initialization failed");
                                 response_tx.send(Err(e)).ok();
                                 continue;
@@ -706,7 +713,7 @@ async fn bm13xx_thread_actor<R, W>(
 
                         if !chip_initialized {
                             trace!("Initializing chip on first assignment.");
-                            if let Err(e) = initialize_chip(&mut chip_commands, &mut peripherals).await {
+                            if let Err(e) = initialize_chip(&mut chip_commands, &mut peripherals, asic_difficulty).await {
                                 error!(error = %e, "Chip initialization failed");
                                 response_tx.send(Err(e)).ok();
                                 continue;
@@ -798,13 +805,22 @@ async fn bm13xx_thread_actor<R, W>(
 
                                             // Validate against task share target
                                             if task.share_target.is_met_by(hash) {
+                                                // Attribute work at the harder of the
+                                                // ASIC ticket mask and the scheduler
+                                                // target, since the actual filter is
+                                                // whichever is stricter.
+                                                let expected_work = max(
+                                                    asic_difficulty.to_work(),
+                                                    task.share_target.to_work(),
+                                                );
+
                                                 let share = Share {
                                                     nonce,
                                                     hash,
                                                     version: full_version,
                                                     ntime: task.ntime,
                                                     extranonce2: task.en2,
-                                                    expected_work: task.share_target.to_work(),
+                                                    expected_work,
                                                 };
 
                                                 // Send via task's dedicated channel
