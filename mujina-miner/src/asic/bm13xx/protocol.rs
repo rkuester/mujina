@@ -20,6 +20,7 @@ use super::crc::{crc5, crc5_is_valid, crc16};
 use super::error::ProtocolError;
 use crate::job_source::GeneralPurposeBits;
 use crate::tracing::prelude::*;
+use crate::types::Difficulty;
 
 /// Wrapper for formatting byte slices as space-separated hex.
 struct HexBytes<'a>(&'a [u8]);
@@ -341,6 +342,44 @@ impl ReportingRate {
 
     pub const fn nonces_per_sec_value(&self) -> f64 {
         self.nonces_per_sec
+    }
+}
+
+/// ASIC difficulty as a power-of-2 exponent.
+///
+/// BM13xx chips filter nonces using bitmask comparison (`hash &
+/// mask == 0`) rather than numerical target comparison (`hash <
+/// target`). Each bit in the mask independently halves the pass
+/// rate, so only power-of-2 difficulty steps are representable.
+/// This type stores the log2 of the difficulty: a value of 8
+/// means difficulty 2^8 = 256.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Log2Difficulty {
+    exponent: u8,
+}
+
+impl Log2Difficulty {
+    /// Floor an arbitrary difficulty to the nearest power-of-2
+    /// ASIC difficulty.
+    ///
+    /// The conversion is lossy: non-power-of-2 difficulties are
+    /// rounded down. This ensures the actual nonce rate is at least
+    /// as high as the rate implied by the input difficulty.
+    pub fn from_difficulty(difficulty: Difficulty) -> Self {
+        let d = difficulty.as_f64();
+        let exponent = if d >= 1.0 { d.log2().floor() as u8 } else { 0 };
+        Self { exponent }
+    }
+
+    /// The log2 of the difficulty (e.g., 8 for difficulty 256).
+    pub const fn exponent(&self) -> u8 {
+        self.exponent
+    }
+}
+
+impl fmt::Display for Log2Difficulty {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "2^{}", self.exponent)
     }
 }
 
@@ -2410,6 +2449,43 @@ mod response_tests {
             difficulty >= Difficulty::from(esp_miner_job::POOL_SHARE_DIFFICULTY_INT),
             "Hash should meet pool difficulty"
         );
+    }
+}
+
+#[cfg(test)]
+mod log2_difficulty_tests {
+    use super::*;
+    use crate::types::Difficulty;
+
+    #[test]
+    fn power_of_two_difficulty_exact() {
+        let diff = Log2Difficulty::from_difficulty(Difficulty::from(256_u64));
+        assert_eq!(diff.exponent(), 8);
+    }
+
+    #[test]
+    fn non_power_of_two_floors() {
+        // 300 is between 2^8=256 and 2^9=512, should floor to 8
+        let diff = Log2Difficulty::from_difficulty(Difficulty::from(300_u64));
+        assert_eq!(diff.exponent(), 8);
+    }
+
+    #[test]
+    fn difficulty_one() {
+        let diff = Log2Difficulty::from_difficulty(Difficulty::from(1_u64));
+        assert_eq!(diff.exponent(), 0);
+    }
+
+    #[test]
+    fn large_difficulty() {
+        let diff = Log2Difficulty::from_difficulty(Difficulty::from(65536_u64));
+        assert_eq!(diff.exponent(), 16);
+    }
+
+    #[test]
+    fn display() {
+        let diff = Log2Difficulty::from_difficulty(Difficulty::from(256_u64));
+        assert_eq!(format!("{diff}"), "2^8");
     }
 }
 
