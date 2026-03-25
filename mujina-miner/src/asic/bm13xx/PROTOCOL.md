@@ -420,11 +420,64 @@ Controls nonce search space distribution (format not fully documented):
 - Different values used for different chip counts
 - Mechanism remains partially understood through empirical testing
 
-#### 0x14 - TICKET_MASK (Difficulty)
-Sets the difficulty mask (4 bytes, little-endian):
-- Each byte is bit-reversed
-- Example: difficulty 256 = 0xFF000000 -> transmitted as [0xFF, 0x00, 0x00,
-0x00]
+#### 0x14 - TICKET_MASK (Nonce Reporting Filter)
+
+Controls which nonces the chip reports over the serial link.
+The chip hashes at billions of hashes per second but only a
+tiny fraction are interesting. This register sets the threshold
+so the chip only sends nonces whose hashes are hard enough to
+be worth reporting.
+
+**How it works:**
+
+The chip always requires the first 32 bits of the bit-reversed
+hash to be zero (hardwired, equivalent to Bitcoin difficulty 1).
+The ticket mask specifies *additional* bit positions beyond
+those 32 that must also be zero. Setting N extra zero bits
+means only ~1 in 2^(32+N) hashes passes the filter.
+
+For example, with `zero_bits = 8`, the chip requires 40 total
+zero bits in the bit-reversed hash. At ~1 TH/s this produces
+roughly 1 nonce per second -- a manageable rate for the serial
+link.
+
+Because the base 32 zero bits are already baked in, the mask
+value resembles a difficulty: `2^N - 1` for N extra zero bits.
+However, this is not identical to Bitcoin difficulty (see
+below).
+
+**Mask vs. target comparison:**
+
+Bitcoin checks `hash < target`, a numerical comparison that
+can express any arbitrary threshold. The chip instead checks
+`hash & mask == 0`, a bitwise operation that only tests
+whether specific bit positions are zero. It ignores all other
+bits. The two approaches agree on average probability (N zero
+bits = ~1-in-2^N either way), but they accept different sets
+of hashes. Because each mask bit independently halves the pass
+rate, only power-of-2 difficulty steps are possible. The mask
+is a coarser, cheaper-to-implement filter that approximates
+real difficulty.
+
+**Wire encoding:**
+
+Each byte of the 4-byte register value is bit-reversed before
+transmission.
+
+Example for difficulty 1024 (value `0x000003FF`, 10 zero bits):
+- Byte 0: `0xFF` -> bit-reversed -> `0xFF`
+- Byte 1: `0x03` -> bit-reversed -> `0xC0`
+- Wire bytes: `[0xC0, 0xFF, 0x00, 0x00]`
+
+**Bit-reversal justification:**
+
+The per-byte bit-reversal is confirmed by esp-miner
+(`_reverse_bits` in `common.c`), bosminer
+(`reverse_bits().swap_bytes()` in `bm1387.rs`), and the
+bm1397-docs register reference. The bm1397-docs speculates
+this is because the ASIC compares against a bit-reversed SHA
+hash, not just a byte-reversed one, so the mask must match
+that representation.
 
 #### 0x18 - MISC_CONTROL
 UART and GPIO pin configuration (32-bit register, documented in BM1366):
