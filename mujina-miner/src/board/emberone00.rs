@@ -21,9 +21,16 @@ use super::{
 use crate::{
     api_client::types::{BoardTelemetry, TemperatureSensor},
     asic::hash_thread::HashThread,
+    hw_trait::gpio::{Gpio, GpioPin, PinValue},
     mgmt_protocol::{
         ControlChannel,
-        bitaxe_raw::{DeviceVersion, ResponseFormat, i2c::BitaxeRawI2c, led::BitaxeRawLed, system},
+        bitaxe_raw::{
+            DeviceVersion, ResponseFormat,
+            gpio::{BitaxeRawGpioController, BitaxeRawGpioPin},
+            i2c::BitaxeRawI2c,
+            led::BitaxeRawLed,
+            system,
+        },
     },
     peripheral::{
         led::{CalibratedLed, ColorProfile, Status, StatusLed},
@@ -53,6 +60,15 @@ inventory::submit! {
 mod i2c_addr {
     pub const TMP1075_LEFT: u8 = 0x4A;
     pub const TMP451_RIGHT: u8 = 0x49;
+}
+
+/// GPIO command indices exposed by the emberone-usbserial-fw firmware.
+///
+/// These are not physical pin numbers. The firmware maps each index
+/// to the corresponding RP2040 GPIO. See the Command enum in
+/// emberone-usbserial-fw/src/control/gpio.rs for the mapping.
+mod gpio_cmd {
+    pub const VDDIO_EN: u8 = 0x02;
 }
 
 /// Select response format based on firmware version.
@@ -93,6 +109,13 @@ async fn create_from_usb(
     let control = ControlChannel::new(control_port, format);
 
     let i2c = BitaxeRawI2c::new(control.clone());
+
+    let mut gpio = BitaxeRawGpioController::new(control.clone());
+    let mut vddio_en = gpio.pin(gpio_cmd::VDDIO_EN).await?;
+    vddio_en.write(PinValue::High).await?;
+    // TPS61041 soft start is ~0.5 ms; MCP1824 LDOs settle in ~0.2 ms
+    const VDDIO_SETTLE: Duration = Duration::from_millis(5);
+    time::sleep(VDDIO_SETTLE).await;
 
     let led = BitaxeRawLed::new(control.clone());
     let led = CalibratedLed::new(Box::new(led), ColorProfile::SK6812);
@@ -135,6 +158,7 @@ async fn create_from_usb(
     let board = EmberOne00 {
         device_info: device,
         control,
+        vddio_en,
         status_led,
         monitor_cancel: cancel,
         monitor_task,
@@ -216,6 +240,7 @@ fn spawn_monitor(
 pub struct EmberOne00 {
     device_info: UsbDeviceInfo,
     control: ControlChannel,
+    vddio_en: BitaxeRawGpioPin,
     status_led: StatusLed,
     monitor_cancel: CancellationToken,
     monitor_task: JoinHandle<()>,
@@ -234,6 +259,7 @@ impl Board for EmberOne00 {
     async fn shutdown(&mut self) -> Result<()> {
         self.monitor_cancel.cancel();
         let _ = (&mut self.monitor_task).await;
+        let _ = self.vddio_en.write(PinValue::Low).await;
         self.status_led.off().await;
         let _ = system::reboot(&self.control).await;
         Ok(())
