@@ -12,6 +12,7 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::{self, MissedTickBehavior};
 use tokio_serial::SerialPortBuilderExt;
+use tokio_util::sync::CancellationToken;
 
 use super::{
     Board, BoardDescriptor, BoardInfo,
@@ -128,13 +129,15 @@ async fn create_from_usb(
     };
     let (telemetry_tx, telemetry_rx) = watch::channel(initial_telemetry);
 
-    let monitor_handle = spawn_monitor(temp_left, temp_right, telemetry_tx);
+    let cancel = CancellationToken::new();
+    let monitor_task = spawn_monitor(temp_left, temp_right, telemetry_tx, cancel.clone());
 
     let board = EmberOne00 {
         device_info: device,
         control,
         status_led,
-        monitor_handle,
+        monitor_cancel: cancel,
+        monitor_task,
     };
 
     let registration = super::BoardRegistration { telemetry_rx };
@@ -146,6 +149,7 @@ fn spawn_monitor(
     mut temp_left: Tmp1075<BitaxeRawI2c>,
     mut temp_right: Tmp451<BitaxeRawI2c>,
     telemetry_tx: watch::Sender<BoardTelemetry>,
+    cancel: CancellationToken,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         const INTERVAL: Duration = Duration::from_secs(5);
@@ -156,7 +160,10 @@ fn spawn_monitor(
         ticker.tick().await;
 
         loop {
-            ticker.tick().await;
+            tokio::select! {
+                _ = cancel.cancelled() => break,
+                _ = ticker.tick() => {}
+            }
 
             let left_c = match temp_left.read().await {
                 Ok(reading) => Some(reading.as_degrees_c()),
@@ -210,7 +217,8 @@ pub struct EmberOne00 {
     device_info: UsbDeviceInfo,
     control: ControlChannel,
     status_led: StatusLed,
-    monitor_handle: JoinHandle<()>,
+    monitor_cancel: CancellationToken,
+    monitor_task: JoinHandle<()>,
 }
 
 #[async_trait]
@@ -224,7 +232,8 @@ impl Board for EmberOne00 {
     }
 
     async fn shutdown(&mut self) -> Result<()> {
-        self.monitor_handle.abort();
+        self.monitor_cancel.cancel();
+        let _ = (&mut self.monitor_task).await;
         self.status_led.off().await;
         let _ = system::reboot(&self.control).await;
         Ok(())
