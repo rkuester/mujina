@@ -42,7 +42,7 @@ use tokio_util::sync::CancellationToken;
 struct DeviceProperties {
     vid: u16,
     pid: u16,
-    bcd_device: Option<u16>,
+    bcd_device: u16,
     serial_number: Option<String>,
     manufacturer: Option<String>,
     product: Option<String>,
@@ -137,11 +137,13 @@ impl LinuxUdevDiscovery {
         let pid = u16::from_str_radix(pid_str, 16)
             .with_context(|| format!("invalid PID '{}'", pid_str))?;
 
-        // Extract bcdDevice (device release number, optional) - 4 hex digits like "0500"
-        let bcd_device = device
+        // Extract bcdDevice (device release number) - 4 hex digits like "0500"
+        let bcd_device_str = device
             .attribute_value("bcdDevice")
             .and_then(|v| v.to_str())
-            .and_then(|s| u16::from_str_radix(s, 16).ok());
+            .ok_or_else(|| anyhow::anyhow!("missing bcdDevice attribute"))?;
+        let bcd_device = u16::from_str_radix(bcd_device_str, 16)
+            .with_context(|| format!("invalid bcdDevice '{}'", bcd_device_str))?;
 
         // Extract serial number (optional)
         let serial_number = device

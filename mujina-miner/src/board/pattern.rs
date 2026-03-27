@@ -97,17 +97,14 @@ pub enum BcdVersionMatch {
 
 impl BcdVersionMatch {
     /// Check if this matcher matches the given bcdDevice value.
-    pub fn matches(&self, bcd_device: Option<u16>) -> bool {
-        match bcd_device {
-            None => false,
-            Some(bcd) => match self {
-                BcdVersionMatch::Exact(expected) => bcd == *expected,
-                BcdVersionMatch::Major(major) => {
-                    // Extract major version (upper byte) from 0xJJMN
-                    let device_major = (bcd >> 8) as u8;
-                    device_major == *major
-                }
-            },
+    pub fn matches(&self, bcd_device: u16) -> bool {
+        match self {
+            BcdVersionMatch::Exact(expected) => bcd_device == *expected,
+            BcdVersionMatch::Major(major) => {
+                // Extract major version (upper byte) from 0xJJMN
+                let device_major = (bcd_device >> 8) as u8;
+                device_major == *major
+            }
         }
     }
 
@@ -565,7 +562,7 @@ mod tests {
     fn make_device_with_bcd(
         vid: u16,
         pid: u16,
-        bcd_device: Option<u16>,
+        bcd_device: u16,
         manufacturer: Option<&str>,
         product: Option<&str>,
         serial: Option<&str>,
@@ -594,15 +591,11 @@ mod tests {
         };
 
         // Exact match
-        let device = make_device_with_bcd(0x1234, 0x5678, Some(0x0500), None, None, None);
+        let device = make_device_with_bcd(0x1234, 0x5678, 0x0500, None, None, None);
         assert!(pattern.matches(&device));
 
         // Wrong bcdDevice
-        let device = make_device_with_bcd(0x1234, 0x5678, Some(0x0501), None, None, None);
-        assert!(!pattern.matches(&device));
-
-        // Missing bcdDevice
-        let device = make_device_with_bcd(0x1234, 0x5678, None, None, None, None);
+        let device = make_device_with_bcd(0x1234, 0x5678, 0x0501, None, None, None);
         assert!(!pattern.matches(&device));
     }
 
@@ -619,27 +612,23 @@ mod tests {
         };
 
         // 0x0500 = version 5.0.0
-        let device = make_device_with_bcd(0x1234, 0x5678, Some(0x0500), None, None, None);
+        let device = make_device_with_bcd(0x1234, 0x5678, 0x0500, None, None, None);
         assert!(pattern.matches(&device));
 
         // 0x0512 = version 5.1.2
-        let device = make_device_with_bcd(0x1234, 0x5678, Some(0x0512), None, None, None);
+        let device = make_device_with_bcd(0x1234, 0x5678, 0x0512, None, None, None);
         assert!(pattern.matches(&device));
 
         // 0x05FF = version 5.15.15 (max minor/patch)
-        let device = make_device_with_bcd(0x1234, 0x5678, Some(0x05FF), None, None, None);
+        let device = make_device_with_bcd(0x1234, 0x5678, 0x05FF, None, None, None);
         assert!(pattern.matches(&device));
 
         // 0x0400 = version 4.0.0 (wrong major)
-        let device = make_device_with_bcd(0x1234, 0x5678, Some(0x0400), None, None, None);
+        let device = make_device_with_bcd(0x1234, 0x5678, 0x0400, None, None, None);
         assert!(!pattern.matches(&device));
 
         // 0x0600 = version 6.0.0 (wrong major)
-        let device = make_device_with_bcd(0x1234, 0x5678, Some(0x0600), None, None, None);
-        assert!(!pattern.matches(&device));
-
-        // Missing bcdDevice
-        let device = make_device_with_bcd(0x1234, 0x5678, None, None, None, None);
+        let device = make_device_with_bcd(0x1234, 0x5678, 0x0600, None, None, None);
         assert!(!pattern.matches(&device));
     }
 
