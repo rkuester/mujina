@@ -18,7 +18,7 @@ use crate::{
     asic::hash_thread::HashThread,
     mgmt_protocol::{
         ControlChannel,
-        bitaxe_raw::{ResponseFormat, led::BitaxeRawLed, system},
+        bitaxe_raw::{DeviceVersion, ResponseFormat, led::BitaxeRawLed, system},
     },
     peripheral::led::{CalibratedLed, ColorProfile, Status, StatusLed},
     transport::UsbDeviceInfo,
@@ -40,14 +40,15 @@ inventory::submit! {
     }
 }
 
-/// Select response format based on firmware version in bcdDevice.
+/// Select response format based on firmware version.
 ///
 /// Firmware minor >= 1 uses v1 response format with explicit
 /// status byte. Older firmware uses v0.
-fn response_format(bcd_device: Option<u16>) -> ResponseFormat {
-    match bcd_device {
-        Some(bcd) if (bcd & 0x00F0) >= 0x0010 => ResponseFormat::V1,
-        _ => ResponseFormat::V0,
+fn response_format(version: &DeviceVersion) -> ResponseFormat {
+    if version.firmware_minor() >= 1 {
+        ResponseFormat::V1
+    } else {
+        ResponseFormat::V0
     }
 }
 
@@ -72,7 +73,8 @@ async fn create_from_usb(
     let control_port = tokio_serial::new(&serial_ports[0], 115200)
         .open_native_async()
         .context("failed to open control port")?;
-    let format = response_format(device.bcd_device);
+    let version = DeviceVersion::from_bcd(device.bcd_device);
+    let format = response_format(&version);
     let channel = ControlChannel::new(control_port, format);
 
     let led = BitaxeRawLed::new(channel.clone());
