@@ -8,7 +8,7 @@
 //! ## Platform Support
 //!
 //! - **Linux**: nusb (enumeration/hotplug) + udev (serial port lookup)
-//! - **macOS**: nusb (enumeration/hotplug), serial port lookup pending
+//! - **macOS**: nusb (enumeration/hotplug) + IOKit (serial port lookup)
 
 use std::collections::HashMap;
 
