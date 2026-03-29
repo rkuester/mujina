@@ -10,7 +10,6 @@
 //! - **macOS**: Stub implementation (IOKit support planned for future)
 
 use anyhow::Result;
-use std::sync::OnceLock;
 
 use crate::tracing::prelude::*;
 use tokio::sync::mpsc;
@@ -34,37 +33,31 @@ pub struct UsbDeviceInfo {
     pub product: Option<String>,
     /// USB device path (e.g., "/sys/bus/usb/devices/1-1.2")
     pub device_path: String,
-    /// Serial port device nodes associated with this USB device.
-    /// Lazily populated on first access via serial_ports() method.
-    /// Stores a Result so we can cache both success and failure.
-    pub(crate) serial_ports: OnceLock<Result<Vec<String>>>,
-    // Future: other interfaces like HID, mass storage, etc.
 }
 
 impl UsbDeviceInfo {
     /// Get serial ports associated with this USB device.
     ///
-    /// Scans for serial port device nodes (e.g., /dev/ttyACM0, /dev/ttyUSB0)
-    /// on first call and caches the result. Returns cached value on subsequent calls.
+    /// Waits for at least `expected` device nodes to appear and
+    /// become accessible, since serial ports may not be ready
+    /// immediately after a USB device is connected. The count is
+    /// needed because ports can appear incrementally and a partial
+    /// result is not useful. Returns an error if the count is not
+    /// reached after retries are exhausted.
     ///
-    /// This lazy approach avoids expensive serial port enumeration for devices
-    /// that won't be used (USB hubs, keyboards, etc.), only scanning when a board
-    /// implementation actually needs the serial ports.
-    pub fn serial_ports(&self) -> Result<&[String]> {
-        self.serial_ports
-            .get_or_init(|| {
-                #[cfg(target_os = "linux")]
-                {
-                    linux::find_serial_ports_for_device(&self.device_path)
-                }
-                #[cfg(not(target_os = "linux"))]
-                {
-                    Ok(vec![])
-                }
-            })
-            .as_ref()
-            .map(|v| v.as_slice())
-            .map_err(|e| anyhow::anyhow!("{}", e))
+    /// Only call this for devices expected to have serial ports,
+    /// since the retry logic makes it expensive for devices that
+    /// don't.
+    pub async fn get_serial_ports(&self, expected: usize) -> Result<Vec<String>> {
+        let ports = platform::find_serial_ports(&self.device_path, expected).await?;
+        anyhow::ensure!(
+            ports.len() == expected,
+            "expected {} serial ports at {}, found {}",
+            expected,
+            self.device_path,
+            ports.len()
+        );
+        Ok(ports)
     }
 }
 
@@ -79,7 +72,6 @@ impl Default for UsbDeviceInfo {
             manufacturer: None,
             product: None,
             device_path: String::new(),
-            serial_ports: OnceLock::new(),
         }
     }
 }
@@ -156,9 +148,26 @@ impl UsbTransport {
 // Platform-specific implementations
 #[cfg(target_os = "linux")]
 mod linux;
+#[cfg(target_os = "linux")]
+use linux as platform;
 
 #[cfg(target_os = "macos")]
 mod macos;
+#[cfg(target_os = "macos")]
+use macos as platform;
+
+// On unsupported platforms, serial port discovery is a stub so the
+// miner still compiles (e.g., for CPU mining). If this is ever
+// called, something has gone wrong because a board matched a USB
+// device on a platform where we can't find its serial ports.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+mod platform {
+    use anyhow::{Result, bail};
+
+    pub async fn find_serial_ports(_device_path: &str, _expected: usize) -> Result<Vec<String>> {
+        bail!("serial port discovery is not supported on this platform");
+    }
+}
 
 /// Internal trait for platform-specific USB discovery implementations.
 ///

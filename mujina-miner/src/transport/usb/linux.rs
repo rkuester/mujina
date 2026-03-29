@@ -30,7 +30,13 @@
 //! reconnections. This is critical for boards that expect a specific port for
 //! control vs data communication.
 
+use std::path::Path;
+use std::time::Duration;
+
 use anyhow::{Context, Result};
+use nix::unistd::{AccessFlags, access};
+use tokio::time::sleep;
+use udev::{Device, Enumerator};
 
 use super::{TransportEvent as UsbEvent, UsbDeviceInfo};
 use crate::{tracing::prelude::*, transport::TransportEvent};
@@ -48,57 +54,86 @@ struct DeviceProperties {
     product: Option<String>,
 }
 
-/// Find serial port devices (tty) associated with a USB device.
+/// Search for serial port devices (tty) associated with a USB
+/// device.
 ///
-/// Takes a USB device sysfs path (e.g., "/sys/devices/pci0000:00/...") and
-/// returns serial port device nodes (e.g., ["/dev/ttyACM0", "/dev/ttyACM1"]).
-/// Ports are sorted by device node name for consistent ordering.
+/// Retries until at least `expected` ports appear in sysfs and
+/// become accessible, since USB hotplug events arrive before the
+/// kernel has created tty children and before udev rules have set
+/// permissions. Returns an error if fewer than `expected` ports
+/// are found after retries are exhausted.
 ///
-/// This is a public function so UsbDeviceInfo can lazily scan for serial ports
-/// without needing access to the original udev::Device reference.
-pub(super) fn find_serial_ports_for_device(device_path: &str) -> Result<Vec<String>> {
-    let mut ports = Vec::new();
+/// Ports are sorted by device node name for consistent ordering
+/// across reconnections.
+pub async fn find_serial_ports(device_path: &str, expected: usize) -> Result<Vec<String>> {
+    const RETRIES: u32 = 20;
+    const DELAY: Duration = Duration::from_millis(100);
 
-    // Create an enumerator to find tty devices
-    let mut enumerator = udev::Enumerator::new().context("failed to create enumerator")?;
+    let path = device_path.to_string();
+    let mut best = vec![];
 
-    // Look for tty subsystem devices
-    enumerator
-        .match_subsystem("tty")
-        .context("failed to filter by subsystem")?;
+    for attempt in 0..RETRIES {
+        let p = path.clone();
+        let ports = tokio::task::spawn_blocking(move || -> Result<Vec<String>> {
+            let parent = Device::from_syspath(Path::new(&p))
+                .with_context(|| format!("failed to open USB device at {}", p))?;
 
-    // Scan all tty devices and check if they're children of our USB device
-    for tty_device in enumerator
-        .scan_devices()
-        .context("failed to scan devices")?
-    {
-        // Check if this tty device is a descendant of our USB device
-        // by walking up the parent chain
-        let mut current = Some(tty_device.clone());
-        let mut is_child = false;
+            let mut enumerator = Enumerator::new()?;
+            enumerator.match_subsystem("tty")?;
+            enumerator.match_parent(&parent)?;
 
-        while let Some(dev) = current {
-            if dev.syspath().to_str() == Some(device_path) {
-                is_child = true;
-                break;
+            let mut ports = Vec::new();
+            for tty_device in enumerator.scan_devices()? {
+                if let Some(devnode) = tty_device.devnode()
+                    && let Some(path_str) = devnode.to_str()
+                {
+                    ports.push(path_str.to_string());
+                }
             }
-            current = dev.parent();
+
+            if ports.is_empty() {
+                return Ok(vec![]);
+            }
+
+            // Verify that udev rules have set permissions.
+            // Use access(2) rather than opening the device, since
+            // opening a serial port can toggle DTR/RTS on some
+            // drivers.
+            let all_accessible = ports
+                .iter()
+                .all(|port| access(port.as_str(), AccessFlags::R_OK | AccessFlags::W_OK).is_ok());
+
+            if !all_accessible {
+                debug!(
+                    count = ports.len(),
+                    "serial ports found but not yet accessible"
+                );
+                return Ok(vec![]);
+            }
+
+            ports.sort();
+            Ok(ports)
+        })
+        .await??;
+
+        if ports.len() >= expected {
+            return Ok(ports);
         }
 
-        if is_child
-            && let Some(devnode) = tty_device.devnode()
-            && let Some(path_str) = devnode.to_str()
-        {
-            // Get the device node (e.g., /dev/ttyACM0)
-            ports.push(path_str.to_string());
+        if ports.len() > best.len() {
+            best = ports;
+        }
+
+        if attempt + 1 < RETRIES {
+            debug!(
+                attempt = attempt + 1,
+                device_path, "waiting for serial ports to become available"
+            );
+            sleep(DELAY).await;
         }
     }
 
-    // Sort ports by name for consistent ordering
-    // This ensures /dev/ttyACM0 comes before /dev/ttyACM1
-    ports.sort();
-
-    Ok(ports)
+    Ok(best)
 }
 
 /// Linux udev-based USB discovery implementation.
@@ -175,9 +210,10 @@ impl LinuxUdevDiscovery {
 
     /// Build a UsbDeviceInfo from a udev device.
     ///
-    /// Extracts basic device properties but does NOT scan for serial ports.
-    /// Serial ports are discovered lazily when UsbDeviceInfo::serial_ports()
-    /// is called, avoiding expensive enumeration for devices that won't be used.
+    /// Does not scan for serial ports; that is done later via
+    /// serial_ports() only for devices that matched a board pattern,
+    /// since the scan is expensive (retries until device nodes appear
+    /// and permissions are set).
     fn build_device_info(&self, device: &udev::Device) -> Result<UsbDeviceInfo> {
         // Extract basic device properties
         let props = self.extract_device_properties(device)?;
@@ -197,7 +233,6 @@ impl LinuxUdevDiscovery {
             manufacturer: props.manufacturer,
             product: props.product,
             device_path,
-            serial_ports: std::sync::OnceLock::new(),
         })
     }
 

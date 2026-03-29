@@ -86,13 +86,10 @@ fn response_format(version: &DeviceVersion) -> ResponseFormat {
 async fn create_from_usb(
     device: UsbDeviceInfo,
 ) -> Result<(Box<dyn Board + Send>, super::BoardRegistration)> {
-    let serial_ports = device.serial_ports()?;
-    if serial_ports.len() != 2 {
-        bail!(
-            "emberOne/00 requires exactly 2 serial ports, found {}",
-            serial_ports.len()
-        );
-    }
+    let serial_ports = device
+        .get_serial_ports(2)
+        .await
+        .context("emberOne/00 has 2 serial ports")?;
 
     debug!(
         serial = ?device.serial_number,

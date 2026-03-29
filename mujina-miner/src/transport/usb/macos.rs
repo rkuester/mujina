@@ -17,6 +17,13 @@ use crate::transport::TransportEvent;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+/// Search for serial ports associated with a USB device.
+///
+/// Not yet implemented on macOS.
+pub async fn find_serial_ports(_device_path: &str, _expected: usize) -> Result<Vec<String>> {
+    anyhow::bail!("serial port discovery is not yet implemented for macOS")
+}
+
 /// macOS IOKit-based USB discovery (stub).
 pub struct MacOsIoKitDiscovery;
 
