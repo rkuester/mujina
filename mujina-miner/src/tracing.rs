@@ -12,7 +12,7 @@ use time::OffsetDateTime;
 use tracing::field::{Field, Visit};
 use tracing::{Event, Level, Subscriber};
 use tracing_subscriber::{
-    filter::{EnvFilter, LevelFilter},
+    filter::EnvFilter,
     fmt::{
         FmtContext, FormatEvent, FormatFields,
         format::{DefaultFields, Writer as FmtWriter},
@@ -35,6 +35,22 @@ pub fn init() {
     if !journald::try_init() {
         init_stdout();
     }
+}
+
+/// Default log filter: WARN for third-party crates, INFO for ours.
+const DEFAULT_LOG_FILTER: &str = "warn,mujina_miner=info";
+
+/// Build an `EnvFilter` with our defaults, overridable by RUST_LOG.
+///
+/// EnvFilter has no API to add default per-target directives
+/// that RUST_LOG can override. Build a base string with our
+/// defaults and append RUST_LOG so its directives win.
+fn build_env_filter() -> EnvFilter {
+    let filter_str = match std::env::var("RUST_LOG") {
+        Ok(env) => format!("{DEFAULT_LOG_FILTER},{env}"),
+        Err(_) => DEFAULT_LOG_FILTER.to_string(),
+    };
+    filter_str.parse().unwrap()
 }
 
 #[cfg(target_os = "linux")]
@@ -115,13 +131,8 @@ mod journald {
     }
 }
 
-// Log to stdout, filtering according to environment variable RUST_LOG,
-// overriding the default level (ERROR) to INFO.
 fn init_stdout() {
-    let env_filter = EnvFilter::builder()
-        .with_default_directive(LevelFilter::INFO.into())
-        .with_env_var("RUST_LOG")
-        .from_env_lossy();
+    let env_filter = build_env_filter();
 
     tracing_subscriber::registry()
         .with(env_filter)
