@@ -10,11 +10,14 @@ use std::{
 use tokio::{
     io::{AsyncRead, ReadBuf},
     sync::{Mutex, watch},
-    time,
+    time::{self, Instant, MissedTickBehavior},
 };
 use tokio_serial::SerialPortBuilderExt;
 use tokio_stream::StreamExt;
-use tokio_util::codec::{FramedRead, FramedWrite};
+use tokio_util::{
+    codec::{FramedRead, FramedWrite},
+    sync::CancellationToken,
+};
 
 use crate::{
     api_client::types::{BoardTelemetry, Fan, PowerMeasurement, TemperatureSensor},
@@ -103,7 +106,7 @@ async fn create_from_usb(device: UsbDeviceInfo) -> Result<BackplaneConnector> {
     // Initialize peripherals
     i2c.set_frequency(100_000).await?;
 
-    let fan_controller = init_fan_controller(i2c.clone()).await?;
+    let emc2101 = init_fan_controller(i2c.clone()).await?;
     let regulator = Arc::new(Mutex::new(init_power_controller(i2c.clone()).await?));
 
     time::sleep(Duration::from_millis(500)).await;
@@ -184,10 +187,11 @@ async fn create_from_usb(device: UsbDeviceInfo) -> Result<BackplaneConnector> {
 
     // Telemetry channel seeded with board identity
     let serial = device.serial_number.clone();
+    let board_name = format!("bitaxe-{}", serial.as_deref().unwrap_or("unknown"));
     let initial_state = BoardTelemetry {
-        name: format!("bitaxe-{}", serial.as_deref().unwrap_or("unknown")),
+        name: board_name.clone(),
         model: "Bitaxe Gamma".into(),
-        serial,
+        serial: serial.clone(),
         ..Default::default()
     };
     let (telemetry_tx, telemetry_rx) = watch::channel(initial_state);
@@ -198,22 +202,23 @@ async fn create_from_usb(device: UsbDeviceInfo) -> Result<BackplaneConnector> {
         serial_number: device.serial_number.clone(),
     };
 
-    // Assemble internal state for the monitor and shutdown
-    let mut bitaxe = Bitaxe {
+    // Assemble internal state and spawn the board monitor
+    let bitaxe = Bitaxe {
         asic_nrst: reset_pin,
-        i2c,
-        fan_controller,
+        emc2101,
         regulator,
         thread_shutdown: thread_shutdown_tx,
-        stats_task_handle: None,
-        serial_number: device.serial_number,
-        telemetry_tx: Some(telemetry_tx),
+        board_name,
+        board_model: "Bitaxe Gamma",
+        board_serial: serial,
     };
 
-    bitaxe.spawn_stats_monitor();
+    let cancel = CancellationToken::new();
+    let monitor_handle = tokio::spawn(bitaxe.run_monitor(telemetry_tx, cancel.clone()));
 
     let shutdown = Box::pin(async move {
-        bitaxe.shutdown().await;
+        cancel.cancel();
+        let _ = monitor_handle.await;
     });
 
     Ok(BackplaneConnector {
@@ -224,210 +229,156 @@ async fn create_from_usb(device: UsbDeviceInfo) -> Result<BackplaneConnector> {
     })
 }
 
-/// Internal state for the board monitor and shutdown sequence.
+/// Internal state owned by the board monitor task.
 ///
-/// The factory moves this into a spawned task. It holds only what
-/// the stats monitor and graceful shutdown need.
+/// The factory assembles this and moves it into `run_monitor()`.
 struct Bitaxe {
     asic_nrst: BitaxeRawGpioPin,
-    i2c: BitaxeRawI2c,
-    fan_controller: Option<Emc2101<BitaxeRawI2c>>,
+    emc2101: Emc2101<BitaxeRawI2c>,
     regulator: Arc<Mutex<Tps546<BitaxeRawI2c>>>,
     thread_shutdown: watch::Sender<ThreadRemovalSignal>,
-    stats_task_handle: Option<tokio::task::JoinHandle<()>>,
-    serial_number: Option<String>,
-    /// Taken by `spawn_stats_monitor` which publishes periodic snapshots.
-    telemetry_tx: Option<watch::Sender<BoardTelemetry>>,
+    board_name: String,
+    board_model: &'static str,
+    board_serial: Option<String>,
 }
 
 impl Bitaxe {
-    fn board_info(&self) -> BoardInfo {
-        BoardInfo {
-            model: "Bitaxe Gamma".to_string(),
-            firmware_version: Some("bitaxe-raw".to_string()),
-            serial_number: self.serial_number.clone(),
+    async fn run_monitor(
+        mut self,
+        telemetry_tx: watch::Sender<BoardTelemetry>,
+        cancel: CancellationToken,
+    ) {
+        let mut tick = time::interval(Duration::from_secs(2));
+        tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        let mut last_log = Instant::now();
+
+        loop {
+            tokio::select! {
+                _ = tick.tick() => {
+                    self.monitor_tick(&telemetry_tx, &mut last_log).await;
+                }
+                _ = cancel.cancelled() => {
+                    self.shutdown().await;
+                    return;
+                }
+            }
+        }
+    }
+
+    async fn monitor_tick(&mut self, tx: &watch::Sender<BoardTelemetry>, last_log: &mut Instant) {
+        // Read all sensors in one pass
+        let asic_temp = self.emc2101.get_external_temperature().await.ok();
+        let fan_percent = self.emc2101.get_fan_speed().await.ok().map(u8::from);
+        let fan_rpm = self.emc2101.get_rpm().await.ok();
+
+        let (vin_mv, vout_mv, iout_ma, power_mw, vr_temp) = {
+            let mut reg = self.regulator.lock().await;
+
+            if let Err(e) = reg.check_status().await {
+                error!("Power controller fault: {}", e);
+                if let Err(e) = reg.clear_faults().await {
+                    error!("Failed to clear faults: {}", e);
+                }
+            }
+
+            (
+                reg.get_vin().await.ok(),
+                reg.get_vout().await.ok(),
+                reg.get_iout().await.ok(),
+                reg.get_power().await.ok(),
+                reg.get_temperature().await.ok(),
+            )
+        };
+
+        // Publish telemetry
+        let _ = tx.send(BoardTelemetry {
+            name: self.board_name.clone(),
+            model: self.board_model.into(),
+            serial: self.board_serial.clone(),
+            fans: vec![Fan {
+                name: "fan".into(),
+                rpm: fan_rpm,
+                percent: fan_percent,
+                target_percent: None,
+            }],
+            temperatures: vec![
+                TemperatureSensor {
+                    name: "asic".into(),
+                    temperature: asic_temp.map(Temperature::from_celsius),
+                },
+                TemperatureSensor {
+                    name: "vr".into(),
+                    temperature: vr_temp.map(|t| Temperature::from_celsius(t as f32)),
+                },
+            ],
+            powers: vec![
+                PowerMeasurement {
+                    name: "input".into(),
+                    voltage_v: vin_mv.map(|mv| mv as f32 / 1000.0),
+                    current_a: None,
+                    power_w: None,
+                },
+                PowerMeasurement {
+                    name: "core".into(),
+                    voltage_v: vout_mv.map(|mv| mv as f32 / 1000.0),
+                    current_a: iout_ma.map(|ma| ma as f32 / 1000.0),
+                    power_w: power_mw.map(|mw| mw as f32 / 1000.0),
+                },
+            ],
+            threads: Vec::new(), // TODO: populate from hash thread telemetry
+        });
+
+        // Periodic log
+        const LOG_INTERVAL: Duration = Duration::from_secs(30);
+        if last_log.elapsed() >= LOG_INTERVAL {
+            *last_log = Instant::now();
+            info!(
+                board = %self.board_model,
+                serial = ?self.board_serial,
+                asic_temp_c = ?asic_temp,
+                fan_percent = ?fan_percent,
+                fan_rpm = ?fan_rpm,
+                vr_temp_c = ?vr_temp,
+                power_w = ?power_mw.map(|mw| mw as f32 / 1000.0),
+                current_a = ?iout_ma.map(|ma| ma as f32 / 1000.0),
+                vin_v = ?vin_mv.map(|mv| mv as f32 / 1000.0),
+                vout_v = ?vout_mv.map(|mv| mv as f32 / 1000.0),
+                "Board status"
+            );
         }
     }
 
     async fn shutdown(&mut self) {
-        // Signal hash threads to shut down gracefully
         if let Err(e) = self.thread_shutdown.send(ThreadRemovalSignal::Shutdown) {
             warn!("Failed to send shutdown signal to threads: {}", e);
         } else {
             time::sleep(Duration::from_millis(200)).await;
         }
 
-        // Hold chips in reset
         if let Err(e) = self.asic_nrst.write(PinValue::Low).await {
             warn!("Failed to hold chips in reset: {}", e);
         }
 
-        // Turn off core voltage
         match self.regulator.lock().await.set_vout(0.0).await {
             Ok(()) => debug!("Core voltage turned off"),
             Err(e) => warn!("Failed to turn off core voltage: {}", e),
         }
 
-        // Reduce fan speed (no more heat generation)
-        if let Some(ref mut fan) = self.fan_controller {
-            let shutdown_speed = Percent::new_clamped(25);
-            if let Err(e) = fan.set_fan_speed(shutdown_speed).await {
-                warn!("Failed to set fan speed: {}", e);
-            }
+        let shutdown_speed = Percent::new_clamped(25);
+        if let Err(e) = self.emc2101.set_fan_speed(shutdown_speed).await {
+            warn!("Failed to set fan speed: {}", e);
         }
-
-        // Cancel the statistics monitoring task
-        if let Some(handle) = self.stats_task_handle.take() {
-            handle.abort();
-        }
-    }
-
-    /// Spawn a task to periodically log and publish board telemetry.
-    fn spawn_stats_monitor(&mut self) {
-        let i2c = self.i2c.clone();
-        let regulator = self.regulator.clone();
-
-        let board_info = self.board_info();
-        let board_name = format!(
-            "bitaxe-{}",
-            board_info.serial_number.as_deref().unwrap_or("unknown")
-        );
-        let board_model = board_info.model.clone();
-        let board_serial = board_info.serial_number.clone();
-
-        let telemetry_tx = self
-            .telemetry_tx
-            .take()
-            .expect("telemetry_tx must be present when spawning stats monitor");
-
-        let handle = tokio::spawn(async move {
-            const STATS_INTERVAL: Duration = Duration::from_secs(5);
-            let mut interval = time::interval(STATS_INTERVAL);
-            interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
-
-            let mut fan_ctrl = Emc2101::new(i2c);
-
-            const LOG_INTERVAL: Duration = Duration::from_secs(30);
-            let mut last_log = time::Instant::now();
-
-            // Discard first tick (fires immediately, ADC readings may not be settled)
-            interval.tick().await;
-
-            loop {
-                interval.tick().await;
-
-                let asic_temp = fan_ctrl.get_external_temperature().await.ok();
-                let fan_percent = fan_ctrl.get_fan_speed().await.ok().map(u8::from);
-                let fan_rpm = fan_ctrl.get_rpm().await.ok();
-
-                let (vin_mv, vout_mv, iout_ma, power_mw, vr_temp) = {
-                    let mut reg = regulator.lock().await;
-                    (
-                        reg.get_vin().await.ok(),
-                        reg.get_vout().await.ok(),
-                        reg.get_iout().await.ok(),
-                        reg.get_power().await.ok(),
-                        reg.get_temperature().await.ok(),
-                    )
-                };
-
-                if let Some(mv) = vout_mv {
-                    let volts = mv as f32 / 1000.0;
-                    if volts < 1.0 {
-                        warn!("Core voltage low: {:.3}V", volts);
-                    }
-                }
-
-                {
-                    let mut reg = regulator.lock().await;
-                    if let Err(e) = reg.check_status().await {
-                        error!("CRITICAL: Power controller fault detected: {}", e);
-
-                        warn!("Attempting to clear power controller faults...");
-                        if let Err(clear_err) = reg.clear_faults().await {
-                            error!("Failed to clear faults: {}", clear_err);
-                        }
-
-                        continue;
-                    }
-                }
-
-                let _ = telemetry_tx.send(BoardTelemetry {
-                    name: board_name.clone(),
-                    model: board_model.clone(),
-                    serial: board_serial.clone(),
-                    fans: vec![Fan {
-                        name: "fan".into(),
-                        rpm: fan_rpm,
-                        percent: fan_percent,
-                        target_percent: None,
-                    }],
-                    temperatures: vec![
-                        TemperatureSensor {
-                            name: "asic".into(),
-                            temperature: asic_temp.map(Temperature::from_celsius),
-                        },
-                        TemperatureSensor {
-                            name: "vr".into(),
-                            temperature: vr_temp.map(|t| Temperature::from_celsius(t as f32)),
-                        },
-                    ],
-                    powers: vec![
-                        PowerMeasurement {
-                            name: "input".into(),
-                            voltage_v: vin_mv.map(|mv| mv as f32 / 1000.0),
-                            current_a: None,
-                            power_w: None,
-                        },
-                        PowerMeasurement {
-                            name: "core".into(),
-                            voltage_v: vout_mv.map(|mv| mv as f32 / 1000.0),
-                            current_a: iout_ma.map(|ma| ma as f32 / 1000.0),
-                            power_w: power_mw.map(|mw| mw as f32 / 1000.0),
-                        },
-                    ],
-                    threads: Vec::new(),
-                });
-
-                if last_log.elapsed() >= LOG_INTERVAL {
-                    last_log = time::Instant::now();
-                    info!(
-                        board = %board_model,
-                        serial = ?board_serial,
-                        asic_temp_c = ?asic_temp,
-                        fan_percent = ?fan_percent,
-                        fan_rpm = ?fan_rpm,
-                        vr_temp_c = ?vr_temp,
-                        power_w = ?power_mw.map(|mw| mw as f32 / 1000.0),
-                        current_a = ?iout_ma.map(|ma| ma as f32 / 1000.0),
-                        vin_v = ?vin_mv.map(|mv| mv as f32 / 1000.0),
-                        vout_v = ?vout_mv.map(|mv| mv as f32 / 1000.0),
-                        "Board status."
-                    );
-                }
-            }
-        });
-
-        self.stats_task_handle = Some(handle);
     }
 }
 
-async fn init_fan_controller(i2c: BitaxeRawI2c) -> Result<Option<Emc2101<BitaxeRawI2c>>> {
+async fn init_fan_controller(i2c: BitaxeRawI2c) -> Result<Emc2101<BitaxeRawI2c>> {
     let mut fan = Emc2101::new(i2c);
-
-    match fan.init().await {
-        Ok(()) => {
-            match fan.set_fan_speed(Percent::FULL).await {
-                Ok(()) => debug!("Fan speed set to 100%"),
-                Err(e) => warn!("Failed to set fan speed: {}", e),
-            }
-            Ok(Some(fan))
-        }
-        Err(e) => {
-            warn!("Failed to initialize EMC2101 fan controller: {}", e);
-            Ok(None)
-        }
-    }
+    fan.init().await.context("EMC2101 init failed")?;
+    fan.set_fan_speed(Percent::FULL)
+        .await
+        .context("failed to set initial fan speed")?;
+    debug!("Fan speed set to 100%");
+    Ok(fan)
 }
 
 async fn init_power_controller(i2c: BitaxeRawI2c) -> Result<Tps546<BitaxeRawI2c>> {
@@ -514,9 +465,9 @@ async fn discover_chips(
 
     let mut chip_infos = Vec::new();
     let timeout = Duration::from_millis(500);
-    let deadline = time::Instant::now() + timeout;
+    let deadline = Instant::now() + timeout;
 
-    while time::Instant::now() < deadline {
+    while Instant::now() < deadline {
         tokio::select! {
             response = reader.next() => {
                 match response {
