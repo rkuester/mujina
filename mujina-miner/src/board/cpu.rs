@@ -1,7 +1,7 @@
-//! CPU mining board implementation.
+//! CPU hashboard implementation.
 //!
 //! Provides a virtual board that uses CPU cores for SHA-256 hashing.
-//! Configured via environment variables.
+//! See [`CpuMinerConfig`] for environment variable configuration.
 
 use anyhow::{Result, anyhow};
 use tokio::sync::watch;
@@ -13,36 +13,6 @@ use crate::{
     cpu_miner::{CpuHashThread, CpuMinerConfig},
 };
 
-/// Factory function for creating CpuBoard instances.
-async fn create_cpu_board() -> Result<BackplaneConnector> {
-    let config = CpuMinerConfig::from_env()
-        .ok_or_else(|| anyhow!("cpu miner not configured (MUJINA_CPU_MINER not set)"))?;
-
-    let serial = format!("cpu-{}x{}%", config.thread_count, config.duty_percent);
-    let initial_state = BoardTelemetry {
-        name: serial.clone(),
-        model: "CPU Miner".into(),
-        serial: Some(serial),
-        ..Default::default()
-    };
-    let (telemetry_tx, telemetry_rx) = watch::channel(initial_state);
-
-    let mut board = CpuBoard::new(config, telemetry_tx);
-    let threads = board.create_hash_threads();
-    let info = board.board_info();
-
-    let shutdown = Box::pin(async move {
-        board.shutdown();
-    });
-
-    Ok(BackplaneConnector {
-        info,
-        threads,
-        telemetry_rx,
-        shutdown: Some(shutdown),
-    })
-}
-
 inventory::submit! {
     VirtualBoardDescriptor {
         device_type: "cpu_miner",
@@ -51,58 +21,40 @@ inventory::submit! {
     }
 }
 
-/// CPU mining board.
-///
-/// A virtual board that spawns CPU-based mining threads. Unlike
-/// hardware boards, this doesn't require any physical devices.
-/// Configured entirely via environment variables.
-struct CpuBoard {
-    /// Configuration parsed from environment.
-    config: CpuMinerConfig,
+async fn create_cpu_board() -> Result<BackplaneConnector> {
+    let config = CpuMinerConfig::from_env()
+        .ok_or_else(|| anyhow!("cpu miner not configured (MUJINA_CPU_MINER not set)"))?;
 
-    /// Threads created by this board (kept for shutdown).
-    threads: Vec<CpuHashThread>,
+    let info = BoardInfo {
+        model: "CPU Miner".into(),
+        firmware_version: None,
+        serial_number: Some(format!(
+            "cpu-{}x{}%",
+            config.thread_count, config.duty_percent
+        )),
+    };
 
-    /// Channel for publishing board telemetry to the API server.
-    #[expect(dead_code, reason = "will publish telemetry in a follow-up commit")]
-    telemetry_tx: watch::Sender<BoardTelemetry>,
-}
+    let initial_state = BoardTelemetry {
+        name: info.serial_number.clone().unwrap(),
+        model: info.model.clone(),
+        serial: info.serial_number.clone(),
+        ..Default::default()
+    };
+    let (_telemetry_tx, telemetry_rx) = watch::channel(initial_state);
 
-impl CpuBoard {
-    fn new(config: CpuMinerConfig, telemetry_tx: watch::Sender<BoardTelemetry>) -> Self {
-        Self {
-            config,
-            threads: Vec::new(),
-            telemetry_tx,
-        }
-    }
+    let threads: Vec<Box<dyn HashThread>> = (0..config.thread_count)
+        .map(|i| {
+            Box::new(CpuHashThread::new(
+                format!("CPU Core {i}"),
+                config.duty_percent,
+            )) as _
+        })
+        .collect();
 
-    fn board_info(&self) -> BoardInfo {
-        BoardInfo {
-            model: "CPU Miner".into(),
-            firmware_version: None,
-            serial_number: Some(format!(
-                "cpu-{}x{}%",
-                self.config.thread_count, self.config.duty_percent
-            )),
-        }
-    }
-
-    fn shutdown(&mut self) {
-        for thread in &self.threads {
-            thread.shutdown();
-        }
-        self.threads.clear();
-    }
-
-    fn create_hash_threads(&mut self) -> Vec<Box<dyn HashThread>> {
-        let mut threads: Vec<Box<dyn HashThread>> = Vec::new();
-
-        for i in 0..self.config.thread_count {
-            let thread = CpuHashThread::new(format!("CPU Core {}", i), self.config.duty_percent);
-            threads.push(Box::new(thread));
-        }
-
-        threads
-    }
+    Ok(BackplaneConnector {
+        info,
+        threads,
+        telemetry_rx,
+        shutdown: None,
+    })
 }
