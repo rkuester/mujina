@@ -911,6 +911,99 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_pll_calculations_match_reference() {
+        // Test cases from the Bitaxe Gamma protocol capture
+        // Format: (freq_mhz, expected_flag, expected_fb_div, expected_ref_div, expected_post_div)
+        let test_cases = vec![
+            (62.50, 0x50, 0xD2, 0x02, 0x65),
+            (68.75, 0x50, 0xE7, 0x02, 0x65),
+            (75.00, 0x50, 0xD2, 0x02, 0x64),
+            (81.25, 0x50, 0xE4, 0x02, 0x64),
+            (87.50, 0x50, 0xC4, 0x02, 0x63),
+            (93.75, 0x50, 0xD2, 0x02, 0x63),
+            (100.00, 0x50, 0xE0, 0x02, 0x63),
+            (525.00, 0x50, 0xD2, 0x02, 0x40),
+        ];
+
+        for (freq_mhz, expected_flag, expected_fb, expected_ref, expected_post) in test_cases {
+            let config = calculate_pll_for_frequency(freq_mhz)
+                .unwrap_or_else(|| panic!("Failed to calculate PLL for {} MHz", freq_mhz));
+
+            assert_eq!(
+                config.flag, expected_flag,
+                "Flag mismatch for {} MHz: expected 0x{:02X}, got 0x{:02X}",
+                freq_mhz, expected_flag, config.flag
+            );
+            assert_eq!(
+                config.fb_div, expected_fb,
+                "FB divider mismatch for {} MHz: expected 0x{:02X}, got 0x{:02X}",
+                freq_mhz, expected_fb, config.fb_div
+            );
+            assert_eq!(
+                config.ref_div, expected_ref,
+                "Ref divider mismatch for {} MHz: expected {}, got {}",
+                freq_mhz, expected_ref, config.ref_div
+            );
+            assert_eq!(
+                config.post_div, expected_post,
+                "Post divider mismatch for {} MHz: expected 0x{:02X}, got 0x{:02X}",
+                freq_mhz, expected_post, config.post_div
+            );
+
+            let post_div1 = ((config.post_div >> 4) & 0xF) + 1;
+            let post_div2 = (config.post_div & 0xF) + 1;
+            let calculated_freq =
+                25.0 * config.fb_div as f32 / (config.ref_div * post_div1 * post_div2) as f32;
+            assert!(
+                (calculated_freq - freq_mhz).abs() < 1.0,
+                "Frequency calculation error for {} MHz: calculated {} MHz",
+                freq_mhz,
+                calculated_freq
+            );
+        }
+    }
+
+    #[test]
+    fn test_frequency_ramp_generation() {
+        let steps = generate_frequency_ramp_steps(56.25, 525.0, 6.25);
+
+        // (525 - 56.25) / 6.25 + 1 = 76 steps
+        assert_eq!(steps.len(), 76, "Expected 76 frequency steps");
+
+        if let Some(first) = steps.first() {
+            let post_div1 = ((first.post_div >> 4) & 0xF) + 1;
+            let post_div2 = (first.post_div & 0xF) + 1;
+            let first_freq =
+                25.0 * first.fb_div as f32 / (first.ref_div * post_div1 * post_div2) as f32;
+            assert!(
+                (first_freq - 56.25).abs() < 1.0,
+                "First frequency should be ~56.25 MHz"
+            );
+        }
+
+        if let Some(last) = steps.last() {
+            let post_div1 = ((last.post_div >> 4) & 0xF) + 1;
+            let post_div2 = (last.post_div & 0xF) + 1;
+            let last_freq =
+                25.0 * last.fb_div as f32 / (last.ref_div * post_div1 * post_div2) as f32;
+            assert!(
+                (last_freq - 525.0).abs() < 1.0,
+                "Last frequency should be ~525 MHz"
+            );
+        }
+    }
+
+    #[test]
+    fn test_pll_flag_setting() {
+        // Flag is 0x50 when VCO frequency >= 2400 MHz, 0x40 otherwise
+        let low_freq = calculate_pll_for_frequency(100.0).unwrap();
+        assert_eq!(low_freq.flag, 0x50, "Should have 0x50 flag for 100 MHz");
+
+        let high_freq = calculate_pll_for_frequency(525.0).unwrap();
+        assert_eq!(high_freq.flag, 0x50, "Should have 0x50 flag for 525 MHz");
+    }
+
+    #[test]
     fn test_task_to_job_full_converts_high_level_types() {
         use crate::asic::bm13xx::test_data::esp_miner_job;
         use crate::job_source::{
