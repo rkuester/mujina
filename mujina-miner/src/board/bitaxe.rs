@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use futures::sink::SinkExt;
 use std::{
     pin::Pin,
-    sync::Arc,
+    sync::{Arc, Mutex as StdMutex},
     task::{Context, Poll},
     time::Duration,
 };
@@ -24,7 +24,7 @@ use crate::{
     asic::{
         ChipInfo,
         bm13xx::{self, BM13xxProtocol, protocol::Command, thread::BM13xxThread},
-        hash_thread::{BoardPeripherals, HashThread, ThreadRemovalSignal},
+        hash_thread::{AsicEnable, BoardPeripherals, HashThread, ThreadRemovalSignal},
     },
     hw_trait::{
         gpio::{Gpio, GpioPin, PinValue},
@@ -167,8 +167,10 @@ async fn create_from_usb(device: UsbDeviceInfo) -> Result<BackplaneConnector> {
     };
 
     let asic_enable = BitaxeAsicEnable {
-        nrst_pin: reset_pin.clone(),
+        nrst_pin: reset_pin,
+        enabled_since: Arc::new(StdMutex::new(None)),
     };
+    let asic_enable_monitor = asic_enable.clone();
     let peripherals = BoardPeripherals {
         asic_enable: Some(Box::new(asic_enable)),
         voltage_regulator: None,
@@ -192,7 +194,37 @@ async fn create_from_usb(device: UsbDeviceInfo) -> Result<BackplaneConnector> {
         name: board_name.clone(),
         model: "Bitaxe Gamma".into(),
         serial: serial.clone(),
-        ..Default::default()
+        fans: vec![Fan {
+            name: "fan".into(),
+            rpm: None,
+            percent: None,
+            target_percent: None,
+        }],
+        temperatures: vec![
+            TemperatureSensor {
+                name: "asic".into(),
+                temperature: None,
+            },
+            TemperatureSensor {
+                name: "vr".into(),
+                temperature: None,
+            },
+        ],
+        powers: vec![
+            PowerMeasurement {
+                name: "input".into(),
+                voltage_v: None,
+                current_a: None,
+                power_w: None,
+            },
+            PowerMeasurement {
+                name: "core".into(),
+                voltage_v: None,
+                current_a: None,
+                power_w: None,
+            },
+        ],
+        threads: Vec::new(), // TODO: populate from hash thread telemetry
     };
     let (telemetry_tx, telemetry_rx) = watch::channel(initial_state);
 
@@ -204,13 +236,12 @@ async fn create_from_usb(device: UsbDeviceInfo) -> Result<BackplaneConnector> {
 
     // Assemble internal state and spawn the board monitor
     let bitaxe = Bitaxe {
-        asic_nrst: reset_pin,
         emc2101,
         regulator,
         thread_shutdown: thread_shutdown_tx,
-        board_name,
         board_model: "Bitaxe Gamma",
         board_serial: serial,
+        asic_enable: asic_enable_monitor,
     };
 
     let cancel = CancellationToken::new();
@@ -233,13 +264,12 @@ async fn create_from_usb(device: UsbDeviceInfo) -> Result<BackplaneConnector> {
 ///
 /// The factory assembles this and moves it into `run_monitor()`.
 struct Bitaxe {
-    asic_nrst: BitaxeRawGpioPin,
     emc2101: Emc2101<BitaxeRawI2c>,
     regulator: Arc<Mutex<Tps546<BitaxeRawI2c>>>,
     thread_shutdown: watch::Sender<ThreadRemovalSignal>,
-    board_name: String,
     board_model: &'static str,
     board_serial: Option<String>,
+    asic_enable: BitaxeAsicEnable,
 }
 
 impl Bitaxe {
@@ -267,7 +297,7 @@ impl Bitaxe {
 
     async fn monitor_tick(&mut self, tx: &watch::Sender<BoardTelemetry>, last_log: &mut Instant) {
         // Read all sensors in one pass
-        let asic_temp = self.emc2101.get_external_temperature().await.ok();
+        let raw_temp = self.emc2101.get_external_temperature().await.ok();
         let fan_percent = self.emc2101.get_fan_speed().await.ok().map(u8::from);
         let fan_rpm = self.emc2101.get_rpm().await.ok();
 
@@ -290,42 +320,27 @@ impl Bitaxe {
             )
         };
 
-        // Publish telemetry
-        let _ = tx.send(BoardTelemetry {
-            name: self.board_name.clone(),
-            model: self.board_model.into(),
-            serial: self.board_serial.clone(),
-            fans: vec![Fan {
-                name: "fan".into(),
-                rpm: fan_rpm,
-                percent: fan_percent,
-                target_percent: None,
-            }],
-            temperatures: vec![
-                TemperatureSensor {
-                    name: "asic".into(),
-                    temperature: asic_temp.map(Temperature::from_celsius),
-                },
-                TemperatureSensor {
-                    name: "vr".into(),
-                    temperature: vr_temp.map(|t| Temperature::from_celsius(t as f32)),
-                },
-            ],
-            powers: vec![
-                PowerMeasurement {
-                    name: "input".into(),
-                    voltage_v: vin_mv.map(|mv| mv as f32 / 1000.0),
-                    current_a: None,
-                    power_w: None,
-                },
-                PowerMeasurement {
-                    name: "core".into(),
-                    voltage_v: vout_mv.map(|mv| mv as f32 / 1000.0),
-                    current_a: iout_ma.map(|ma| ma as f32 / 1000.0),
-                    power_w: power_mw.map(|mw| mw as f32 / 1000.0),
-                },
-            ],
-            threads: Vec::new(), // TODO: populate from hash thread telemetry
+        // The EMC2101 measures temperature via a diode on the ASIC
+        // die. When the ASIC comes out of reset, the resulting
+        // electrical transient corrupts the first few ADC conversions.
+        // Wait for the measurement to settle before trusting readings.
+        const DIODE_SETTLE: Duration = Duration::from_millis(500);
+        let diode_ready = self
+            .asic_enable
+            .enabled_since()
+            .is_some_and(|since| since.elapsed() >= DIODE_SETTLE);
+        let asic_temp = if diode_ready { raw_temp } else { None };
+
+        // Update telemetry with current readings
+        tx.send_modify(|t| {
+            t.fans[0].rpm = fan_rpm;
+            t.fans[0].percent = fan_percent;
+            t.temperatures[0].temperature = asic_temp.map(Temperature::from_celsius);
+            t.temperatures[1].temperature = vr_temp.map(|t| Temperature::from_celsius(t as f32));
+            t.powers[0].voltage_v = vin_mv.map(|mv| mv as f32 / 1000.0);
+            t.powers[1].voltage_v = vout_mv.map(|mv| mv as f32 / 1000.0);
+            t.powers[1].current_a = iout_ma.map(|ma| ma as f32 / 1000.0);
+            t.powers[1].power_w = power_mw.map(|mw| mw as f32 / 1000.0);
         });
 
         // Periodic log
@@ -355,7 +370,7 @@ impl Bitaxe {
             time::sleep(Duration::from_millis(200)).await;
         }
 
-        if let Err(e) = self.asic_nrst.write(PinValue::Low).await {
+        if let Err(e) = self.asic_enable.disable().await {
             warn!("Failed to hold chips in reset: {}", e);
         }
 
@@ -507,25 +522,40 @@ async fn discover_chips(
     Ok(chip_infos)
 }
 
-/// Adapter implementing `AsicEnable` for Bitaxe's GPIO-based reset control.
+/// GPIO-based ASIC reset control that records when the ASIC was
+/// last enabled.
+#[derive(Clone)]
 struct BitaxeAsicEnable {
     nrst_pin: BitaxeRawGpioPin,
+    enabled_since: Arc<StdMutex<Option<Instant>>>,
+}
+
+impl BitaxeAsicEnable {
+    /// When the ASIC was last taken out of reset, or `None` if it
+    /// is currently in reset. Safe to call from another task.
+    fn enabled_since(&self) -> Option<Instant> {
+        *self.enabled_since.lock().expect("enabled_since lock")
+    }
 }
 
 #[async_trait]
-impl crate::asic::hash_thread::AsicEnable for BitaxeAsicEnable {
+impl AsicEnable for BitaxeAsicEnable {
     async fn enable(&mut self) -> Result<()> {
         self.nrst_pin
             .write(PinValue::High)
             .await
-            .map_err(|e| anyhow!("failed to release reset: {}", e))
+            .map_err(|e| anyhow!("failed to release reset: {}", e))?;
+        *self.enabled_since.lock().expect("enabled_since lock") = Some(Instant::now());
+        Ok(())
     }
 
     async fn disable(&mut self) -> Result<()> {
         self.nrst_pin
             .write(PinValue::Low)
             .await
-            .map_err(|e| anyhow!("failed to assert reset: {}", e))
+            .map_err(|e| anyhow!("failed to assert reset: {}", e))?;
+        *self.enabled_since.lock().expect("enabled_since lock") = None;
+        Ok(())
     }
 }
 
