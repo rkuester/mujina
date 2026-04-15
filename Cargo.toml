@@ -1,5 +1,5 @@
 [workspace]
-members = ["mujina-miner", "tools/mujina-dissect"]
+members = ["mujina-miner"]
 resolver = "2"
 
 [workspace.package]
