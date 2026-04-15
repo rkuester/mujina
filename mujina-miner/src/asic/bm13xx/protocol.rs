@@ -2,12 +2,6 @@
 //!
 //! This module handles the encoding and decoding of commands and responses
 //! for BM13xx family chips (BM1366, BM1370, etc).
-//!
-//! TODO: Remove redundancy in BM13xx protocol implementation
-//! - Consolidate CRC validation logic between decoder and dissector code paths
-//! - Extract common frame parsing utilities to reduce duplication
-//! - Consider shared frame validation traits/interfaces
-//! - Unify endianness handling across different frame types
 
 use bitcoin::hashes::Hash;
 use bitcoin::pow::Work;
