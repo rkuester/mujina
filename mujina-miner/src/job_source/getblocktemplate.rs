@@ -18,17 +18,21 @@ use serde_json::json;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+use bitcoin::hash_types::TxMerkleNode;
+
+use self::block::assemble_block;
 use self::coinbase::{CoinbaseSplit, build_coinbase, compute_merkle_branches};
 use self::config::GbtConfig;
 use self::rpc::RpcClient;
 use self::template::{GbtResponse, ParsedTemplate};
 use super::{
-    Extranonce2Range, GeneralPurposeBits, JobTemplate, MerkleRootKind, MerkleRootTemplate,
+    Extranonce2Range, GeneralPurposeBits, JobTemplate, MerkleRootKind, MerkleRootTemplate, Share,
     SourceCommand, SourceEvent, VersionTemplate,
 };
 use crate::tracing::prelude::*;
 use crate::types::HashRate;
 
+pub mod block;
 pub mod coinbase;
 pub mod config;
 pub mod rpc;
@@ -58,12 +62,13 @@ pub struct GbtSource {
 
 /// Per-template bookkeeping kept alongside the source.
 ///
-/// Held so a future `SubmitShare` handler can reconstruct the block
-/// from the share; commit 4 fills in that path.
-#[allow(dead_code)]
+/// Held so the [`SubmitShare`](SourceCommand::SubmitShare) handler
+/// can reconstruct the block from the share without re-fetching the
+/// template.
 struct TemplateState {
     template: Arc<ParsedTemplate>,
     coinbase: CoinbaseSplit,
+    merkle_branches: Vec<TxMerkleNode>,
     job_id: String,
 }
 
@@ -242,7 +247,7 @@ impl GbtSource {
                 extranonce1: coinbase.extranonce1.clone(),
                 extranonce2_range: Extranonce2Range::new(self.config.extranonce2_size)?,
                 coinbase2: coinbase.coinbase2.clone(),
-                merkle_branches,
+                merkle_branches: merkle_branches.clone(),
             }),
         };
 
@@ -250,6 +255,7 @@ impl GbtSource {
         self.current = Some(TemplateState {
             template: parsed,
             coinbase,
+            merkle_branches,
             job_id,
         });
 
@@ -257,21 +263,73 @@ impl GbtSource {
         Ok(new_lpid)
     }
 
-    /// Handle a command that arrives while not actively submitting.
-    ///
-    /// `SubmitShare` is a stub for now; commit 4 wires it through to
-    /// `submitblock`.
+    /// Handle a command that arrives during the long-poll wait or
+    /// the inter-fetch sleep. `SubmitShare` spawns the actual
+    /// `submitblock` call as a separate task so the source's main
+    /// loop keeps responding to events.
     fn handle_command(&mut self, cmd: SourceCommand) {
         match cmd {
             SourceCommand::UpdateHashRate(rate) => self.expected_hashrate = rate,
-            SourceCommand::SubmitShare(share) => {
-                debug!(
-                    job_id = %share.job_id,
-                    nonce = format!("{:#x}", share.nonce),
-                    "Share dropped (submit_block path arrives in a later commit)"
-                );
-            }
+            SourceCommand::SubmitShare(share) => self.spawn_submit(share),
         }
+    }
+
+    fn spawn_submit(&self, share: Share) {
+        let Some(state) = self.current.as_ref() else {
+            warn!(
+                job_id = %share.job_id,
+                "Share arrived without an active template; dropping"
+            );
+            return;
+        };
+        if state.job_id != share.job_id {
+            warn!(
+                share_job = %share.job_id,
+                current_job = %state.job_id,
+                "Share for stale job; dropping"
+            );
+            return;
+        }
+
+        let block_hex = match assemble_block(
+            &state.template,
+            &state.coinbase,
+            &state.merkle_branches,
+            &share,
+        ) {
+            Ok(hex) => hex,
+            Err(e) => {
+                error!(
+                    job_id = %share.job_id,
+                    error = %e,
+                    "Failed to assemble block"
+                );
+                return;
+            }
+        };
+
+        let rpc = self.rpc.clone();
+        let job_id = share.job_id.clone();
+        info!(
+            job_id = %job_id,
+            nonce = format!("{:#x}", share.nonce),
+            "Submitting block to node"
+        );
+        tokio::spawn(async move {
+            match rpc.submit_block(&block_hex).await {
+                Ok(None) => info!(job_id = %job_id, "Block accepted by node"),
+                Ok(Some(reason)) => warn!(
+                    job_id = %job_id,
+                    reason = %reason,
+                    "Block rejected by node"
+                ),
+                Err(e) => error!(
+                    job_id = %job_id,
+                    error = %e,
+                    "submitblock RPC failed"
+                ),
+            }
+        });
     }
 }
 
