@@ -9,6 +9,7 @@
 //! warrants special handling.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use parking_lot::RwLock;
 use reqwest::{Client, StatusCode};
@@ -66,7 +67,15 @@ pub enum RpcAuth {
 }
 
 /// JSON-RPC client for `bitcoind`.
+///
+/// Cheap to clone: the inner state is shared via `Arc`, so multiple
+/// callers share a single connection pool and credential cache.
+#[derive(Clone)]
 pub struct RpcClient {
+    inner: Arc<RpcInner>,
+}
+
+struct RpcInner {
     http: Client,
     url: String,
     auth: RpcAuth,
@@ -79,10 +88,12 @@ impl RpcClient {
     /// `url` is the node's RPC endpoint, e.g. `http://127.0.0.1:8332`.
     pub fn new(url: String, auth: RpcAuth) -> Self {
         Self {
-            http: Client::new(),
-            url,
-            auth,
-            cached: RwLock::new(None),
+            inner: Arc::new(RpcInner {
+                http: Client::new(),
+                url,
+                auth,
+                cached: RwLock::new(None),
+            }),
         }
     }
 
@@ -103,8 +114,9 @@ impl RpcClient {
         for force_refresh in [false, true] {
             let (user, pass) = self.resolve_auth(force_refresh).await?;
             let resp = self
+                .inner
                 .http
-                .post(&self.url)
+                .post(&self.inner.url)
                 .basic_auth(user, Some(pass))
                 .json(&body)
                 .send()
@@ -137,11 +149,11 @@ impl RpcClient {
 
     /// Resolve auth to (user, pass), reading the cookie file if needed.
     async fn resolve_auth(&self, force_refresh: bool) -> Result<(String, String), RpcError> {
-        if !force_refresh && let Some(cached) = self.cached.read().clone() {
+        if !force_refresh && let Some(cached) = self.inner.cached.read().clone() {
             return Ok(cached);
         }
 
-        let resolved = match &self.auth {
+        let resolved = match &self.inner.auth {
             RpcAuth::UserPass { user, pass } => (user.clone(), pass.clone()),
             RpcAuth::Cookie(path) => {
                 let contents =
@@ -159,7 +171,7 @@ impl RpcClient {
             }
         };
 
-        *self.cached.write() = Some(resolved.clone());
+        *self.inner.cached.write() = Some(resolved.clone());
         Ok(resolved)
     }
 }

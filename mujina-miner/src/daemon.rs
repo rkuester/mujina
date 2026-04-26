@@ -20,6 +20,7 @@ use crate::{
         SourceCommand, SourceEvent,
         dummy::DummySource,
         forced_rate::{ForcedRateConfig, ForcedRateSource},
+        getblocktemplate::{GbtSource, config::GbtConfig},
         stratum_v1::StratumV1Source,
     },
     scheduler::{self, SourceRegistration},
@@ -100,91 +101,32 @@ impl Daemon {
             }
         });
 
-        // Create job source (Stratum v1 or Dummy)
+        // Create job source (Stratum v1, getblocktemplate, or Dummy)
         // Controlled by environment variables:
-        // - MUJINA_POOL_URL: Pool address (e.g., stratum+tcp://localhost:3333)
-        // - MUJINA_POOL_USER: Worker username (optional, defaults to "mujina-testing")
-        // - MUJINA_POOL_PASS: Worker password (optional, defaults to "x")
+        // - MUJINA_POOL_URL: Pool/node address. The URL scheme picks the
+        //   protocol:
+        //     stratum+tcp:// | stratum:// | tcp://  -> Stratum v1
+        //     http://       | https://             -> Bitcoin Core
+        //                                             getblocktemplate
+        // - MUJINA_POOL_USER: Worker username (optional, defaults to
+        //   "mujina-testing"); reused as HTTP-Basic user for the
+        //   getblocktemplate path.
+        // - MUJINA_POOL_PASS: Worker password (optional, defaults to "x").
         let (source_event_tx, source_event_rx) = mpsc::channel::<SourceEvent>(100);
         let (source_cmd_tx, source_cmd_rx) = mpsc::channel(10);
 
         if let Ok(pool_url) = env::var("MUJINA_POOL_URL") {
-            // Use Stratum v1 source
-            let pool_user =
-                env::var("MUJINA_POOL_USER").unwrap_or_else(|_| "mujina-testing".to_string());
-            let pool_pass = env::var("MUJINA_POOL_PASS").unwrap_or_else(|_| "x".to_string());
-
-            let stratum_config = StratumPoolConfig {
-                url: pool_url.clone(),
-                username: pool_user,
-                password: pool_pass,
-                user_agent: "mujina-miner/0.1.0-alpha".to_string(),
-            };
-
-            // Optionally wrap with ForcedRateSource for testing
-            if let Some(forced_rate_config) = ForcedRateConfig::from_env() {
-                info!(
-                    rate = %forced_rate_config.target_rate,
-                    "Forced share rate wrapper enabled"
-                );
-
-                // Create inner channels (stratum <-> wrapper)
-                let (inner_event_tx, inner_event_rx) = mpsc::channel::<SourceEvent>(100);
-                let (inner_cmd_tx, inner_cmd_rx) = mpsc::channel::<SourceCommand>(10);
-
-                let stratum_source = StratumV1Source::new(
-                    stratum_config,
-                    inner_cmd_rx,
-                    inner_event_tx,
-                    self.shutdown.clone(),
-                    Box::new(TcpConnector::new(pool_url.clone())),
-                );
-                let stratum_name = stratum_source.name();
-
-                // Spawn stratum source
-                self.tracker.spawn(async move {
-                    if let Err(e) = stratum_source.run().await {
-                        error!("Stratum v1 source error: {}", e);
-                    }
-                });
-
-                // Create and spawn wrapper (uses outer channels from above)
-                let forced_rate = ForcedRateSource::new(
-                    forced_rate_config,
-                    inner_event_rx,
-                    source_event_tx,
-                    inner_cmd_tx,
-                    source_cmd_rx,
-                    self.shutdown.clone(),
-                );
+            if is_http_scheme(&pool_url) {
+                // getblocktemplate path. Network is fixed to mainnet
+                // for now; auto-detection lands in a later commit.
+                let cfg = GbtConfig::from_env(pool_url.clone(), bitcoin::Network::Bitcoin)?;
+                let source =
+                    GbtSource::new(cfg, source_cmd_rx, source_event_tx, self.shutdown.clone());
+                let name = source.name();
 
                 source_reg_tx
                     .send(SourceRegistration {
-                        name: format!("{} (forced-rate)", stratum_name),
-                        url: Some(pool_url.clone()),
-                        event_rx: source_event_rx,
-                        command_tx: source_cmd_tx,
-                    })
-                    .await?;
-
-                self.tracker.spawn(async move {
-                    if let Err(e) = forced_rate.run().await {
-                        error!("Forced rate wrapper error: {}", e);
-                    }
-                });
-            } else {
-                // Direct stratum source (no wrapper)
-                let stratum_source = StratumV1Source::new(
-                    stratum_config,
-                    source_cmd_rx,
-                    source_event_tx,
-                    self.shutdown.clone(),
-                    Box::new(TcpConnector::new(pool_url.clone())),
-                );
-
-                source_reg_tx
-                    .send(SourceRegistration {
-                        name: stratum_source.name(),
+                        name,
                         url: Some(pool_url),
                         event_rx: source_event_rx,
                         command_tx: source_cmd_tx,
@@ -192,14 +134,98 @@ impl Daemon {
                     .await?;
 
                 self.tracker.spawn(async move {
-                    if let Err(e) = stratum_source.run().await {
-                        error!("Stratum v1 source error: {}", e);
+                    if let Err(e) = source.run().await {
+                        error!("getblocktemplate source error: {}", e);
                     }
                 });
+            } else {
+                // Stratum v1 path.
+                let pool_user =
+                    env::var("MUJINA_POOL_USER").unwrap_or_else(|_| "mujina-testing".to_string());
+                let pool_pass = env::var("MUJINA_POOL_PASS").unwrap_or_else(|_| "x".to_string());
+
+                let stratum_config = StratumPoolConfig {
+                    url: pool_url.clone(),
+                    username: pool_user,
+                    password: pool_pass,
+                    user_agent: "mujina-miner/0.1.0-alpha".to_string(),
+                };
+
+                if let Some(forced_rate_config) = ForcedRateConfig::from_env() {
+                    info!(
+                        rate = %forced_rate_config.target_rate,
+                        "Forced share rate wrapper enabled"
+                    );
+
+                    let (inner_event_tx, inner_event_rx) = mpsc::channel::<SourceEvent>(100);
+                    let (inner_cmd_tx, inner_cmd_rx) = mpsc::channel::<SourceCommand>(10);
+
+                    let stratum_source = StratumV1Source::new(
+                        stratum_config,
+                        inner_cmd_rx,
+                        inner_event_tx,
+                        self.shutdown.clone(),
+                        Box::new(TcpConnector::new(pool_url.clone())),
+                    );
+                    let stratum_name = stratum_source.name();
+
+                    self.tracker.spawn(async move {
+                        if let Err(e) = stratum_source.run().await {
+                            error!("Stratum v1 source error: {}", e);
+                        }
+                    });
+
+                    let forced_rate = ForcedRateSource::new(
+                        forced_rate_config,
+                        inner_event_rx,
+                        source_event_tx,
+                        inner_cmd_tx,
+                        source_cmd_rx,
+                        self.shutdown.clone(),
+                    );
+
+                    source_reg_tx
+                        .send(SourceRegistration {
+                            name: format!("{} (forced-rate)", stratum_name),
+                            url: Some(pool_url.clone()),
+                            event_rx: source_event_rx,
+                            command_tx: source_cmd_tx,
+                        })
+                        .await?;
+
+                    self.tracker.spawn(async move {
+                        if let Err(e) = forced_rate.run().await {
+                            error!("Forced rate wrapper error: {}", e);
+                        }
+                    });
+                } else {
+                    let stratum_source = StratumV1Source::new(
+                        stratum_config,
+                        source_cmd_rx,
+                        source_event_tx,
+                        self.shutdown.clone(),
+                        Box::new(TcpConnector::new(pool_url.clone())),
+                    );
+
+                    source_reg_tx
+                        .send(SourceRegistration {
+                            name: stratum_source.name(),
+                            url: Some(pool_url),
+                            event_rx: source_event_rx,
+                            command_tx: source_cmd_tx,
+                        })
+                        .await?;
+
+                    self.tracker.spawn(async move {
+                        if let Err(e) = stratum_source.run().await {
+                            error!("Stratum v1 source error: {}", e);
+                        }
+                    });
+                }
             }
         } else {
-            // Use DummySource
-            info!("Using dummy job source (set MUJINA_POOL_URL to use Stratum v1)");
+            // Use DummySource.
+            info!("Using dummy job source (set MUJINA_POOL_URL to use Stratum v1 or Bitcoin Core)");
 
             let dummy_source = DummySource::new(
                 source_cmd_rx,
@@ -299,5 +325,30 @@ impl Daemon {
 impl Default for Daemon {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Whether `url` indicates the getblocktemplate path
+/// (`http://` or `https://`). Anything else falls through to the
+/// Stratum v1 source, which already handles `stratum+tcp://`,
+/// `stratum://`, `tcp://`, and bare host:port forms.
+fn is_http_scheme(url: &str) -> bool {
+    let lower = url.to_lowercase();
+    lower.starts_with("http://") || lower.starts_with("https://")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn http_scheme_detection() {
+        assert!(is_http_scheme("http://127.0.0.1:8332"));
+        assert!(is_http_scheme("https://node.example/rpc"));
+        assert!(is_http_scheme("HTTP://node:8332"));
+        assert!(!is_http_scheme("stratum+tcp://pool:3333"));
+        assert!(!is_http_scheme("stratum://pool:3333"));
+        assert!(!is_http_scheme("tcp://pool:3333"));
+        assert!(!is_http_scheme("pool:3333"));
     }
 }
