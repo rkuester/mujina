@@ -54,6 +54,7 @@
 pub mod dummy;
 mod extranonce2;
 pub mod forced_rate;
+pub mod getblocktemplate;
 pub(crate) mod job;
 mod merkle;
 mod messages;
