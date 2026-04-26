@@ -123,6 +123,7 @@ impl Daemon {
                 let source =
                     GbtSource::new(cfg, source_cmd_rx, source_event_tx, self.shutdown.clone());
                 let name = source.name();
+                let block_stats = Some(source.stats_handle());
 
                 source_reg_tx
                     .send(SourceRegistration {
@@ -130,6 +131,7 @@ impl Daemon {
                         url: Some(pool_url),
                         event_rx: source_event_rx,
                         command_tx: source_cmd_tx,
+                        block_stats,
                     })
                     .await?;
 
@@ -190,6 +192,7 @@ impl Daemon {
                             url: Some(pool_url.clone()),
                             event_rx: source_event_rx,
                             command_tx: source_cmd_tx,
+                            block_stats: None,
                         })
                         .await?;
 
@@ -213,6 +216,7 @@ impl Daemon {
                             url: Some(pool_url),
                             event_rx: source_event_rx,
                             command_tx: source_cmd_tx,
+                            block_stats: None,
                         })
                         .await?;
 
@@ -240,6 +244,7 @@ impl Daemon {
                     url: None,
                     event_rx: source_event_rx,
                     command_tx: source_cmd_tx,
+                    block_stats: None,
                 })
                 .await?;
 

@@ -22,6 +22,9 @@ pub struct GbtConfig {
     pub url: String,
     pub auth: RpcAuth,
     pub payout_script: ScriptBuf,
+    /// Display form of the payout address, kept alongside
+    /// `payout_script` so stats and logs don't have to re-encode it.
+    pub payout_address: String,
     pub vanity_bytes: Vec<u8>,
     pub extranonce2_size: u8,
     pub network: Network,
@@ -63,6 +66,7 @@ impl GbtConfig {
             url,
             auth,
             payout_script,
+            payout_address: address_str,
             vanity_bytes,
             extranonce2_size: DEFAULT_EXTRANONCE2_SIZE,
             network,

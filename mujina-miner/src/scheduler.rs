@@ -42,7 +42,7 @@ use tokio_stream::{StreamExt, StreamMap};
 use tokio_util::sync::CancellationToken;
 
 use crate::api::commands::SchedulerCommand;
-use crate::api_client::types::{MinerTelemetry, SourceTelemetry};
+use crate::api_client::types::{BlockInProgress, MinerTelemetry, SourceTelemetry};
 use crate::asic::hash_thread::{HashTask, HashThread, HashThreadEvent, Share};
 use crate::job_source::{
     JobTemplate, MerkleRootKind, Share as SourceShare, SourceCommand, SourceEvent,
@@ -126,6 +126,14 @@ pub struct SourceRegistration {
 
     /// Command sender for this source (SubmitShare, etc.)
     pub command_tx: mpsc::Sender<SourceCommand>,
+
+    /// Per-source snapshot of the block currently being mined, if
+    /// the source publishes one. Sources that build their own
+    /// coinbase (getblocktemplate) update this on each new
+    /// template; the scheduler reads from it when building
+    /// telemetry. `None` for sources that don't have a block view
+    /// (Stratum, dummy).
+    pub block_stats: Option<Arc<parking_lot::RwLock<Option<BlockInProgress>>>>,
 }
 
 /// Internal scheduler tracking for a registered source.
@@ -145,6 +153,10 @@ struct SourceEntry {
 
     /// Debounced alarm for high-difficulty warnings.
     difficulty_alarm: DebouncedAlarm,
+
+    /// Optional handle to the source's block-in-progress snapshot.
+    /// Set only for sources that build their own coinbase.
+    block_stats: Option<Arc<parking_lot::RwLock<Option<BlockInProgress>>>>,
 }
 
 /// Whether to update alongside existing work or replace it.
@@ -249,6 +261,7 @@ impl Scheduler {
                         let d = Difficulty::from_target(j.share_target).as_f64();
                         if d >= 10.0 { d.round() } else { d }
                     }),
+                    block: s.block_stats.as_ref().and_then(|s| s.read().clone()),
                 })
                 .collect(),
         }
@@ -313,6 +326,7 @@ impl Scheduler {
             command_tx: registration.command_tx,
             last_job: None,
             difficulty_alarm: DebouncedAlarm::new(HIGH_DIFFICULTY_DEBOUNCE),
+            block_stats: registration.block_stats,
         });
         source_events.insert(source_id, ReceiverStream::new(registration.event_rx));
         debug!(source_id = ?source_id, name = %registration.name, "Source registered");

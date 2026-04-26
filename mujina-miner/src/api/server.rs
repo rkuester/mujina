@@ -362,4 +362,75 @@ mod tests {
         let (status, _body) = get(fixtures.router.clone(), "/api/v0/nope").await;
         assert_eq!(status, 404);
     }
+
+    #[tokio::test]
+    async fn source_block_returns_snapshot() {
+        use crate::api_client::types::BlockInProgress;
+        let miner_state = MinerTelemetry {
+            sources: vec![SourceTelemetry {
+                name: "node".into(),
+                url: Some("http://127.0.0.1:8332".into()),
+                block: Some(BlockInProgress {
+                    height: 881_423,
+                    prev_blockhash: "abc123".into(),
+                    network: "bitcoin".into(),
+                    coinbase_value_sats: 312_500_000,
+                    subsidy_sats: 312_500_000,
+                    fees_sats: 0,
+                    payout_address: "bc1q...".into(),
+                    coinbase_message: "/test/".into(),
+                    tx_count: 0,
+                    weight: 0,
+                    weight_pct: 0.0,
+                    top_fee_tx: None,
+                    biggest_tx: None,
+                    fee_floor_sat_per_vb: None,
+                    ln_shaped_count: 0,
+                    halving_era: 4,
+                    blocks_until_halving: 200_000,
+                    retarget_position: 1_000,
+                    network_target_hex: "00..00".into(),
+                    signet_challenge_hex: None,
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let fixtures = build_test_router(miner_state, vec![]);
+
+        let (status, body) = get(fixtures.router.clone(), "/api/v0/sources/node/block").await;
+        assert_eq!(status, 200);
+
+        let block: BlockInProgress = serde_json::from_str(&body).unwrap();
+        assert_eq!(block.height, 881_423);
+        assert_eq!(block.network, "bitcoin");
+    }
+
+    #[tokio::test]
+    async fn source_block_returns_204_when_no_block_view() {
+        let miner_state = MinerTelemetry {
+            sources: vec![SourceTelemetry {
+                name: "stratum-pool".into(),
+                url: Some("stratum+tcp://pool:3333".into()),
+                block: None,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let fixtures = build_test_router(miner_state, vec![]);
+
+        let (status, _body) = get(
+            fixtures.router.clone(),
+            "/api/v0/sources/stratum-pool/block",
+        )
+        .await;
+        assert_eq!(status, 204);
+    }
+
+    #[tokio::test]
+    async fn source_block_returns_404_when_source_missing() {
+        let fixtures = build_test_router(MinerTelemetry::default(), vec![]);
+        let (status, _body) = get(fixtures.router.clone(), "/api/v0/sources/missing/block").await;
+        assert_eq!(status, 404);
+    }
 }

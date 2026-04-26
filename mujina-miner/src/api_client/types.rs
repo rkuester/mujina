@@ -105,6 +105,11 @@ pub struct SourceTelemetry {
         serialize_with = "serialize_opt_f64_as_integer_when_whole"
     )]
     pub difficulty: Option<f64>,
+    /// Snapshot of the block currently being mined (only populated
+    /// for sources that build their own coinbase, like the
+    /// getblocktemplate path). `None` for Stratum and dummy sources.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub block: Option<BlockInProgress>,
 }
 
 /// Snapshot of the block currently being mined by a getblocktemplate

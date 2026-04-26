@@ -16,7 +16,7 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 use super::commands::SchedulerCommand;
 use super::server::SharedState;
 use crate::api_client::types::{
-    BoardTelemetry, MinerPatchRequest, MinerTelemetry, SourceTelemetry,
+    BlockInProgress, BoardTelemetry, MinerPatchRequest, MinerTelemetry, SourceTelemetry,
 };
 
 /// Build the v0 API routes with OpenAPI metadata.
@@ -28,6 +28,7 @@ pub fn routes() -> OpenApiRouter<SharedState> {
         .routes(routes!(get_board))
         .routes(routes!(get_sources))
         .routes(routes!(get_source))
+        .routes(routes!(get_source_block))
 }
 
 /// Health check endpoint.
@@ -178,4 +179,38 @@ async fn get_source(
         .cloned()
         .map(Json)
         .ok_or(StatusCode::NOT_FOUND)
+}
+
+/// Return the block-in-progress snapshot for a source.
+///
+/// Returns 404 if the source doesn't exist; 204 No Content if the
+/// source exists but doesn't publish a block view (Stratum, dummy)
+/// or hasn't received its first template yet.
+#[utoipa::path(
+    get,
+    path = "/sources/{name}/block",
+    tag = "sources",
+    params(
+        ("name" = String, Path, description = "Source name"),
+    ),
+    responses(
+        (status = OK, description = "Current block-in-progress", body = BlockInProgress),
+        (status = NO_CONTENT, description = "Source has no block view yet"),
+        (status = NOT_FOUND, description = "Source not found"),
+    ),
+)]
+async fn get_source_block(
+    State(state): State<SharedState>,
+    Path(name): Path<String>,
+) -> Result<Json<BlockInProgress>, StatusCode> {
+    let telemetry = state.miner_telemetry_rx.borrow();
+    let source = telemetry
+        .sources
+        .iter()
+        .find(|s| s.name == name)
+        .ok_or(StatusCode::NOT_FOUND)?;
+    match &source.block {
+        Some(block) => Ok(Json(block.clone())),
+        None => Err(StatusCode::NO_CONTENT),
+    }
 }

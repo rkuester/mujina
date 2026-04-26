@@ -19,16 +19,19 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use bitcoin::hash_types::TxMerkleNode;
+use parking_lot::RwLock;
 
 use self::block::assemble_block;
 use self::coinbase::{CoinbaseSplit, build_coinbase, compute_merkle_branches};
 use self::config::GbtConfig;
 use self::rpc::RpcClient;
+use self::stats::block_in_progress;
 use self::template::{GbtResponse, ParsedTemplate};
 use super::{
     Extranonce2Range, GeneralPurposeBits, JobTemplate, MerkleRootKind, MerkleRootTemplate, Share,
     SourceCommand, SourceEvent, VersionTemplate,
 };
+use crate::api_client::types::BlockInProgress;
 use crate::tracing::prelude::*;
 use crate::types::HashRate;
 
@@ -59,6 +62,13 @@ pub struct GbtSource {
     expected_hashrate: HashRate,
     current: Option<TemplateState>,
     job_seq: u64,
+    /// Snapshot of the block currently being mined, exposed via
+    /// the API. Updated atomically each time a new template lands.
+    stats: Arc<RwLock<Option<BlockInProgress>>>,
+    /// Display form of the configured payout address, for stats.
+    /// Derived once at construction so we don't re-encode it per
+    /// template.
+    payout_address_display: String,
 }
 
 /// Per-template bookkeeping kept alongside the source.
@@ -82,6 +92,7 @@ impl GbtSource {
         shutdown: CancellationToken,
     ) -> Self {
         let rpc = RpcClient::new(config.url.clone(), config.auth.clone());
+        let payout_address_display = config.payout_address.clone();
         Self {
             config,
             event_tx,
@@ -91,7 +102,15 @@ impl GbtSource {
             expected_hashrate: HashRate::default(),
             current: None,
             job_seq: 0,
+            stats: Arc::new(RwLock::new(None)),
+            payout_address_display,
         }
+    }
+
+    /// Handle to the source's block-in-progress snapshot, suitable
+    /// for handing to `SourceRegistration::block_stats`.
+    pub fn stats_handle(&self) -> Arc<RwLock<Option<BlockInProgress>>> {
+        Arc::clone(&self.stats)
     }
 
     /// Human-readable name for telemetry, derived from the URL.
@@ -253,6 +272,15 @@ impl GbtSource {
         };
 
         let new_lpid = parsed.longpollid.clone();
+
+        let bip = block_in_progress(
+            &parsed,
+            self.config.network,
+            &self.payout_address_display,
+            &self.config.vanity_bytes,
+        );
+        *self.stats.write() = Some(bip);
+
         self.current = Some(TemplateState {
             template: parsed,
             coinbase,
@@ -378,6 +406,7 @@ mod tests {
                 pass: "p".into(),
             },
             payout_script: payout_script(),
+            payout_address: "test-address".into(),
             vanity_bytes: b"/test/".to_vec(),
             extranonce2_size: 4,
             network: Network::Bitcoin,
