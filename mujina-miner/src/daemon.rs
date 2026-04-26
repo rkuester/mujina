@@ -117,9 +117,16 @@ impl Daemon {
 
         if let Ok(pool_url) = env::var("MUJINA_POOL_URL") {
             if is_http_scheme(&pool_url) {
-                // getblocktemplate path. Network is fixed to mainnet
-                // for now; auto-detection lands in a later commit.
-                let cfg = GbtConfig::from_env(pool_url.clone(), bitcoin::Network::Bitcoin)?;
+                // getblocktemplate path. Detect the chain from the
+                // node so a signet/regtest setup picks the right
+                // address validation, cookie path, and stats network
+                // automatically.
+                let cfg = GbtConfig::detect_and_build(pool_url.clone()).await?;
+                info!(
+                    chain = ?cfg.network,
+                    payout = %cfg.payout_address,
+                    "getblocktemplate source: chain detected"
+                );
                 let source =
                     GbtSource::new(cfg, source_cmd_rx, source_event_tx, self.shutdown.clone());
                 let name = source.name();
