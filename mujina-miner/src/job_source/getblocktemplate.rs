@@ -36,6 +36,7 @@ pub mod block;
 pub mod coinbase;
 pub mod config;
 pub mod rpc;
+pub mod stats;
 pub mod template;
 
 /// Initial delay after a fetch error before retrying.
