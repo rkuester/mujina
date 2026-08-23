@@ -33,7 +33,7 @@ thiserror = "2.0"
 time = { version = "0.3", features = ["macros"] }
 tokio = { version = "1", features = ["full"] }
 tokio-serial = "5.4"
-tokio-stream = "0.1"
+tokio-stream = { version = "0.1", features = ["sync"] }
 tokio-util = { version = "0.7", features = ["codec", "rt"] }
 tower-http = { version = "0.6", features = ["trace"] }
 tracing = "0.1"
