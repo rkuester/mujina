@@ -1,3 +1,4 @@
+pub mod attributes;
 pub(crate) mod bitaxe;
 pub(crate) mod cpu;
 pub(crate) mod emberone00;
@@ -8,14 +9,20 @@ use futures::future::BoxFuture;
 use tokio::sync::watch;
 
 use crate::{
-    api_client::types::BoardTelemetry, asic::hash_thread::HashThread, transport::UsbDeviceInfo,
+    api_client::types::BoardTelemetry, asic::hash_thread::HashThread, systree::Cursor,
+    transport::UsbDeviceInfo,
 };
+
+pub use attributes::BoardAttributes;
 
 /// Returned by board factory functions with everything the backplane
 /// needs to integrate a board into the system.
 pub struct BackplaneConnector {
     /// Board identification and metadata.
     pub info: BoardInfo,
+
+    /// The board's attributes in the systree.
+    pub attrs: BoardAttributes,
 
     /// Hash threads ready to be scheduled.
     pub threads: Vec<Box<dyn HashThread>>,
@@ -51,8 +58,11 @@ pub struct BoardInfo {
 /// 5. Returning a [`BackplaneConnector`] with all of the above
 ///
 /// The backplane calls the factory when a matching USB device is
-/// discovered.
-pub type BoardFactoryFn = fn(UsbDeviceInfo) -> BoxFuture<'static, Result<BackplaneConnector>>;
+/// discovered, and passes a cursor on the collection of boards.
+/// The board names itself under that cursor, because only the
+/// board knows where its identity comes from.
+pub type BoardFactoryFn =
+    fn(UsbDeviceInfo, Cursor) -> BoxFuture<'static, Result<BackplaneConnector>>;
 
 /// Board descriptor that gets collected by inventory.
 ///
@@ -83,7 +93,7 @@ inventory::collect!(BoardDescriptor);
 /// Same contract as [`BoardFactoryFn`], but virtual boards don't
 /// receive USB device info. They are configured via environment
 /// variables or other means.
-pub type VirtualBoardFactoryFn = fn() -> BoxFuture<'static, Result<BackplaneConnector>>;
+pub type VirtualBoardFactoryFn = fn(Cursor) -> BoxFuture<'static, Result<BackplaneConnector>>;
 
 /// Descriptor for virtual boards (CPU miner, test boards, etc.).
 ///

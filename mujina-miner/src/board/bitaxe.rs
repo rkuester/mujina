@@ -47,6 +47,7 @@ use crate::{
         emc2101::{Emc2101, Percent},
         tps546::{Tps546, Tps546Config, Tps546Regulator},
     },
+    systree::Cursor,
     tracing::prelude::*,
     transport::{
         UsbDeviceInfo,
@@ -56,9 +57,12 @@ use crate::{
 };
 
 use super::{
-    BackplaneConnector, BoardInfo,
+    BackplaneConnector, BoardAttributes, BoardInfo,
     pattern::{Match, StringMatch},
 };
+
+/// The name this board reports as its model.
+const MODEL: &str = "Bitaxe Gamma";
 
 inventory::submit! {
     crate::board::BoardDescriptor {
@@ -70,8 +74,8 @@ inventory::submit! {
             product: Match::Specific(StringMatch::Exact("Bitaxe")),
             serial_pattern: Match::Any,
         },
-        name: "Bitaxe Gamma",
-        create_fn: |device| Box::pin(create_from_usb(device, Firmware::BitaxeRaw)),
+        name: MODEL,
+        create_fn: |device, boards| Box::pin(create_from_usb(device, boards, Firmware::BitaxeRaw)),
     }
 }
 
@@ -86,8 +90,8 @@ inventory::submit! {
             product: Match::Specific(StringMatch::Exact("Bitaxe Gamma RHAP-D")),
             serial_pattern: Match::Any,
         },
-        name: "Bitaxe Gamma",
-        create_fn: |device| Box::pin(create_from_usb(device, Firmware::RhapD)),
+        name: MODEL,
+        create_fn: |device, boards| Box::pin(create_from_usb(device, boards, Firmware::RhapD)),
     }
 }
 
@@ -121,7 +125,11 @@ impl Firmware {
 }
 
 /// Create a Bitaxe board from USB device info.
-async fn create_from_usb(device: UsbDeviceInfo, firmware: Firmware) -> Result<BackplaneConnector> {
+async fn create_from_usb(
+    device: UsbDeviceInfo,
+    boards: Cursor,
+    firmware: Firmware,
+) -> Result<BackplaneConnector> {
     let device = BitaxeDevice::attach(device, firmware).await?;
 
     let (thread_shutdown_tx, thread_shutdown_rx) = watch::channel(());
@@ -136,16 +144,18 @@ async fn create_from_usb(device: UsbDeviceInfo, firmware: Firmware) -> Result<Ba
         "bitaxe-{}",
         device.serial_number.as_deref().unwrap_or("unknown")
     );
+    let attrs = BoardAttributes::attach(&boards.child(&board_name), MODEL);
+
     let initial_state = BoardTelemetry {
         name: board_name.clone(),
-        model: "Bitaxe Gamma".into(),
+        model: MODEL.into(),
         serial: device.serial_number.clone(),
         ..Default::default()
     };
     let (telemetry_tx, telemetry_rx) = watch::channel(initial_state);
 
     let info = BoardInfo {
-        model: "Bitaxe Gamma".to_string(),
+        model: MODEL.to_string(),
         firmware_version: Some(firmware.to_string()),
         serial_number: device.serial_number.clone(),
     };
@@ -187,6 +197,7 @@ async fn create_from_usb(device: UsbDeviceInfo, firmware: Firmware) -> Result<Ba
 
     Ok(BackplaneConnector {
         info,
+        attrs,
         threads,
         telemetry_rx,
         shutdown: Some(shutdown),
@@ -272,7 +283,7 @@ impl BitaxeDevice {
             regulator: self.regulator.clone(),
             thread_shutdown,
             board_name,
-            board_model: "Bitaxe Gamma",
+            board_model: MODEL,
             board_serial: self.serial_number.clone(),
             bad_thermal_count: 0,
             reset_line: self.reset_line.clone(),

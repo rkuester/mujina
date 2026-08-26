@@ -16,8 +16,11 @@ use futures::future::BoxFuture;
 
 use crate::{
     api::BoardRegistration,
-    board::{BackplaneConnector, BoardDescriptor, BoardInfo, VirtualBoardRegistry},
+    board::{
+        BackplaneConnector, BoardAttributes, BoardDescriptor, BoardInfo, VirtualBoardRegistry,
+    },
     scheduler::ThreadRegistration,
+    systree::{Cursor, MemberStatus},
     tracing::prelude::*,
     transport::{Device, DeviceKey, TransportEvent, UsbDeviceInfo},
 };
@@ -57,6 +60,8 @@ pub struct Backplane {
     scheduler_tx: mpsc::Sender<ThreadRegistration>,
     /// Channel to forward board registrations to the API server
     board_reg_tx: mpsc::Sender<BoardRegistration>,
+    /// Systree cursor on the collection of boards
+    sys_boards: Cursor,
 }
 
 impl Backplane {
@@ -65,6 +70,7 @@ impl Backplane {
         event_rxs: Vec<mpsc::Receiver<TransportEvent>>,
         scheduler_tx: mpsc::Sender<ThreadRegistration>,
         board_reg_tx: mpsc::Sender<BoardRegistration>,
+        sys_boards: Cursor,
     ) -> Self {
         Self {
             registry: BoardRegistry,
@@ -73,6 +79,7 @@ impl Backplane {
             event_rxs,
             scheduler_tx,
             board_reg_tx,
+            sys_boards,
         }
     }
 
@@ -164,6 +171,7 @@ impl Backplane {
 
         let BackplaneConnector {
             info,
+            attrs,
             threads,
             telemetry_rx,
             shutdown,
@@ -178,7 +186,11 @@ impl Backplane {
             );
         }
 
-        let board = ActiveBoard { info, shutdown };
+        let board = ActiveBoard {
+            info,
+            attrs,
+            shutdown,
+        };
         info!(
             board = %board.info.model,
             serial = %board.serial(),
@@ -238,7 +250,8 @@ impl Backplane {
                     "Hash board connected via USB."
                 );
 
-                let conn = match (descriptor.create_fn)(device_info).await {
+                let sys_boards = self.sys_boards.clone();
+                let conn = match (descriptor.create_fn)(device_info, sys_boards).await {
                     Ok(conn) => conn,
                     Err(e) => {
                         error!(
@@ -265,7 +278,7 @@ impl Backplane {
                     "CPU miner board connected."
                 );
 
-                let conn = match (descriptor.create_fn)().await {
+                let conn = match (descriptor.create_fn)(self.sys_boards.clone()).await {
                     Ok(conn) => conn,
                     Err(e) => {
                         error!(
@@ -290,6 +303,7 @@ impl Backplane {
     /// removal changes nothing here.
     async fn handle_disconnected(&mut self, key: DeviceKey) -> Result<()> {
         if let Some(mut board) = self.boards.remove(&key) {
+            board.mark_absent();
             board.shutdown().await;
             info!(
                 board = %board.info.model,
@@ -305,10 +319,20 @@ impl Backplane {
 /// Per-board state the backplane keeps for lifecycle management.
 struct ActiveBoard {
     info: BoardInfo,
+    attrs: BoardAttributes,
     shutdown: Option<BoxFuture<'static, ()>>,
 }
 
 impl ActiveBoard {
+    /// Reports that the board is no longer there.
+    ///
+    /// The board's values stay in the tree, so a client that tuned
+    /// it still sees them and reads the status beside them.
+    fn mark_absent(&self) {
+        let mut tree = self.attrs.write();
+        tree.set(&self.attrs.status, MemberStatus::Absent);
+    }
+
     /// Returns the board's serial number for a log entry.
     fn serial(&self) -> &str {
         self.info.serial_number.as_deref().unwrap_or("unknown")
@@ -331,7 +355,13 @@ mod tests {
 
     use super::*;
     use crate::api_client::types::BoardTelemetry;
+    use crate::systree::Tree;
     use crate::transport::{cpu, usb::DevicePath};
+
+    /// A cursor on the collection of boards in a tree of its own.
+    fn test_boards() -> Cursor {
+        Tree::new().root().child("boards")
+    }
 
     /// A board with no threads that sets `stopped` when the
     /// backplane stops it.
@@ -343,6 +373,7 @@ mod tests {
                 firmware_version: None,
                 serial_number: None,
             },
+            attrs: BoardAttributes::attach(&test_boards().child("test-board"), "Test Board"),
             threads: Vec::new(),
             telemetry_rx,
             shutdown: Some(Box::pin({
@@ -360,7 +391,12 @@ mod tests {
         drop(transport_tx);
         let (scheduler_tx, _scheduler_rx) = mpsc::channel(10);
         let (board_reg_tx, _board_reg_rx) = mpsc::channel(10);
-        let mut backplane = Backplane::new(vec![transport_rx], scheduler_tx, board_reg_tx);
+        let mut backplane = Backplane::new(
+            vec![transport_rx],
+            scheduler_tx,
+            board_reg_tx,
+            test_boards(),
+        );
 
         let stopped = Arc::new(AtomicBool::new(false));
         let key = DeviceKey::Cpu(cpu::DeviceId::new("test-board"));
@@ -393,7 +429,12 @@ mod tests {
         let (transport_tx, transport_rx) = mpsc::channel(1);
         let (scheduler_tx, _scheduler_rx) = mpsc::channel(10);
         let (board_reg_tx, _board_reg_rx) = mpsc::channel(10);
-        let mut backplane = Backplane::new(vec![transport_rx], scheduler_tx, board_reg_tx);
+        let mut backplane = Backplane::new(
+            vec![transport_rx],
+            scheduler_tx,
+            board_reg_tx,
+            test_boards(),
+        );
 
         let stopped = Arc::new(AtomicBool::new(false));
         let key = DeviceKey::Usb(DevicePath::new("/sys/devices/test-board"));
@@ -430,7 +471,12 @@ mod tests {
         let (transport_tx, transport_rx) = mpsc::channel(1);
         let (scheduler_tx, _scheduler_rx) = mpsc::channel(10);
         let (board_reg_tx, _board_reg_rx) = mpsc::channel(10);
-        let mut backplane = Backplane::new(vec![transport_rx], scheduler_tx, board_reg_tx);
+        let mut backplane = Backplane::new(
+            vec![transport_rx],
+            scheduler_tx,
+            board_reg_tx,
+            test_boards(),
+        );
 
         let removed = Arc::new(AtomicBool::new(false));
         let removed_key = DeviceKey::Usb(DevicePath::new("/sys/devices/removed-board"));
@@ -472,7 +518,12 @@ mod tests {
         let (_transport_tx, transport_rx) = mpsc::channel(1);
         let (scheduler_tx, _scheduler_rx) = mpsc::channel(10);
         let (board_reg_tx, _board_reg_rx) = mpsc::channel(10);
-        let mut backplane = Backplane::new(vec![transport_rx], scheduler_tx, board_reg_tx);
+        let mut backplane = Backplane::new(
+            vec![transport_rx],
+            scheduler_tx,
+            board_reg_tx,
+            test_boards(),
+        );
 
         let first = Arc::new(AtomicBool::new(false));
         let second = Arc::new(AtomicBool::new(false));
