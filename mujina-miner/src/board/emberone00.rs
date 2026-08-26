@@ -14,7 +14,7 @@ use tokio_serial::SerialPortBuilderExt;
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    BackplaneConnector, BoardDescriptor, BoardInfo,
+    BackplaneConnector, BoardAttributes, BoardDescriptor, BoardInfo,
     pattern::{BoardPattern, Match, StringMatch},
 };
 use crate::{
@@ -35,8 +35,12 @@ use crate::{
         tmp451::Tmp451,
         tmp1075::Tmp1075,
     },
+    systree::Cursor,
     transport::UsbDeviceInfo,
 };
+
+/// The name this board reports as its model.
+const MODEL: &str = "emberOne/00";
 
 // Register this board type with the inventory system
 inventory::submit! {
@@ -49,8 +53,8 @@ inventory::submit! {
             product: Match::Specific(StringMatch::Exact("EmberOne00")),
             serial_pattern: Match::Any,
         },
-        name: "emberOne/00",
-        create_fn: |device| Box::pin(create_from_usb(device)),
+        name: MODEL,
+        create_fn: |device, boards| Box::pin(create_from_usb(device, boards)),
     }
 }
 
@@ -81,7 +85,7 @@ fn response_format(version: &DeviceVersion) -> ResponseFormat {
     }
 }
 
-async fn create_from_usb(device: UsbDeviceInfo) -> Result<BackplaneConnector> {
+async fn create_from_usb(device: UsbDeviceInfo, boards: Cursor) -> Result<BackplaneConnector> {
     let serial_ports = device.get_serial_ports(2).await?;
 
     debug!(
@@ -133,7 +137,7 @@ async fn create_from_usb(device: UsbDeviceInfo) -> Result<BackplaneConnector> {
         .context("TMP451 remote offset failed")?;
 
     let info = BoardInfo {
-        model: "emberOne/00".to_string(),
+        model: MODEL.to_string(),
         firmware_version: None,
         serial_number: device.serial_number.clone(),
     };
@@ -142,6 +146,8 @@ async fn create_from_usb(device: UsbDeviceInfo) -> Result<BackplaneConnector> {
         "emberone00-{}",
         info.serial_number.as_deref().unwrap_or("unknown")
     );
+    let attrs = BoardAttributes::attach(&boards.child(&board_name), MODEL);
+
     let initial_telemetry = BoardTelemetry {
         name: board_name,
         model: info.model.clone(),
@@ -169,6 +175,7 @@ async fn create_from_usb(device: UsbDeviceInfo) -> Result<BackplaneConnector> {
 
     Ok(BackplaneConnector {
         info,
+        attrs,
         threads: Vec::new(),
         telemetry_rx,
         shutdown: Some(shutdown),

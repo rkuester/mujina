@@ -16,8 +16,11 @@ use futures::future::BoxFuture;
 
 use crate::{
     api::BoardRegistration,
-    board::{BackplaneConnector, BoardDescriptor, BoardInfo, VirtualBoardRegistry},
+    board::{
+        BackplaneConnector, BoardAttributes, BoardDescriptor, BoardInfo, VirtualBoardRegistry,
+    },
     scheduler::ThreadRegistration,
+    systree::{Cursor, MemberStatus},
     tracing::prelude::*,
     transport::{
         TransportEvent, UsbDeviceInfo, cpu::TransportEvent as CpuTransportEvent,
@@ -60,6 +63,8 @@ pub struct Backplane {
     scheduler_tx: mpsc::Sender<ThreadRegistration>,
     /// Channel to forward board registrations to the API server
     board_reg_tx: mpsc::Sender<BoardRegistration>,
+    /// Systree cursor on the collection of boards
+    sys_boards: Cursor,
 }
 
 impl Backplane {
@@ -68,6 +73,7 @@ impl Backplane {
         event_rxs: Vec<mpsc::Receiver<TransportEvent>>,
         scheduler_tx: mpsc::Sender<ThreadRegistration>,
         board_reg_tx: mpsc::Sender<BoardRegistration>,
+        sys_boards: Cursor,
     ) -> Self {
         Self {
             registry: BoardRegistry,
@@ -76,6 +82,7 @@ impl Backplane {
             event_rxs,
             scheduler_tx,
             board_reg_tx,
+            sys_boards,
         }
     }
 
@@ -159,6 +166,7 @@ impl Backplane {
     async fn start_board(&mut self, board_id: String, conn: BackplaneConnector) {
         let BackplaneConnector {
             info,
+            attrs,
             threads,
             telemetry_rx,
             shutdown,
@@ -195,7 +203,14 @@ impl Backplane {
             }
         }
 
-        self.boards.insert(board_id, ActiveBoard { info, shutdown });
+        self.boards.insert(
+            board_id,
+            ActiveBoard {
+                info,
+                attrs,
+                shutdown,
+            },
+        );
     }
 
     /// Tell the scheduler that startup enumeration across all transports is
@@ -230,7 +245,8 @@ impl Backplane {
                     "Hash board connected via USB."
                 );
 
-                let conn = match (descriptor.create_fn)(device_info).await {
+                let sys_boards = self.sys_boards.clone();
+                let conn = match (descriptor.create_fn)(device_info, sys_boards).await {
                     Ok(conn) => conn,
                     Err(e) => {
                         error!(
@@ -258,6 +274,7 @@ impl Backplane {
                 let board_ids: Vec<String> = self.boards.keys().cloned().collect();
                 for board_id in board_ids {
                     if let Some(mut board) = self.boards.remove(&board_id) {
+                        board.mark_absent();
                         board.shutdown().await;
                         info!(
                             board = %board.info.model,
@@ -289,7 +306,7 @@ impl Backplane {
                     "CPU miner board connected."
                 );
 
-                let conn = match (descriptor.create_fn)().await {
+                let conn = match (descriptor.create_fn)(self.sys_boards.clone()).await {
                     Ok(conn) => conn,
                     Err(e) => {
                         error!(
@@ -319,10 +336,20 @@ impl Backplane {
 /// Per-board state the backplane keeps for lifecycle management.
 struct ActiveBoard {
     info: BoardInfo,
+    attrs: BoardAttributes,
     shutdown: Option<BoxFuture<'static, ()>>,
 }
 
 impl ActiveBoard {
+    /// Reports that the board is no longer there.
+    ///
+    /// The board's values stay in the tree, so a client that tuned
+    /// it still sees them and reads the status beside them.
+    fn mark_absent(&self) {
+        let mut tree = self.attrs.write();
+        tree.set(&self.attrs.status, MemberStatus::Absent);
+    }
+
     async fn shutdown(&mut self) {
         if let Some(fut) = self.shutdown.take() {
             fut.await;

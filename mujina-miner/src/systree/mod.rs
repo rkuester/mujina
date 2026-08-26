@@ -18,6 +18,7 @@
 mod attribute;
 mod cursor;
 mod guard;
+mod member;
 mod path;
 mod render;
 mod tree;
@@ -29,5 +30,6 @@ mod tests;
 pub use attribute::{AttributeValue, Report};
 pub use cursor::Cursor;
 pub use guard::{ReadGuard, WriteGuard};
+pub use member::MemberStatus;
 pub use path::{Path, PathError};
 pub use tree::Tree;

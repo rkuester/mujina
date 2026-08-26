@@ -23,6 +23,7 @@ use crate::{
     },
     scheduler::{self, SourceRegistration, ThreadRegistration},
     stratum_v1::{PoolConfig as StratumPoolConfig, TcpConnector},
+    systree::Tree,
     transport::{CpuDeviceInfo, TransportEvent, UsbTransport, cpu as cpu_transport},
 };
 
@@ -92,8 +93,17 @@ impl Daemon {
         // registrations here, the API server collects and serves them.
         let (board_reg_tx, board_reg_rx) = mpsc::channel(10);
 
+        // The tree of every value the miner reports. Boards attach
+        // their own nodes under it as they are found.
+        let systree = Tree::new();
+
         // Create and start backplane
-        let mut backplane = Backplane::new(transport_rxs, thread_tx, board_reg_tx);
+        let mut backplane = Backplane::new(
+            transport_rxs,
+            thread_tx,
+            board_reg_tx,
+            systree.root().child("boards"),
+        );
         self.tracker.spawn({
             let shutdown = self.shutdown.clone();
             async move {
