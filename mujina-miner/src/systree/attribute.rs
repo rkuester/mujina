@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use serde_json::Value;
 use tokio::sync::watch;
 use tokio_stream::wrappers::WatchStream;
 
@@ -24,9 +25,24 @@ pub struct Report<T> {
 /// unchanged. `Send` and `Sync` permit the value to cross threads.
 /// `'static` excludes borrowed data, since the tree outlives the
 /// components that write to it.
-pub trait AttributeValue: Clone + PartialEq + Send + Sync + 'static {}
+///
+/// An implementation specifies how the value appears in the API:
+/// its JSON form and unit. Quantity types stay free of API
+/// knowledge, and one implementation defines the unit for every
+/// attribute holding that type.
+pub trait AttributeValue: Clone + PartialEq + Send + Sync + 'static {
+    /// The unit of the value. It joins the attribute's name, so
+    /// `voltage` becomes `voltage_v`.
+    ///
+    /// Use the SI symbol where the quantity has one. Where the
+    /// quantity counts events over a span of time, name the span
+    /// in the unit, as in `per_s` or `per_h`, so `hashes` becomes
+    /// `hashes_per_s`. Use `None` for a value with no unit.
+    const UNIT: Option<&'static str> = None;
 
-impl<T: Clone + PartialEq + Send + Sync + 'static> AttributeValue for T {}
+    /// Converts the value to JSON in the unit given by [`UNIT`](Self::UNIT).
+    fn to_json(&self) -> Value;
+}
 
 /// An attribute with its value type erased.
 ///
@@ -35,6 +51,12 @@ impl<T: Clone + PartialEq + Send + Sync + 'static> AttributeValue for T {}
 pub(super) trait Attribute: Send + Sync {
     /// Wakes subscribers of this attribute.
     fn notify(&self);
+
+    /// Returns the attribute's current value as JSON.
+    ///
+    /// The caller needs no knowledge of the value's type, which
+    /// lets one piece of code render a subtree of mixed types.
+    fn to_json(&self) -> Value;
 }
 
 impl<T: AttributeValue> Report<T> {
@@ -110,5 +132,9 @@ impl<T> Clone for Report<T> {
 impl<T: AttributeValue> Attribute for watch::Sender<T> {
     fn notify(&self) {
         self.send_modify(|_| ());
+    }
+
+    fn to_json(&self) -> Value {
+        self.borrow().to_json()
     }
 }

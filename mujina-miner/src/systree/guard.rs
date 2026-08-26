@@ -1,8 +1,8 @@
-//! Guards: group multiple writes so they take effect together.
+//! Guards: group writes and reads so each sees one instant of the tree.
 
 use std::sync::Arc;
 
-use parking_lot::RwLockWriteGuard;
+use parking_lot::{RwLockReadGuard, RwLockWriteGuard};
 
 use super::attribute::{Attribute, AttributeValue, Report};
 use super::tree::{AttributeMap, Tree};
@@ -14,6 +14,15 @@ use super::tree::{AttributeMap, Tree};
 pub struct WriteGuard<'a> {
     tree: Option<RwLockWriteGuard<'a, AttributeMap>>,
     changed: Vec<Arc<dyn Attribute>>,
+}
+
+/// Holds the tree open for reading.
+///
+/// Every value read through one guard comes from one instant in
+/// time. Multiple readers hold the tree at once, so one render
+/// never waits for another.
+pub struct ReadGuard<'a> {
+    tree: RwLockReadGuard<'a, AttributeMap>,
 }
 
 impl<'a> WriteGuard<'a> {
@@ -49,5 +58,25 @@ impl Drop for WriteGuard<'_> {
         for attribute in self.changed.drain(..) {
             attribute.notify();
         }
+    }
+}
+
+impl<'a> ReadGuard<'a> {
+    pub(super) fn open(tree: &'a Tree) -> Self {
+        Self {
+            tree: tree.hold_for_reading(),
+        }
+    }
+}
+
+impl ReadGuard<'_> {
+    /// Returns the current value of an attribute.
+    pub fn get<T: AttributeValue>(&self, attribute: &Report<T>) -> T {
+        attribute.get()
+    }
+
+    /// Lends the attributes the guard holds.
+    pub(super) fn attributes(&self) -> &AttributeMap {
+        &self.tree
     }
 }
