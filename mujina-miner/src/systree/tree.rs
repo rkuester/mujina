@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use parking_lot::{RwLock, RwLockWriteGuard};
+use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use crate::tracing::prelude::*;
 
@@ -43,6 +43,11 @@ impl Tree {
         {
             warn!(%path, "attaching an attribute where one already exists");
         }
+    }
+
+    /// Acquires the read lock on the tree.
+    pub(super) fn hold_for_reading(&self) -> RwLockReadGuard<'_, AttributeMap> {
+        self.attributes.read()
     }
 
     /// Acquires the write lock on the entire tree.

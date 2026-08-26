@@ -19,13 +19,15 @@ mod attribute;
 mod cursor;
 mod guard;
 mod path;
+mod render;
 mod tree;
+mod values;
 
 #[cfg(test)]
 mod tests;
 
 pub use attribute::{AttributeValue, Report};
 pub use cursor::Cursor;
-pub use guard::WriteGuard;
+pub use guard::{ReadGuard, WriteGuard};
 pub use path::{Path, PathError};
 pub use tree::Tree;
