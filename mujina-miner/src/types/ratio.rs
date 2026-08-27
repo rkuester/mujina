@@ -5,6 +5,12 @@
 //! percent-step values; not a general rational number. Convert on
 //! access via the unit-specific methods.
 
+use std::fmt;
+
+use serde_json::Value;
+
+use crate::systree::{AttributeValue, SettingValue, ValueError};
+
 /// A dimensionless ratio in parts per million.
 ///
 /// A ratio type with named scales. Stores parts per million
@@ -59,6 +65,30 @@ const fn round_to_i64(x: f32) -> i64 {
         (x + 0.5) as i64
     } else {
         (x - 0.5) as i64
+    }
+}
+
+/// Renders as a percentage, so a name takes the `_percent` suffix.
+impl AttributeValue for Ratio {
+    const UNIT: Option<&'static str> = Some("percent");
+
+    fn to_json(&self) -> Value {
+        Value::from(self.percent())
+    }
+}
+
+impl SettingValue for Ratio {
+    fn from_json(value: &Value) -> Result<Self, ValueError> {
+        match value.as_f64() {
+            Some(percent) => Ok(Self::from_percent(percent as f32)),
+            None => Err(ValueError::WrongType("a ratio in percent")),
+        }
+    }
+}
+
+impl fmt::Display for Ratio {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:.1}%", self.percent())
     }
 }
 

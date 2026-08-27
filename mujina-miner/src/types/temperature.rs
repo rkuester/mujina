@@ -2,8 +2,12 @@
 
 mod conversions;
 
-use serde::{Deserialize, Serialize};
 use std::fmt;
+
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+use crate::systree::{AttributeValue, SettingValue, ValueError};
 
 /// Temperature in degrees Celsius.
 ///
@@ -33,6 +37,24 @@ impl Temperature {
 impl fmt::Display for Temperature {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{:.1} C", self.0)
+    }
+}
+
+/// Renders in degrees Celsius, so a name takes the `_c` suffix.
+impl AttributeValue for Temperature {
+    const UNIT: Option<&'static str> = Some("c");
+
+    fn to_json(&self) -> Value {
+        Value::from(self.as_degrees_c())
+    }
+}
+
+impl SettingValue for Temperature {
+    fn from_json(value: &Value) -> Result<Self, ValueError> {
+        match value.as_f64() {
+            Some(degrees) => Ok(Self::from_celsius(degrees as f32)),
+            None => Err(ValueError::WrongType("a temperature in degrees Celsius")),
+        }
     }
 }
 
