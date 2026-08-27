@@ -129,7 +129,9 @@ const GROUPS: &[EnvGroup] = &[
                 name: "MUJINA_CPUMINER_DUTY",
                 summary: "CPU duty cycle percent (1-100). Each thread hashes this \
                           fraction of every second and sleeps the rest, capping \
-                          sustained CPU load.",
+                          sustained CPU load. It sets each thread's \
+                          target_duty_percent, which a client can change through \
+                          the API while the miner runs.",
                 default: Some("50"),
                 example: None,
             },
