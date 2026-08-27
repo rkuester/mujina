@@ -355,6 +355,7 @@ mod tests {
 
     use super::*;
     use crate::api_client::types::BoardTelemetry;
+    use crate::board::BoardModel;
     use crate::systree::{Tree, Unconfigured};
     use crate::transport::{cpu, usb::DevicePath};
 
@@ -366,14 +367,18 @@ mod tests {
     /// A board with no threads that sets `stopped` when the
     /// backplane stops it.
     fn test_board(stopped: &Arc<AtomicBool>) -> BackplaneConnector {
+        const MODEL: BoardModel = BoardModel {
+            name: "Test Board",
+            key: "test-board",
+        };
         let (_telemetry_tx, telemetry_rx) = watch::channel(BoardTelemetry::default());
         BackplaneConnector {
             info: BoardInfo {
-                model: "Test Board".into(),
+                model: MODEL.name.into(),
                 firmware_version: None,
                 serial_number: None,
             },
-            attrs: BoardAttributes::attach(&test_boards().child("test-board"), "Test Board"),
+            attrs: BoardAttributes::attach(&test_boards(), MODEL, "unknown"),
             threads: Vec::new(),
             telemetry_rx,
             shutdown: Some(Box::pin({

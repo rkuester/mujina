@@ -13,7 +13,7 @@ use crate::{
     transport::UsbDeviceInfo,
 };
 
-pub use attributes::BoardAttributes;
+pub use attributes::{BoardAttributes, BoardModel};
 
 /// Returned by board factory functions with everything the backplane
 /// needs to integrate a board into the system.

@@ -14,7 +14,7 @@ use tokio_serial::SerialPortBuilderExt;
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    BackplaneConnector, BoardAttributes, BoardDescriptor, BoardInfo,
+    BackplaneConnector, BoardAttributes, BoardDescriptor, BoardInfo, BoardModel,
     pattern::{BoardPattern, Match, StringMatch},
 };
 use crate::{
@@ -39,8 +39,11 @@ use crate::{
     transport::UsbDeviceInfo,
 };
 
-/// The name this board reports as its model.
-const MODEL: &str = "emberOne/00";
+/// The model this board reports.
+const MODEL: BoardModel = BoardModel {
+    name: "emberOne/00",
+    key: "emberone-00",
+};
 
 // Register this board type with the inventory system
 inventory::submit! {
@@ -53,7 +56,7 @@ inventory::submit! {
             product: Match::Specific(StringMatch::Exact("EmberOne00")),
             serial_pattern: Match::Any,
         },
-        name: MODEL,
+        name: MODEL.name,
         create_fn: |device, boards| Box::pin(create_from_usb(device, boards)),
     }
 }
@@ -137,16 +140,19 @@ async fn create_from_usb(device: UsbDeviceInfo, boards: Cursor) -> Result<Backpl
         .context("TMP451 remote offset failed")?;
 
     let info = BoardInfo {
-        model: MODEL.to_string(),
+        model: MODEL.name.to_string(),
         firmware_version: None,
         serial_number: device.serial_number.clone(),
     };
 
-    let board_name = format!(
-        "emberone00-{}",
-        info.serial_number.as_deref().unwrap_or("unknown")
-    );
-    let attrs = BoardAttributes::attach(&boards.child(&board_name), MODEL);
+    let serial = info
+        .serial_number
+        .clone()
+        .unwrap_or_else(|| "unknown".into());
+    // The board telemetry document keeps the name it has always
+    // used, which is not the board's key in the tree.
+    let board_name = format!("emberone00-{serial}");
+    let attrs = BoardAttributes::attach(&boards, MODEL, &serial);
 
     let initial_telemetry = BoardTelemetry {
         name: board_name,
