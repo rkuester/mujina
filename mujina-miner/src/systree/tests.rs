@@ -1,5 +1,7 @@
 //! Tests for the tree, its cursors, and its guards.
 
+use std::fmt;
+use std::sync::Arc;
 use std::thread;
 
 use serde_json::{Value, json};
@@ -9,12 +11,12 @@ use super::*;
 
 /// Returns a cursor on the root of an empty tree.
 fn root() -> Cursor {
-    Tree::new().root()
+    Tree::new(Arc::new(Unconfigured)).root()
 }
 
 /// A test type with a unit, simulating quantity types a board
 /// reports.
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, PartialOrd)]
 struct Volts(f64);
 
 impl AttributeValue for Volts {
@@ -22,6 +24,21 @@ impl AttributeValue for Volts {
 
     fn to_json(&self) -> Value {
         json!(self.0)
+    }
+}
+
+impl SettingValue for Volts {
+    fn from_json(value: &Value) -> Result<Self, ValueError> {
+        match value.as_f64() {
+            Some(volts) => Ok(Self(volts)),
+            None => Err(ValueError::WrongType("a voltage in volts")),
+        }
+    }
+}
+
+impl fmt::Display for Volts {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:.3} V", self.0)
     }
 }
 
@@ -183,7 +200,7 @@ fn a_missing_node_and_a_null_value_stay_apart() {
     );
     assert_eq!(root.child("boards").child("gone").render_json(), None);
     assert_eq!(
-        Tree::new().root().render_json(),
+        Tree::new(Arc::new(Unconfigured)).root().render_json(),
         None,
         "empty tree returns None"
     );
@@ -255,4 +272,174 @@ fn a_group_of_writes_waits_for_a_reader() {
 
     rail.join().expect("the writer finished");
     assert_eq!((voltage.get(), current.get()), (1_150_000, 15_000));
+}
+
+/// A resolver answering from a fixed list of entries.
+struct Layers {
+    entries: Vec<(Selector, Value)>,
+}
+
+impl Layers {
+    /// Returns layers holding one entry.
+    fn holding(selector: &str, value: Value) -> Arc<Self> {
+        Arc::new(Self {
+            entries: vec![(selector.parse().expect("a valid selector"), value)],
+        })
+    }
+}
+
+impl Resolver for Layers {
+    fn resolve(&self, path: &Path) -> Option<(Value, Origin)> {
+        self.entries
+            .iter()
+            .find(|(selector, _)| selector.matches(path))
+            .map(|(_, value)| (value.clone(), Origin::Admin))
+    }
+}
+
+/// Returns a tree over the given layers.
+fn tree_over(resolver: Arc<dyn Resolver>) -> Arc<Tree> {
+    Tree::new(resolver)
+}
+
+/// Parses a path that must be valid.
+fn path(pointer: &str) -> Path {
+    pointer.parse().expect("valid pointer")
+}
+
+#[test]
+fn a_setting_no_layer_supplies_keeps_its_default() {
+    let target = root().setting("target_voltage", Some(Volts(1.15)));
+
+    assert_eq!(target.get(), Some(Volts(1.15)));
+    assert_eq!(target.origin(), Origin::Builtin);
+}
+
+#[test]
+fn a_setting_resolves_as_it_is_created() {
+    let tree = tree_over(Layers::holding("/boards/*/target_voltage_v", json!(1.25)));
+
+    let target = tree
+        .root()
+        .child("boards")
+        .child("x")
+        .setting("target_voltage", None::<Volts>);
+
+    assert_eq!(target.get(), Some(Volts(1.25)));
+    assert_eq!(target.origin(), Origin::Admin);
+}
+
+#[test]
+fn a_configured_value_the_attribute_rejects_leaves_the_default() {
+    let tree = tree_over(Layers::holding("/target_voltage_v", json!(9.0)));
+
+    let target = tree.root().setting_checked(
+        "target_voltage",
+        Some(Volts(1.15)),
+        within(Volts(0.0)..=Volts(2.0)),
+    );
+
+    assert_eq!(target.get(), Some(Volts(1.15)));
+    assert_eq!(target.origin(), Origin::Builtin);
+}
+
+#[test]
+fn a_client_write_reaches_the_setting_and_wakes_its_subscriber() {
+    let tree = Tree::new(Arc::new(Unconfigured));
+    let target = tree.root().setting("target_voltage", None::<Volts>);
+    let watcher = target.subscribe();
+
+    tree.store_json(&path("/target_voltage_v"), &json!(1.3), Origin::Api)
+        .expect("the attribute takes the value");
+
+    assert_eq!(target.get(), Some(Volts(1.3)));
+    assert_eq!(target.origin(), Origin::Api);
+    assert!(watcher.has_changed().expect("the attribute is alive"));
+}
+
+#[test]
+fn a_client_cannot_write_a_value_the_daemon_reports() {
+    let tree = Tree::new(Arc::new(Unconfigured));
+    let temperature = tree.root().report("asic_temperature", Some(61.5));
+
+    let refused = tree.store_json(&path("/asic_temperature"), &json!(20.0), Origin::Api);
+
+    assert!(matches!(
+        refused,
+        Err(WriteError::Value(ValueError::Reported))
+    ));
+    assert_eq!(temperature.get(), Some(61.5));
+}
+
+#[test]
+fn a_write_to_no_attribute_is_an_error_rather_than_a_new_attribute() {
+    let tree = Tree::new(Arc::new(Unconfigured));
+
+    let refused = tree.store_json(
+        &path("/boards/x/target_voltage_v"),
+        &json!(1.2),
+        Origin::Api,
+    );
+
+    assert!(matches!(refused, Err(WriteError::NoSuchAttribute(_))));
+    assert_eq!(tree.render(&Path::root()), None);
+}
+
+#[test]
+fn an_attribute_rejects_a_value_outside_its_range() {
+    let tree = Tree::new(Arc::new(Unconfigured));
+    let target = tree.root().setting_checked(
+        "target_voltage",
+        Some(Volts(1.15)),
+        within(Volts(1.0)..=Volts(1.4)),
+    );
+
+    let refused = tree.store_json(&path("/target_voltage_v"), &json!(2.0), Origin::Api);
+
+    assert!(matches!(
+        refused,
+        Err(WriteError::Value(ValueError::Rejected(_)))
+    ));
+    assert_eq!(target.get(), Some(Volts(1.15)));
+}
+
+#[test]
+fn an_unset_setting_is_a_value_a_client_can_ask_for() {
+    let tree = Tree::new(Arc::new(Unconfigured));
+    let target = tree.root().setting_checked(
+        "target_voltage",
+        Some(Volts(1.15)),
+        within(Volts(1.0)..=Volts(1.4)),
+    );
+
+    tree.store_json(&path("/target_voltage_v"), &Value::Null, Origin::Api)
+        .expect("null means the daemon decides");
+
+    assert_eq!(target.get(), None);
+}
+
+#[test]
+fn a_setting_no_layer_supplies_any_longer_returns_to_its_default() {
+    let tree = Tree::new(Arc::new(Unconfigured));
+    let target = tree.root().setting("target_voltage", Some(Volts(1.15)));
+    tree.store_json(&path("/target_voltage_v"), &json!(1.3), Origin::Api)
+        .expect("the attribute takes the value");
+
+    tree.resolve_all();
+
+    assert_eq!(target.get(), Some(Volts(1.15)));
+    assert_eq!(target.origin(), Origin::Builtin);
+}
+
+#[test]
+fn only_settings_report_where_their_value_came_from() {
+    let tree = tree_over(Layers::holding("/boards/x/target_voltage_v", json!(1.25)));
+    let board = tree.root().child("boards").child("x");
+    board.report("asic_temperature", Some(61.5));
+    board.setting("target_voltage", None::<Volts>);
+
+    assert_eq!(
+        tree.origins(&Path::root()),
+        json!({"/boards/x/target_voltage_v": "admin"})
+    );
 }

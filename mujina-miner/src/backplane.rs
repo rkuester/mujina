@@ -355,12 +355,12 @@ mod tests {
 
     use super::*;
     use crate::api_client::types::BoardTelemetry;
-    use crate::systree::Tree;
+    use crate::systree::{Tree, Unconfigured};
     use crate::transport::{cpu, usb::DevicePath};
 
     /// A cursor on the collection of boards in a tree of its own.
     fn test_boards() -> Cursor {
-        Tree::new().root().child("boards")
+        Tree::new(Arc::new(Unconfigured)).root().child("boards")
     }
 
     /// A board with no threads that sets `stopped` when the

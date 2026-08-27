@@ -44,16 +44,18 @@ impl BoardAttributes {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use serde_json::json;
 
-    use crate::systree::Tree;
+    use crate::systree::{Tree, Unconfigured};
 
     use super::*;
 
     /// Attaches a board at `/boards/x` and returns it with a cursor
     /// on the root.
     fn board() -> (Cursor, BoardAttributes) {
-        let root = Tree::new().root();
+        let root = Tree::new(Arc::new(Unconfigured)).root();
         let attrs = BoardAttributes::attach(&root.child("boards").child("x"), "Bitaxe Gamma");
         (root, attrs)
     }
