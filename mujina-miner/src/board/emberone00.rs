@@ -7,7 +7,6 @@ use std::time::Duration;
 
 use crate::tracing::prelude::*;
 use anyhow::{Context, Result};
-use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::{self, MissedTickBehavior};
 use tokio_serial::SerialPortBuilderExt;
@@ -18,7 +17,6 @@ use super::{
     pattern::{BoardPattern, Match, StringMatch},
 };
 use crate::{
-    api_client::types::{BoardTelemetry, TemperatureSensor},
     hw_trait::gpio::{Gpio, GpioPin, PinValue},
     mgmt_protocol::{
         ControlChannel,
@@ -150,22 +148,11 @@ async fn create_from_usb(device: UsbDeviceInfo, boards: Cursor) -> Result<Backpl
         .serial_number
         .clone()
         .unwrap_or_else(|| "unknown".into());
-    // The board telemetry document keeps the name it has always
-    // used, which is not the board's key in the tree.
-    let board_name = format!("emberone00-{serial}");
     let board = BoardAttributes::attach(&boards, MODEL, &serial);
     let attrs = EmberOne00Attributes::attach(board.clone());
 
-    let initial_telemetry = BoardTelemetry {
-        name: board_name,
-        model: info.model.clone(),
-        serial: info.serial_number.clone(),
-        ..Default::default()
-    };
-    let (telemetry_tx, telemetry_rx) = watch::channel(initial_telemetry);
-
     let cancel = CancellationToken::new();
-    let monitor_task = spawn_monitor(temp_left, temp_right, attrs, telemetry_tx, cancel.clone());
+    let monitor_task = spawn_monitor(temp_left, temp_right, attrs, cancel.clone());
 
     let mut hardware = EmberOne00 {
         control,
@@ -185,7 +172,6 @@ async fn create_from_usb(device: UsbDeviceInfo, boards: Cursor) -> Result<Backpl
         info,
         attrs: board,
         threads: Vec::new(),
-        telemetry_rx,
         shutdown: Some(shutdown),
     })
 }
@@ -232,7 +218,6 @@ fn spawn_monitor(
     mut temp_left: Tmp1075<BitaxeRawI2c>,
     mut temp_right: Tmp451<BitaxeRawI2c>,
     attrs: EmberOne00Attributes,
-    telemetry_tx: watch::Sender<BoardTelemetry>,
     cancel: CancellationToken,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -278,29 +263,10 @@ fn spawn_monitor(
 
             // Publish the whole pass under one guard, so a render
             // never mixes this pass with the one before it.
-            {
-                let mut published = attrs.write();
-                published.set(&attrs.pcb_left_temperature, t_left);
-                published.set(&attrs.pcb_right_temperature, t_right);
-                published.set(&attrs.chip_0_temperature, t_chip0);
-            }
-
-            telemetry_tx.send_modify(|t| {
-                t.temperatures = vec![
-                    TemperatureSensor {
-                        name: "pcb-left".into(),
-                        temperature: t_left,
-                    },
-                    TemperatureSensor {
-                        name: "pcb-right".into(),
-                        temperature: t_right,
-                    },
-                    TemperatureSensor {
-                        name: "chip-0".into(),
-                        temperature: t_chip0,
-                    },
-                ];
-            });
+            let mut published = attrs.write();
+            published.set(&attrs.pcb_left_temperature, t_left);
+            published.set(&attrs.pcb_right_temperature, t_right);
+            published.set(&attrs.chip_0_temperature, t_chip0);
         }
     })
 }

@@ -21,7 +21,6 @@ use tokio_util::{
 };
 
 use crate::{
-    api_client::types::{BoardTelemetry, Fan, PowerMeasurement, TemperatureSensor},
     asic::{
         bm13xx::{
             self, chip_config,
@@ -161,22 +160,12 @@ async fn create_from_usb(
         None => "Bitaxe-Gamma".to_string(),
     };
 
-    // Telemetry channel seeded with board identity
     let serial = device
         .serial_number
         .clone()
         .unwrap_or_else(|| "unknown".into());
-    let board_name = format!("bitaxe-{serial}");
     let board = BoardAttributes::attach(&boards, MODEL, &serial);
     let attrs = BitaxeAttributes::attach(board.clone());
-
-    let initial_state = BoardTelemetry {
-        name: board_name.clone(),
-        model: MODEL.name.into(),
-        serial: device.serial_number.clone(),
-        ..Default::default()
-    };
-    let (telemetry_tx, telemetry_rx) = watch::channel(initial_state);
 
     let info = BoardInfo {
         model: MODEL.name.to_string(),
@@ -185,13 +174,7 @@ async fn create_from_usb(
     };
 
     let cancel = CancellationToken::new();
-    let monitor_handle = device.spawn_monitor(
-        board_name,
-        attrs,
-        thread_shutdown_tx,
-        telemetry_tx,
-        cancel.clone(),
-    );
+    let monitor_handle = device.spawn_monitor(attrs, thread_shutdown_tx, cancel.clone());
 
     let voltage_regulator = Tps546Regulator::new(device.regulator.clone());
 
@@ -240,7 +223,6 @@ async fn create_from_usb(
         info,
         attrs: board,
         threads,
-        telemetry_rx,
         shutdown: Some(shutdown),
     })
 }
@@ -353,10 +335,8 @@ impl BitaxeDevice {
     /// Spawns the board monitor task.
     fn spawn_monitor(
         &self,
-        board_name: String,
         attrs: BitaxeAttributes,
         thread_shutdown: watch::Sender<()>,
-        telemetry_tx: watch::Sender<BoardTelemetry>,
         cancel: CancellationToken,
     ) -> JoinHandle<()> {
         let monitor = BitaxeMonitor {
@@ -364,13 +344,11 @@ impl BitaxeDevice {
             regulator: self.regulator.clone(),
             attrs,
             thread_shutdown,
-            board_name,
-            board_model: MODEL.name,
             board_serial: self.serial_number.clone(),
             bad_thermal_count: 0,
             reset_line: self.reset_line.clone(),
         };
-        tokio::spawn(monitor.run(telemetry_tx, cancel))
+        tokio::spawn(monitor.run(cancel))
     }
 }
 
@@ -388,8 +366,6 @@ struct BitaxeMonitor {
     /// Shutdown signal to the hash threads. A send requests
     /// shutdown; a thread's exit drops its receiver.
     thread_shutdown: watch::Sender<()>,
-    board_name: String,
-    board_model: &'static str,
     board_serial: Option<String>,
     /// Consecutive bad thermal readings (I2C error, out-of-range, or
     /// above emergency threshold). Triggers emergency shutdown.
@@ -398,7 +374,7 @@ struct BitaxeMonitor {
 }
 
 impl BitaxeMonitor {
-    async fn run(mut self, telemetry_tx: watch::Sender<BoardTelemetry>, cancel: CancellationToken) {
+    async fn run(mut self, cancel: CancellationToken) {
         let mut tick = time::interval(Duration::from_secs(2));
         tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
         let mut last_log = Instant::now();
@@ -415,7 +391,7 @@ impl BitaxeMonitor {
         loop {
             tokio::select! {
                 _ = tick.tick() => {
-                    if let Err(e) = self.monitor_tick(&telemetry_tx, &mut last_log).await {
+                    if let Err(e) = self.monitor_tick(&mut last_log).await {
                         error!(error = %e, "Board monitor failed");
                         self.shutdown().await;
                         return;
@@ -481,11 +457,7 @@ impl BitaxeMonitor {
     /// Any category except normal increments a consecutive
     /// bad-reading counter. After BAD_READING_LIMIT consecutive
     /// bad readings, the board shuts down.
-    async fn monitor_tick(
-        &mut self,
-        tx: &watch::Sender<BoardTelemetry>,
-        last_log: &mut Instant,
-    ) -> Result<()> {
+    async fn monitor_tick(&mut self, last_log: &mut Instant) -> Result<()> {
         // Read all sensors in one pass
         let (raw_temp, fan_percent, fan_rpm) = {
             let mut fan = self.emc2101.lock().await;
@@ -607,50 +579,12 @@ impl BitaxeMonitor {
             );
         }
 
-        // Publish telemetry
-        let _ = tx.send(BoardTelemetry {
-            name: self.board_name.clone(),
-            model: self.board_model.into(),
-            serial: self.board_serial.clone(),
-            fans: vec![Fan {
-                name: "fan".into(),
-                rpm: fan_rpm,
-                percent: fan_percent,
-                target_percent: None,
-            }],
-            temperatures: vec![
-                TemperatureSensor {
-                    name: "asic".into(),
-                    temperature: asic_temp.map(Temperature::from_celsius),
-                },
-                TemperatureSensor {
-                    name: "vr".into(),
-                    temperature: vr_temp.map(|t| Temperature::from_celsius(t as f32)),
-                },
-            ],
-            powers: vec![
-                PowerMeasurement {
-                    name: "input".into(),
-                    voltage_v: vin.map(|v| v.volts()),
-                    current_a: None,
-                    power_w: None,
-                },
-                PowerMeasurement {
-                    name: "core".into(),
-                    voltage_v: vout.map(|v| v.volts()),
-                    current_a: iout_ma.map(|ma| ma as f32 / 1000.0),
-                    power_w: power_mw.map(|mw| mw as f32 / 1000.0),
-                },
-            ],
-            threads: Vec::new(), // TODO: populate from hash thread telemetry
-        });
-
         // Periodic log
         const LOG_INTERVAL: Duration = Duration::from_secs(30);
         if last_log.elapsed() >= LOG_INTERVAL {
             *last_log = Instant::now();
             info!(
-                board = %self.board_model,
+                board = MODEL.name,
                 serial = ?self.board_serial,
                 asic_temp_c = ?asic_temp,
                 fan_percent = ?fan_percent,

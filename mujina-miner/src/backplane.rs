@@ -15,7 +15,6 @@ use tokio_util::sync::CancellationToken;
 use futures::future::BoxFuture;
 
 use crate::{
-    api::BoardRegistration,
     board::{
         BackplaneConnector, BoardAttributes, BoardDescriptor, BoardInfo, VirtualBoardRegistry,
     },
@@ -61,8 +60,6 @@ pub struct Backplane {
     event_rxs: Vec<mpsc::Receiver<TransportEvent>>,
     /// Channel to register hash threads with the scheduler
     scheduler_tx: mpsc::Sender<ThreadRegistration>,
-    /// Channel to forward board registrations to the API server
-    board_reg_tx: mpsc::Sender<BoardRegistration>,
     /// Systree cursor on the collection of boards
     sys_boards: Cursor,
 }
@@ -72,7 +69,6 @@ impl Backplane {
     pub fn new(
         event_rxs: Vec<mpsc::Receiver<TransportEvent>>,
         scheduler_tx: mpsc::Sender<ThreadRegistration>,
-        board_reg_tx: mpsc::Sender<BoardRegistration>,
         sys_boards: Cursor,
     ) -> Self {
         Self {
@@ -81,7 +77,6 @@ impl Backplane {
             boards: HashMap::new(),
             event_rxs,
             scheduler_tx,
-            board_reg_tx,
             sys_boards,
         }
     }
@@ -168,18 +163,8 @@ impl Backplane {
             info,
             attrs,
             threads,
-            telemetry_rx,
             shutdown,
         } = conn;
-
-        let registration = BoardRegistration { telemetry_rx };
-        if let Err(e) = self.board_reg_tx.send(registration).await {
-            error!(
-                board = %info.model,
-                error = %e,
-                "Failed to register board with API server"
-            );
-        }
 
         info!(
             board = %info.model,

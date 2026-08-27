@@ -6,12 +6,8 @@ pub mod pattern;
 
 use anyhow::Result;
 use futures::future::BoxFuture;
-use tokio::sync::watch;
 
-use crate::{
-    api_client::types::BoardTelemetry, asic::hash_thread::HashThread, systree::Cursor,
-    transport::UsbDeviceInfo,
-};
+use crate::{asic::hash_thread::HashThread, systree::Cursor, transport::UsbDeviceInfo};
 
 pub use attributes::{BoardAttributes, BoardModel};
 
@@ -26,9 +22,6 @@ pub struct BackplaneConnector {
 
     /// Hash threads ready to be scheduled.
     pub threads: Vec<Box<dyn HashThread>>,
-
-    /// Watch receiver for the board's telemetry stream.
-    pub telemetry_rx: watch::Receiver<BoardTelemetry>,
 
     /// Shuts down the board when awaited. `None` if the board has
     /// no shutdown work to do.
@@ -51,8 +44,7 @@ pub struct BoardInfo {
 /// The factory is responsible for:
 ///
 /// 1. Opening hardware resources (serial ports, etc.)
-/// 2. Creating a `watch::channel<BoardTelemetry>` seeded with the
-///    board's identity (model, serial)
+/// 2. Attaching the board's attributes under the cursor it is given
 /// 3. Initializing the board hardware
 /// 4. Creating hash threads
 /// 5. Returning a [`BackplaneConnector`] with all of the above

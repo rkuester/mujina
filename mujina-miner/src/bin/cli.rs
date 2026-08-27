@@ -83,11 +83,23 @@ async fn cmd_status() -> Result<()> {
         }
     }
 
-    if !state.boards.is_empty() {
-        println!("Boards:");
-        for board in &state.boards {
-            println!("  - {}", board.model);
-        }
+    print_boards(&client).await?;
+
+    Ok(())
+}
+
+/// Print each board in the systree with its model and its status.
+async fn print_boards(client: &api_client::Client) -> Result<()> {
+    let Some(boards) = client.get_subtree("boards").await? else {
+        println!("Boards: (none)");
+        return Ok(());
+    };
+
+    println!("Boards:");
+    for (key, board) in boards.as_object().into_iter().flatten() {
+        let model = board["model"].as_str().unwrap_or("unknown model");
+        let status = board["status"].as_str().unwrap_or("unknown");
+        println!("  - {key} ({model}, {status})");
     }
 
     Ok(())
