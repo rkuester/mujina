@@ -57,12 +57,15 @@ use crate::{
 };
 
 use super::{
-    BackplaneConnector, BoardAttributes, BoardInfo,
+    BackplaneConnector, BoardAttributes, BoardInfo, BoardModel,
     pattern::{Match, StringMatch},
 };
 
-/// The name this board reports as its model.
-const MODEL: &str = "Bitaxe Gamma";
+/// The model this board reports.
+const MODEL: BoardModel = BoardModel {
+    name: "Bitaxe Gamma",
+    key: "bitaxe-gamma",
+};
 
 inventory::submit! {
     crate::board::BoardDescriptor {
@@ -74,7 +77,7 @@ inventory::submit! {
             product: Match::Specific(StringMatch::Exact("Bitaxe")),
             serial_pattern: Match::Any,
         },
-        name: MODEL,
+        name: MODEL.name,
         create_fn: |device, boards| Box::pin(create_from_usb(device, boards, Firmware::BitaxeRaw)),
     }
 }
@@ -90,7 +93,7 @@ inventory::submit! {
             product: Match::Specific(StringMatch::Exact("Bitaxe Gamma RHAP-D")),
             serial_pattern: Match::Any,
         },
-        name: MODEL,
+        name: MODEL.name,
         create_fn: |device, boards| Box::pin(create_from_usb(device, boards, Firmware::RhapD)),
     }
 }
@@ -140,22 +143,23 @@ async fn create_from_usb(
     };
 
     // Telemetry channel seeded with board identity
-    let board_name = format!(
-        "bitaxe-{}",
-        device.serial_number.as_deref().unwrap_or("unknown")
-    );
-    let attrs = BoardAttributes::attach(&boards.child(&board_name), MODEL);
+    let serial = device
+        .serial_number
+        .clone()
+        .unwrap_or_else(|| "unknown".into());
+    let board_name = format!("bitaxe-{serial}");
+    let attrs = BoardAttributes::attach(&boards, MODEL, &serial);
 
     let initial_state = BoardTelemetry {
         name: board_name.clone(),
-        model: MODEL.into(),
+        model: MODEL.name.into(),
         serial: device.serial_number.clone(),
         ..Default::default()
     };
     let (telemetry_tx, telemetry_rx) = watch::channel(initial_state);
 
     let info = BoardInfo {
-        model: MODEL.to_string(),
+        model: MODEL.name.to_string(),
         firmware_version: Some(firmware.to_string()),
         serial_number: device.serial_number.clone(),
     };
@@ -283,7 +287,7 @@ impl BitaxeDevice {
             regulator: self.regulator.clone(),
             thread_shutdown,
             board_name,
-            board_model: MODEL,
+            board_model: MODEL.name,
             board_serial: self.serial_number.clone(),
             bad_thermal_count: 0,
             reset_line: self.reset_line.clone(),

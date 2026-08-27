@@ -6,7 +6,7 @@
 use anyhow::{Result, anyhow};
 use tokio::sync::watch;
 
-use super::{BackplaneConnector, BoardAttributes, BoardInfo, VirtualBoardDescriptor};
+use super::{BackplaneConnector, BoardAttributes, BoardInfo, BoardModel, VirtualBoardDescriptor};
 use crate::{
     api_client::types::BoardTelemetry,
     asic::hash_thread::HashThread,
@@ -14,13 +14,23 @@ use crate::{
     systree::Cursor,
 };
 
-/// The name this board reports as its model.
-const MODEL: &str = "CPU Miner";
+/// The model this board reports.
+const MODEL: BoardModel = BoardModel {
+    name: "CPU Miner",
+    key: "cpu-miner",
+};
+
+/// The serial this board reports.
+///
+/// One daemon runs one CPU board, so its identity never varies. A
+/// serial made from the thread count would move the board's saved
+/// settings whenever the count changed.
+const SERIAL: &str = "0";
 
 inventory::submit! {
     VirtualBoardDescriptor {
         device_type: "cpu_miner",
-        name: MODEL,
+        name: MODEL.name,
         create_fn: |boards| Box::pin(create_cpu_board(boards)),
     }
 }
@@ -32,12 +42,12 @@ async fn create_cpu_board(boards: Cursor) -> Result<BackplaneConnector> {
     let board_name = format!("cpu-{}x{}%", config.thread_count, config.duty_percent);
 
     let info = BoardInfo {
-        model: MODEL.into(),
+        model: MODEL.name.into(),
         firmware_version: None,
-        serial_number: Some(board_name.clone()),
+        serial_number: Some(SERIAL.into()),
     };
 
-    let attrs = BoardAttributes::attach(&boards.child(&board_name), MODEL);
+    let attrs = BoardAttributes::attach(&boards, MODEL, SERIAL);
 
     let initial_state = BoardTelemetry {
         name: board_name.clone(),
