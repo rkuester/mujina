@@ -35,8 +35,9 @@ use crate::{
         tmp451::Tmp451,
         tmp1075::Tmp1075,
     },
-    systree::Cursor,
+    systree::{Cursor, Report, WriteGuard},
     transport::UsbDeviceInfo,
+    types::Temperature,
 };
 
 /// The model this board reports.
@@ -152,7 +153,8 @@ async fn create_from_usb(device: UsbDeviceInfo, boards: Cursor) -> Result<Backpl
     // The board telemetry document keeps the name it has always
     // used, which is not the board's key in the tree.
     let board_name = format!("emberone00-{serial}");
-    let attrs = BoardAttributes::attach(&boards, MODEL, &serial);
+    let board = BoardAttributes::attach(&boards, MODEL, &serial);
+    let attrs = EmberOne00Attributes::attach(board.clone());
 
     let initial_telemetry = BoardTelemetry {
         name: board_name,
@@ -163,9 +165,9 @@ async fn create_from_usb(device: UsbDeviceInfo, boards: Cursor) -> Result<Backpl
     let (telemetry_tx, telemetry_rx) = watch::channel(initial_telemetry);
 
     let cancel = CancellationToken::new();
-    let monitor_task = spawn_monitor(temp_left, temp_right, telemetry_tx, cancel.clone());
+    let monitor_task = spawn_monitor(temp_left, temp_right, attrs, telemetry_tx, cancel.clone());
 
-    let mut board = EmberOne00 {
+    let mut hardware = EmberOne00 {
         control,
         vddio_en,
         status_led,
@@ -174,24 +176,62 @@ async fn create_from_usb(device: UsbDeviceInfo, boards: Cursor) -> Result<Backpl
     };
 
     let shutdown = Box::pin(async move {
-        board.shutdown().await;
+        hardware.shutdown().await;
     });
 
     warn!("emberOne/00 hash threads not yet implemented");
 
     Ok(BackplaneConnector {
         info,
-        attrs,
+        attrs: board,
         threads: Vec::new(),
         telemetry_rx,
         shutdown: Some(shutdown),
     })
 }
 
-/// Spawn a task that periodically reads sensors and publishes telemetry.
+/// What an emberOne/00 holds in the tree.
+///
+/// It holds what every board owes and adds the three temperatures
+/// the board measures.
+struct EmberOne00Attributes {
+    board: BoardAttributes,
+
+    /// The temperature of the left side of the board.
+    pcb_left_temperature: Report<Option<Temperature>>,
+
+    /// The temperature of the right side of the board.
+    pcb_right_temperature: Report<Option<Temperature>>,
+
+    /// The temperature of the first chip's diode, read through the
+    /// sensor on the right side of the board.
+    chip_0_temperature: Report<Option<Temperature>>,
+}
+
+impl EmberOne00Attributes {
+    /// Attaches an emberOne/00's own attributes over a board's cursor.
+    fn attach(board: BoardAttributes) -> Self {
+        let sys = board.cursor().clone();
+
+        Self {
+            pcb_left_temperature: sys.report("pcb_left_temperature", None),
+            pcb_right_temperature: sys.report("pcb_right_temperature", None),
+            chip_0_temperature: sys.report("chip_0_temperature", None),
+            board,
+        }
+    }
+
+    /// Opens the tree for writing.
+    fn write(&self) -> WriteGuard<'_> {
+        self.board.write()
+    }
+}
+
+/// Spawn a task that periodically reads the board's sensors.
 fn spawn_monitor(
     mut temp_left: Tmp1075<BitaxeRawI2c>,
     mut temp_right: Tmp451<BitaxeRawI2c>,
+    attrs: EmberOne00Attributes,
     telemetry_tx: watch::Sender<BoardTelemetry>,
     cancel: CancellationToken,
 ) -> JoinHandle<()> {
@@ -235,6 +275,15 @@ fn spawn_monitor(
                     None
                 }
             };
+
+            // Publish the whole pass under one guard, so a render
+            // never mixes this pass with the one before it.
+            {
+                let mut published = attrs.write();
+                published.set(&attrs.pcb_left_temperature, t_left);
+                published.set(&attrs.pcb_right_temperature, t_right);
+                published.set(&attrs.chip_0_temperature, t_chip0);
+            }
 
             telemetry_tx.send_modify(|t| {
                 t.temperatures = vec![
