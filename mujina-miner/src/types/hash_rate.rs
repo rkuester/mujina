@@ -12,6 +12,10 @@ use std::iter::Sum;
 use std::ops::Add;
 use std::time::Duration;
 
+use serde_json::Value;
+
+use crate::systree::AttributeValue;
+
 /// Per-miner hashrate in hashes per second.
 ///
 /// Stored as u64, covering up to ~18.4 EH/s. Constructors from
@@ -115,6 +119,16 @@ impl Sum for HashRate {
 impl std::fmt::Display for HashRate {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.to_human_readable())
+    }
+}
+
+/// Renders in hashes per second, so a name takes the `_per_s`
+/// suffix and `hashes` becomes `hashes_per_s`.
+impl AttributeValue for HashRate {
+    const UNIT: Option<&'static str> = Some("per_s");
+
+    fn to_json(&self) -> Value {
+        Value::from(self.0)
     }
 }
 

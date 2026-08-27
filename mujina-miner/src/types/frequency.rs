@@ -4,6 +4,12 @@
 //! pattern of `std::time::Duration`. Convert on access via the unit-
 //! specific methods.
 
+use std::fmt;
+
+use serde_json::Value;
+
+use crate::systree::{AttributeValue, SettingValue, ValueError};
+
 /// Frequency in Hz.
 ///
 /// A unit-aware frequency type. Stores Hz internally for precision;
@@ -46,6 +52,30 @@ impl Frequency {
     /// Returns the frequency in MHz.
     pub const fn mhz(&self) -> f32 {
         self.hz as f32 / 1_000_000.0
+    }
+}
+
+/// Renders in Hz, so a name takes the `_hz` suffix.
+impl AttributeValue for Frequency {
+    const UNIT: Option<&'static str> = Some("hz");
+
+    fn to_json(&self) -> Value {
+        Value::from(self.hz())
+    }
+}
+
+impl SettingValue for Frequency {
+    fn from_json(value: &Value) -> Result<Self, ValueError> {
+        match value.as_u64() {
+            Some(hz) => Ok(Self::from_hz(hz)),
+            None => Err(ValueError::WrongType("a frequency in whole Hz")),
+        }
+    }
+}
+
+impl fmt::Display for Frequency {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:.2} MHz", self.mhz())
     }
 }
 

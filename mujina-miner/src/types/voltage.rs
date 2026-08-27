@@ -5,6 +5,12 @@
 //! negative voltages represent correctly. Convert on access via the
 //! unit-specific methods.
 
+use std::fmt;
+
+use serde_json::Value;
+
+use crate::systree::{AttributeValue, SettingValue, ValueError};
+
 /// Voltage in microvolts.
 ///
 /// A unit-aware voltage type. Stores microvolts internally for
@@ -48,6 +54,30 @@ impl Voltage {
     /// Returns the voltage in volts.
     pub const fn volts(&self) -> f32 {
         self.uv as f32 / 1_000_000.0
+    }
+}
+
+/// Renders in volts, so a name takes the `_v` suffix.
+impl AttributeValue for Voltage {
+    const UNIT: Option<&'static str> = Some("v");
+
+    fn to_json(&self) -> Value {
+        Value::from(self.volts())
+    }
+}
+
+impl SettingValue for Voltage {
+    fn from_json(value: &Value) -> Result<Self, ValueError> {
+        match value.as_f64() {
+            Some(volts) => Ok(Self::from_volts(volts as f32)),
+            None => Err(ValueError::WrongType("a voltage in volts")),
+        }
+    }
+}
+
+impl fmt::Display for Voltage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:.3} V", self.volts())
     }
 }
 
