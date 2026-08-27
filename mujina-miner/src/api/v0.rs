@@ -7,6 +7,7 @@ use axum::{
     Json,
     extract::{Path, State},
     http::StatusCode,
+    routing,
 };
 use std::time::Duration;
 
@@ -15,6 +16,7 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 
 use super::commands::SchedulerCommand;
 use super::server::SharedState;
+use super::systree;
 use crate::api_client::types::{
     BoardTelemetry, MinerPatchRequest, MinerTelemetry, SourceTelemetry,
 };
@@ -28,7 +30,22 @@ pub fn routes() -> OpenApiRouter<SharedState> {
         .routes(routes!(get_board))
         .routes(routes!(get_sources))
         .routes(routes!(get_source))
+        .route("/", routing::get(systree::read_root))
+        .route(
+            TREE,
+            routing::get(systree::read)
+                .put(systree::replace)
+                .patch(systree::amend)
+                .delete(systree::forget),
+        )
 }
+
+/// Every path in the systree, below the more specific routes above.
+///
+/// MIP-0001 UR4 makes the URL the JSON Pointer into the tree. The
+/// documents above are matched first, so they shadow the tree at
+/// their own three paths until they retire.
+const TREE: &str = "/{*path}";
 
 /// Health check endpoint.
 #[utoipa::path(

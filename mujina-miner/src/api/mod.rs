@@ -7,6 +7,7 @@
 pub mod commands;
 mod registry;
 mod server;
+mod systree;
 mod v0;
 
 pub use registry::BoardRegistration;
