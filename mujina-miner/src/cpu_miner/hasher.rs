@@ -30,12 +30,15 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use bitcoin::block::Header as BlockHeader;
 use bitcoin::hashes::Hash;
+use tokio::sync::watch;
 
+use super::attributes::DEFAULT_DUTY;
 use crate::{
-    asic::hash_thread::{HashTask, HashThreadStatus, Share},
+    asic::hash_thread::{HashTask, HashThreadStatus, Share, ThreadAttributes},
     job_source::MerkleRootKind,
+    systree::MemberStatus,
     tracing::prelude::*,
-    types::HashRate,
+    types::{HashRate, Ratio},
 };
 
 /// Commands sent to the mining thread.
@@ -72,18 +75,20 @@ pub enum MinerCommand {
 /// * `thread_name` - Name for logging
 /// * `cmd_rx` - Channel for receiving commands
 /// * `status` - Shared status for queries
-/// * `duty_percent` - Target CPU duty cycle (1-100)
+/// * `duty` - The share of each second to spend hashing, read afresh
+///   each cycle so a client's change takes effect at once
+/// * `attrs` - The thread's attributes, where it publishes its rate
 /// * `shutdown` - Atomic flag for graceful shutdown
 pub fn run_mining_loop(
     thread_name: String,
     cmd_rx: mpsc::Receiver<MinerCommand>,
     status: Arc<RwLock<HashThreadStatus>>,
-    duty_percent: u8,
+    mut duty: watch::Receiver<Option<Ratio>>,
+    attrs: ThreadAttributes,
     shutdown: Arc<AtomicBool>,
 ) {
-    // Calculate duty cycle timing
-    let cycle_ms = 1000u64;
-    let work_ms = (cycle_ms as f64 * duty_percent as f64 / 100.0) as u64;
+    /// How long one work-and-rest cycle lasts.
+    const CYCLE: Duration = Duration::from_secs(1);
 
     let mut current_task: Option<HashTask> = None;
     let mut cached_merkle_root: Option<bitcoin::TxMerkleNode> = None;
@@ -93,7 +98,7 @@ pub fn run_mining_loop(
     let mut hashes_computed: u64 = 0;
     let mut last_hashrate_update = Instant::now();
 
-    loop {
+    'mining: loop {
         // Check shutdown flag
         if shutdown.load(Ordering::Relaxed) {
             break;
@@ -124,27 +129,28 @@ pub fn run_mining_loop(
                         let _ = response_tx.send(Ok(old));
                     }
                     MinerCommand::Shutdown => {
-                        return;
+                        break 'mining;
                     }
                 },
                 Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => return,
+                Err(TryRecvError::Disconnected) => break 'mining,
             }
         }
 
         // Mine if we have a task
         if current_task.is_some() {
             let cycle_start = Instant::now();
+            let work = working_span(*duty.borrow_and_update(), CYCLE);
 
-            // Hash for work_ms milliseconds, checking time only every 10000 hashes
+            // Hash for the working span, checking the time only every 10000 hashes
             loop {
                 // Check elapsed time and other conditions every 10000 hashes
                 if hashes_computed.is_multiple_of(10000) {
-                    if cycle_start.elapsed() >= Duration::from_millis(work_ms) {
+                    if cycle_start.elapsed() >= work {
                         break;
                     }
                     if shutdown.load(Ordering::Relaxed) {
-                        return;
+                        break 'mining;
                     }
                 }
 
@@ -177,7 +183,7 @@ pub fn run_mining_loop(
                             let _ = response_tx.send(Ok(old));
                             break;
                         }
-                        MinerCommand::Shutdown => return,
+                        MinerCommand::Shutdown => break 'mining,
                     }
                 }
 
@@ -200,10 +206,9 @@ pub fn run_mining_loop(
             }
 
             // Sleep for remainder of cycle (utilization control)
-            let elapsed = cycle_start.elapsed().as_millis() as u64;
-            let sleep_ms = cycle_ms.saturating_sub(elapsed);
-            if sleep_ms > 0 {
-                std::thread::sleep(Duration::from_millis(sleep_ms));
+            let rest = CYCLE.saturating_sub(cycle_start.elapsed());
+            if !rest.is_zero() {
+                std::thread::sleep(rest);
             }
 
             // Roll ntime every second
@@ -232,6 +237,7 @@ pub fn run_mining_loop(
                     s.hashrate = hashrate;
                     s.chip_shares_found = shares_found;
                 }
+                attrs.write().set(&attrs.hashrate, hashrate);
 
                 hashes_computed = 0;
                 last_hashrate_update = Instant::now();
@@ -241,6 +247,18 @@ pub fn run_mining_loop(
             std::thread::sleep(Duration::from_millis(100));
         }
     }
+
+    let mut published = attrs.write();
+    published.set(&attrs.status, MemberStatus::Absent);
+    published.set(&attrs.hashrate, HashRate::default());
+}
+
+/// Returns how long of a cycle to spend hashing.
+///
+/// An unset duty means the daemon decides, which is
+/// [`DEFAULT_DUTY`].
+fn working_span(duty: Option<Ratio>, cycle: Duration) -> Duration {
+    cycle.mul_f32(duty.unwrap_or(DEFAULT_DUTY).factor())
 }
 
 /// Measure this CPU's peak single-thread hashrate.

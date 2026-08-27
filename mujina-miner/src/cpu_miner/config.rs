@@ -3,17 +3,14 @@
 //! Parses environment variables to configure the CPU mining backend.
 
 /// CPU miner configuration parsed from environment variables.
+///
+/// Only whether to mine, and with how many threads, is read here.
+/// How hard each thread works is a setting in the tree, so a client
+/// can change it while the miner runs.
 #[derive(Debug, Clone)]
 pub struct CpuMinerConfig {
     /// Number of mining threads to spawn.
     pub thread_count: usize,
-
-    /// Target CPU duty cycle percentage (1-100).
-    ///
-    /// Controls duty cycling: at 80%, each thread hashes for 800ms then
-    /// sleeps for 200ms per second. Useful for avoiding alerts on cloud
-    /// instances that monitor for sustained CPU usage.
-    pub duty_percent: u8,
 }
 
 impl CpuMinerConfig {
@@ -25,22 +22,12 @@ impl CpuMinerConfig {
     /// # Environment Variables
     ///
     /// - `MUJINA_CPUMINER_THREADS`: Number of threads (presence enables CPU mining)
-    /// - `MUJINA_CPUMINER_DUTY`: Duty cycle % (default: 50, clamped to 1-100)
     pub fn from_env() -> Option<Self> {
         let thread_count = std::env::var("MUJINA_CPUMINER_THREADS")
             .ok()
             .and_then(|s| s.parse().ok())?;
 
-        let duty_percent = std::env::var("MUJINA_CPUMINER_DUTY")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(50)
-            .clamp(1, 100);
-
-        Some(Self {
-            thread_count,
-            duty_percent,
-        })
+        Some(Self { thread_count })
     }
 }
 
@@ -61,25 +48,11 @@ mod tests {
 
     #[test]
     #[serial]
-    fn test_duty_clamped_to_valid_range() {
+    fn test_thread_count_comes_from_the_environment() {
         // SAFETY: Test runs serially, no concurrent env access
-        unsafe {
-            // Upper bound: 150 -> 100
-            std::env::set_var("MUJINA_CPUMINER_THREADS", "99");
-            std::env::set_var("MUJINA_CPUMINER_DUTY", "150");
-        }
-        if let Some(config) = CpuMinerConfig::from_env() {
-            assert_eq!(config.duty_percent, 100);
-        }
+        unsafe { std::env::set_var("MUJINA_CPUMINER_THREADS", "99") };
 
-        // SAFETY: Test runs serially, no concurrent env access
-        unsafe {
-            // Lower bound: 0 -> 1
-            std::env::set_var("MUJINA_CPUMINER_THREADS", "99");
-            std::env::set_var("MUJINA_CPUMINER_DUTY", "0");
-        }
-        if let Some(config) = CpuMinerConfig::from_env() {
-            assert_eq!(config.duty_percent, 1);
-        }
+        let config = CpuMinerConfig::from_env().expect("the variable is set");
+        assert_eq!(config.thread_count, 99);
     }
 }

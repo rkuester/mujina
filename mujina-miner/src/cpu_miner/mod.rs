@@ -8,11 +8,16 @@
 //! Enable via environment variables:
 //!
 //! - `MUJINA_CPUMINER_THREADS=N` - Number of mining threads (presence enables)
-//! - `MUJINA_CPUMINER_DUTY=P` - Duty cycle percentage (default: 50)
+//!
+//! The duty cycle is a setting in the tree, at each thread's
+//! `target_duty_percent`, which `MUJINA_CPUMINER_DUTY` sets through
+//! the environment layer of the configuration cascade.
 
+mod attributes;
 mod config;
 mod hasher;
 mod thread;
 
+pub use attributes::{CpuThreadAttributes, DEFAULT_DUTY};
 pub use config::CpuMinerConfig;
 pub use thread::CpuHashThread;
