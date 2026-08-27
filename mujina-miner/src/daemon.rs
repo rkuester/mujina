@@ -4,7 +4,6 @@
 //! task management, signal handling, and graceful shutdown.
 
 use std::env;
-use std::sync::Arc;
 
 use tokio::signal::unix::{self, SignalKind};
 use tokio::sync::{mpsc, watch};
@@ -15,6 +14,7 @@ use crate::tracing::prelude::*;
 use crate::{
     api::{self, ApiConfig, commands::SchedulerCommand},
     backplane::Backplane,
+    config::{Configuration, Location},
     cpu_miner::CpuMinerConfig,
     job_source::{
         SourceCommand, SourceEvent,
@@ -24,7 +24,7 @@ use crate::{
     },
     scheduler::{self, SourceRegistration, ThreadRegistration},
     stratum_v1::{PoolConfig as StratumPoolConfig, TcpConnector},
-    systree::{Tree, Unconfigured},
+    systree::Tree,
     transport::{CpuDeviceInfo, TransportEvent, UsbTransport, cpu as cpu_transport},
 };
 
@@ -94,9 +94,16 @@ impl Daemon {
         // registrations here, the API server collects and serves them.
         let (board_reg_tx, board_reg_rx) = mpsc::channel(10);
 
-        // The tree of every value the miner reports. Boards attach
-        // their own nodes under it as they are found.
-        let systree = Tree::new(Arc::new(Unconfigured));
+        // The layers a setting's value comes from, read before any
+        // transport starts, so the first board to attach resolves
+        // against a full stack.
+        let configuration = Configuration::load(Location::discover());
+        self.tracker
+            .spawn(configuration.clone().save_until(self.shutdown.clone()));
+
+        // The tree of every value the miner holds. Boards attach
+        // their own attributes under it as they are found.
+        let systree = Tree::new(configuration.clone());
 
         // Create and start backplane
         let mut backplane = Backplane::new(
@@ -288,15 +295,26 @@ impl Daemon {
         // Install signal handlers
         let mut sigint = unix::signal(SignalKind::interrupt())?;
         let mut sigterm = unix::signal(SignalKind::terminate())?;
+        let mut sighup = unix::signal(SignalKind::hangup())?;
 
-        // Wait for shutdown signal
-        tokio::select! {
-            _ = sigint.recv() => {
-                info!("Received SIGINT.");
-            },
-            _ = sigterm.recv() => {
-                info!("Received SIGTERM.");
-            },
+        // Wait for a shutdown signal, rereading the configuration
+        // files whenever asked. MIP-0001 UR10 asks for an explicit
+        // reload rather than a file watch.
+        loop {
+            tokio::select! {
+                _ = sigint.recv() => {
+                    info!("Received SIGINT.");
+                    break;
+                },
+                _ = sigterm.recv() => {
+                    info!("Received SIGTERM.");
+                    break;
+                },
+                _ = sighup.recv() => {
+                    info!("Received SIGHUP.");
+                    configuration.reload(&systree);
+                },
+            }
         }
 
         // Initiate shutdown
