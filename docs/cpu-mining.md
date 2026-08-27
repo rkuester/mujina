@@ -45,6 +45,19 @@ Adjust with `MUJINA_CPUMINER_DUTY`:
 - `50` --- Hash half the time, sleep half (default)
 - `10` --- Light load, mostly idle
 
+The duty cycle is a setting in the tree, one per thread, so a client
+can also change it while the miner runs:
+
+```bash
+curl -X PUT -H 'content-type: application/json' -d '25' \
+  'http://127.0.0.1:7785/api/v0/boards/cpu-miner-0/threads/0/target_duty_percent'
+```
+
+A `*` in place of a thread number applies the value to every thread,
+including threads that appear later. The environment variable is one
+layer of the configuration cascade, so it sets the duty at startup and
+a client's write takes over from there.
+
 For testing, lower duty cycles work fine since you're not trying to maximize
 hashrate.
 
