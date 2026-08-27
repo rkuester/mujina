@@ -37,8 +37,46 @@ use bitcoin::pow::Target;
 use tokio::sync::mpsc;
 
 use crate::job_source::{Extranonce2, Extranonce2Range, JobTemplate};
+use crate::systree::{Cursor, MemberStatus, Report, WriteGuard};
 use crate::types::HashRate;
 use bitcoin::pow::Work;
+
+/// What every hash thread reports, whatever its board.
+///
+/// A model's own struct holds this one and adds its extras over the
+/// same cursor, so a driver cannot skip what every thread owes.
+#[derive(Clone)]
+pub struct ThreadAttributes {
+    sys: Cursor,
+
+    /// Whether the thread is there and working.
+    pub status: Report<MemberStatus>,
+
+    /// The rate the thread computes from its clock and its chain,
+    /// not an estimate from the shares it found.
+    pub hashrate: Report<HashRate>,
+}
+
+impl ThreadAttributes {
+    /// Attaches the common thread attributes under a cursor.
+    pub fn attach(sys: &Cursor) -> Self {
+        Self {
+            status: sys.report("status", MemberStatus::Present),
+            hashrate: sys.report("hashes", HashRate::default()),
+            sys: sys.clone(),
+        }
+    }
+
+    /// Returns a cursor on the thread's own place in the tree.
+    pub fn cursor(&self) -> &Cursor {
+        &self.sys
+    }
+
+    /// Opens the tree for writing.
+    pub fn write(&self) -> WriteGuard<'_> {
+        self.sys.write()
+    }
+}
 
 /// HashThread capabilities reported to scheduler for work assignment decisions.
 ///

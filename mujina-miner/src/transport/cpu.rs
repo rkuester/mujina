@@ -22,7 +22,4 @@ pub struct CpuDeviceInfo {
 
     /// Number of mining threads to create.
     pub thread_count: usize,
-
-    /// Target CPU duty cycle percentage (1-100).
-    pub duty_percent: u8,
 }

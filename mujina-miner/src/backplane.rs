@@ -302,7 +302,6 @@ impl Backplane {
                 info!(
                     board = descriptor.name,
                     threads = device_info.thread_count,
-                    duty = device_info.duty_percent,
                     "CPU miner board connected."
                 );
 

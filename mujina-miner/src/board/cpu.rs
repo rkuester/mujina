@@ -10,7 +10,7 @@ use super::{BackplaneConnector, BoardAttributes, BoardInfo, BoardModel, VirtualB
 use crate::{
     api_client::types::BoardTelemetry,
     asic::hash_thread::HashThread,
-    cpu_miner::{CpuHashThread, CpuMinerConfig},
+    cpu_miner::{CpuHashThread, CpuMinerConfig, CpuThreadAttributes},
     systree::Cursor,
 };
 
@@ -39,7 +39,7 @@ async fn create_cpu_board(boards: Cursor) -> Result<BackplaneConnector> {
     let config = CpuMinerConfig::from_env()
         .ok_or_else(|| anyhow!("cpu miner not configured (MUJINA_CPUMINER_THREADS not set)"))?;
 
-    let board_name = format!("cpu-{}x{}%", config.thread_count, config.duty_percent);
+    let board_name = format!("cpu-{}", config.thread_count);
 
     let info = BoardInfo {
         model: MODEL.name.into(),
@@ -57,12 +57,11 @@ async fn create_cpu_board(boards: Cursor) -> Result<BackplaneConnector> {
     };
     let (_telemetry_tx, telemetry_rx) = watch::channel(initial_state);
 
+    let sys_threads = attrs.cursor().child("threads");
     let threads: Vec<Box<dyn HashThread>> = (0..config.thread_count)
         .map(|i| {
-            Box::new(CpuHashThread::new(
-                format!("CPU Core {i}"),
-                config.duty_percent,
-            )) as _
+            let thread = CpuThreadAttributes::attach(&sys_threads.child(&i.to_string()));
+            Box::new(CpuHashThread::new(format!("CPU Core {i}"), thread)) as _
         })
         .collect();
 

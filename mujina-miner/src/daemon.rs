@@ -66,17 +66,12 @@ impl Daemon {
 
         // Inject CPU miner virtual device if configured
         if let Some(config) = CpuMinerConfig::from_env() {
-            info!(
-                threads = config.thread_count,
-                duty = config.duty_percent,
-                "CPU miner enabled"
-            );
+            info!(threads = config.thread_count, "CPU miner enabled");
             let (cpu_tx, cpu_rx) = mpsc::channel::<TransportEvent>(100);
             let device = TransportEvent::Cpu(cpu_transport::TransportEvent::CpuDeviceConnected(
                 CpuDeviceInfo {
-                    device_id: format!("cpu-{}x{}%", config.thread_count, config.duty_percent),
+                    device_id: format!("cpu-{}", config.thread_count),
                     thread_count: config.thread_count,
-                    duty_percent: config.duty_percent,
                 },
             ));
             // Send the device and its enumeration completion, then drop the
