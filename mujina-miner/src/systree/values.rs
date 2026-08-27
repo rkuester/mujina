@@ -6,9 +6,9 @@
 
 use serde_json::Value;
 
-use super::attribute::AttributeValue;
+use super::attribute::{AttributeValue, SettingValue, ValueError};
 
-/// Implements [`AttributeValue`] for types that serde_json renders
+/// Implements the attribute traits for types that serde_json renders
 /// natively.
 ///
 /// A float that is not finite has no JSON form, and renders as
@@ -19,6 +19,13 @@ macro_rules! renders_as_itself {
             impl AttributeValue for $type {
                 fn to_json(&self) -> Value {
                     Value::from(self.clone())
+                }
+            }
+
+            impl SettingValue for $type {
+                fn from_json(value: &Value) -> Result<Self, ValueError> {
+                    serde_json::from_value(value.clone())
+                        .map_err(|_| ValueError::WrongType(stringify!($type)))
                 }
             }
         )*
@@ -38,6 +45,20 @@ impl<T: AttributeValue> AttributeValue for Option<T> {
         match self {
             Some(value) => value.to_json(),
             None => Value::Null,
+        }
+    }
+}
+
+/// Null is a value, not an absence.
+///
+/// An unset setting means the daemon decides, which is a thing a
+/// client can ask for. A layer that says nothing at all is a
+/// different case, and resolution never reaches here.
+impl<T: SettingValue> SettingValue for Option<T> {
+    fn from_json(value: &Value) -> Result<Self, ValueError> {
+        match value {
+            Value::Null => Ok(None),
+            value => T::from_json(value).map(Some),
         }
     }
 }

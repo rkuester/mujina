@@ -4,6 +4,7 @@
 //! task management, signal handling, and graceful shutdown.
 
 use std::env;
+use std::sync::Arc;
 
 use tokio::signal::unix::{self, SignalKind};
 use tokio::sync::{mpsc, watch};
@@ -23,7 +24,7 @@ use crate::{
     },
     scheduler::{self, SourceRegistration, ThreadRegistration},
     stratum_v1::{PoolConfig as StratumPoolConfig, TcpConnector},
-    systree::Tree,
+    systree::{Tree, Unconfigured},
     transport::{CpuDeviceInfo, TransportEvent, UsbTransport, cpu as cpu_transport},
 };
 
@@ -95,7 +96,7 @@ impl Daemon {
 
         // The tree of every value the miner reports. Boards attach
         // their own nodes under it as they are found.
-        let systree = Tree::new();
+        let systree = Tree::new(Arc::new(Unconfigured));
 
         // Create and start backplane
         let mut backplane = Backplane::new(

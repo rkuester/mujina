@@ -7,6 +7,30 @@ use crate::tracing::prelude::*;
 use super::path::Path;
 use super::tree::AttributeMap;
 
+/// Splits a JSON document into the path and value of each scalar.
+///
+/// The inverse of [`render_json`], and what turns a document a
+/// client sends into the writes it asks for. A mapping is a branch
+/// and anything else is a value, so a value that is itself a
+/// mapping cannot be written this way. No attribute holds one.
+pub fn leaves(document: &Value, prefix: &Path) -> Vec<(Path, Value)> {
+    let mut found = Vec::new();
+    split(document, prefix, &mut found);
+    found
+}
+
+/// Collects each scalar in a document with the path its keys spell.
+fn split(value: &Value, path: &Path, found: &mut Vec<(Path, Value)>) {
+    match value {
+        Value::Object(members) if !members.is_empty() => {
+            for (name, value) in members {
+                split(value, &path.child(name), found);
+            }
+        }
+        value => found.push((path.clone(), value.clone())),
+    }
+}
+
 /// Renders attributes at or under a prefix as one JSON document.
 ///
 /// Returns `None` when no attribute exists at the path, keeping a
@@ -42,6 +66,27 @@ pub(super) fn render_json(attributes: &AttributeMap, prefix: &Path) -> Option<Va
     }
 
     document
+}
+
+/// Returns the layer each setting at or under a prefix came from.
+///
+/// The document is a sidecar to the one [`render_json`] returns,
+/// keyed by full path rather than nested, because it is read
+/// alongside the values rather than in place of them. A reported
+/// value has no origin, so it does not appear.
+pub(super) fn render_origins(attributes: &AttributeMap, prefix: &Path) -> Value {
+    let mut origins = Map::new();
+
+    for (path, attribute) in attributes.range(prefix..) {
+        if !path.starts_with(prefix) {
+            break;
+        }
+        if let Some(origin) = attribute.origin() {
+            origins.insert(path.to_string(), origin.as_str().into());
+        }
+    }
+
+    Value::Object(origins)
 }
 
 /// Nests a value under a name, creating objects as needed.
