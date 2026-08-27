@@ -2,6 +2,7 @@ use anyhow::{Context as _, Result, anyhow, bail};
 use async_trait::async_trait;
 use std::{
     fmt,
+    ops::RangeInclusive,
     pin::Pin,
     sync::{Arc, Mutex as StdMutex},
     task::{Context, Poll},
@@ -29,7 +30,7 @@ use crate::{
             thread::BM13xxThread,
             topology::TopologySpec,
         },
-        hash_thread::HashThread,
+        hash_thread::{HashThread, ThreadAttributes},
     },
     hw_trait::{
         gpio::{Gpio, GpioPin, PinValue},
@@ -45,15 +46,17 @@ use crate::{
     },
     peripheral::{
         emc2101::{Emc2101, Percent},
+        fan::FanAttributes,
+        regulator::RegulatorAttributes,
         tps546::{Tps546, Tps546Config, Tps546Regulator},
     },
-    systree::Cursor,
+    systree::{Cursor, MemberStatus, Report, WriteGuard},
     tracing::prelude::*,
     transport::{
         UsbDeviceInfo,
         serial::{SerialReader, SerialStream, SerialWriter},
     },
-    types::{Ratio, Temperature, Voltage},
+    types::{HashRate, Ratio, Temperature, Voltage},
 };
 
 use super::{
@@ -66,6 +69,22 @@ const MODEL: BoardModel = BoardModel {
     name: "Bitaxe Gamma",
     key: "bitaxe-gamma",
 };
+
+/// The core voltage the daemon asks for when nothing else does.
+const DEFAULT_CORE_VOLTAGE: Voltage = Voltage::from_volts(1.15);
+
+/// The range a client may ask of the core rail.
+///
+/// The board sets the limits, and these are narrower than the
+/// regulator's own, which reaches 2.0 V and would cook the ASIC.
+const CORE_VOLTAGE_LIMITS: RangeInclusive<Voltage> =
+    Voltage::from_volts(1.0)..=Voltage::from_volts(1.3);
+
+/// The fan duty the daemon asks for when nothing else does.
+///
+/// There is no thermal control loop yet, so an unset target runs
+/// the fan at full power.
+const DEFAULT_FAN_DUTY: Ratio = Ratio::from_percent(100.0);
 
 inventory::submit! {
     crate::board::BoardDescriptor {
@@ -148,7 +167,8 @@ async fn create_from_usb(
         .clone()
         .unwrap_or_else(|| "unknown".into());
     let board_name = format!("bitaxe-{serial}");
-    let attrs = BoardAttributes::attach(&boards, MODEL, &serial);
+    let board = BoardAttributes::attach(&boards, MODEL, &serial);
+    let attrs = BitaxeAttributes::attach(board.clone());
 
     let initial_state = BoardTelemetry {
         name: board_name.clone(),
@@ -165,8 +185,13 @@ async fn create_from_usb(
     };
 
     let cancel = CancellationToken::new();
-    let monitor_handle =
-        device.spawn_monitor(board_name, thread_shutdown_tx, telemetry_tx, cancel.clone());
+    let monitor_handle = device.spawn_monitor(
+        board_name,
+        attrs,
+        thread_shutdown_tx,
+        telemetry_tx,
+        cancel.clone(),
+    );
 
     let voltage_regulator = Tps546Regulator::new(device.regulator.clone());
 
@@ -183,9 +208,17 @@ async fn create_from_usb(
         voltage_regulator: Box::new(voltage_regulator),
     };
 
+    // One chip, so the chain's nameplate rate is the chip's.
+    let chip = chip_config::bm1370();
+    let sys_thread = board.cursor().child("threads").child("0");
+    let thread_attrs = ThreadAttributes::attach(&sys_thread);
+    thread_attrs
+        .write()
+        .set(&thread_attrs.hashrate, chip.nameplate);
+
     let thread = BM13xxThread::new(
         thread_name,
-        chip_config::bm1370(),
+        chip,
         TopologySpec::single_domain(1),
         data_reader,
         data_writer,
@@ -197,15 +230,58 @@ async fn create_from_usb(
     let shutdown = Box::pin(async move {
         cancel.cancel();
         let _ = monitor_handle.await;
+
+        let mut gone = thread_attrs.write();
+        gone.set(&thread_attrs.status, MemberStatus::Absent);
+        gone.set(&thread_attrs.hashrate, HashRate::default());
     });
 
     Ok(BackplaneConnector {
         info,
-        attrs,
+        attrs: board,
         threads,
         telemetry_rx,
         shutdown: Some(shutdown),
     })
+}
+
+/// What a Bitaxe holds in the tree.
+///
+/// It holds what every board owes and adds this board's own diode
+/// temperature, its core rail, and its fan.
+struct BitaxeAttributes {
+    board: BoardAttributes,
+
+    /// The temperature of the diode on the ASIC die.
+    asic_temperature: Report<Option<Temperature>>,
+
+    /// The rail that feeds the ASIC.
+    core: RegulatorAttributes,
+
+    /// The one fan the board carries.
+    fan: FanAttributes,
+}
+
+impl BitaxeAttributes {
+    /// Attaches a Bitaxe's own attributes over a board's cursor.
+    fn attach(board: BoardAttributes) -> Self {
+        let sys = board.cursor().clone();
+
+        Self {
+            asic_temperature: sys.report("asic_temperature", None),
+            core: RegulatorAttributes::attach(
+                &sys.child("regulators").child("core"),
+                CORE_VOLTAGE_LIMITS,
+            ),
+            fan: FanAttributes::attach(&sys.child("fans").child("0")),
+            board,
+        }
+    }
+
+    /// Opens the tree for writing.
+    fn write(&self) -> WriteGuard<'_> {
+        self.board.write()
+    }
 }
 
 /// The assembled hardware of one Bitaxe Gamma board.
@@ -278,6 +354,7 @@ impl BitaxeDevice {
     fn spawn_monitor(
         &self,
         board_name: String,
+        attrs: BitaxeAttributes,
         thread_shutdown: watch::Sender<()>,
         telemetry_tx: watch::Sender<BoardTelemetry>,
         cancel: CancellationToken,
@@ -285,6 +362,7 @@ impl BitaxeDevice {
         let monitor = BitaxeMonitor {
             emc2101: self.emc2101.clone(),
             regulator: self.regulator.clone(),
+            attrs,
             thread_shutdown,
             board_name,
             board_model: MODEL.name,
@@ -302,6 +380,10 @@ impl BitaxeDevice {
 struct BitaxeMonitor {
     emc2101: Arc<Mutex<Emc2101<BitaxeRawI2c>>>,
     regulator: Arc<Mutex<Tps546<BitaxeRawI2c>>>,
+
+    /// The board's place in the tree, where the monitor publishes
+    /// what it reads and reads what a client asks for.
+    attrs: BitaxeAttributes,
 
     /// Shutdown signal to the hash threads. A send requests
     /// shutdown; a thread's exit drops its receiver.
@@ -321,6 +403,15 @@ impl BitaxeMonitor {
         tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
         let mut last_log = Instant::now();
 
+        // Subscribe before reading, so a write between the two wakes
+        // the loop rather than passing unseen.
+        let mut core_voltage = self.attrs.core.target_voltage.subscribe();
+        let mut fan_duty = self.attrs.fan.target_duty.subscribe();
+        let asked = *core_voltage.borrow_and_update();
+        self.apply_core_voltage(asked).await;
+        let asked = *fan_duty.borrow_and_update();
+        self.apply_fan_duty(asked).await;
+
         loop {
             tokio::select! {
                 _ = tick.tick() => {
@@ -330,6 +421,14 @@ impl BitaxeMonitor {
                         return;
                     }
                 }
+                Ok(()) = core_voltage.changed() => {
+                    let asked = *core_voltage.borrow_and_update();
+                    self.apply_core_voltage(asked).await;
+                }
+                Ok(()) = fan_duty.changed() => {
+                    let asked = *fan_duty.borrow_and_update();
+                    self.apply_fan_duty(asked).await;
+                }
                 _ = cancel.cancelled() => {
                     self.shutdown().await;
                     if let Err(e) = self.emc2101.lock().await.set_fan_speed(Percent::new_clamped(25)).await {
@@ -338,6 +437,32 @@ impl BitaxeMonitor {
                     return;
                 }
             }
+        }
+    }
+
+    /// Asks the core rail for the voltage a client set.
+    ///
+    /// An unset target means the daemon decides, which is
+    /// [`DEFAULT_CORE_VOLTAGE`]. What the rail actually reaches is a
+    /// separate reading, published each pass.
+    async fn apply_core_voltage(&mut self, target: Option<Voltage>) {
+        let asked = target.unwrap_or(DEFAULT_CORE_VOLTAGE);
+        match self.regulator.lock().await.set_vout_target(asked).await {
+            Ok(()) => debug!(%asked, "Core voltage target set"),
+            Err(e) => warn!(%asked, error = %e, "Failed to set the core voltage target"),
+        }
+    }
+
+    /// Drives the fan at the duty a client set.
+    ///
+    /// An unset target means the daemon decides, and with no thermal
+    /// control loop it decides on [`DEFAULT_FAN_DUTY`].
+    async fn apply_fan_duty(&mut self, target: Option<Ratio>) {
+        let asked = target.unwrap_or(DEFAULT_FAN_DUTY);
+        let speed = Percent::new_clamped(asked.percent() as u8);
+        match self.emc2101.lock().await.set_fan_speed(speed).await {
+            Ok(()) => debug!(%asked, "Fan duty set"),
+            Err(e) => warn!(%asked, error = %e, "Failed to set the fan duty"),
         }
     }
 
@@ -434,6 +559,37 @@ impl BitaxeMonitor {
             self.bad_thermal_count = 0;
             None
         };
+
+        // Publish every reading of this pass under one guard, so a
+        // render of the board never mixes this pass with the last.
+        // A failed read publishes null rather than leaving the last
+        // good reading to look current.
+        {
+            let mut published = self.attrs.write();
+            published.set(
+                &self.attrs.asic_temperature,
+                asic_temp.map(Temperature::from_celsius),
+            );
+            published.set(&self.attrs.core.input_voltage, vin);
+            published.set(&self.attrs.core.voltage, vout);
+            published.set(
+                &self.attrs.core.current,
+                iout_ma.map(|ma| ma as f32 / 1000.0),
+            );
+            published.set(
+                &self.attrs.core.power,
+                power_mw.map(|mw| mw as f32 / 1000.0),
+            );
+            published.set(
+                &self.attrs.core.temperature,
+                vr_temp.map(|c| Temperature::from_celsius(c as f32)),
+            );
+            published.set(&self.attrs.fan.rpm, fan_rpm);
+            published.set(
+                &self.attrs.fan.duty,
+                fan_percent.map(|p| Ratio::from_percent(p as f32)),
+            );
+        }
 
         // Without reliable temperature readings we cannot operate
         // safely. Shut down the board.
