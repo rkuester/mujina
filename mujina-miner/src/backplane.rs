@@ -15,7 +15,6 @@ use tokio_util::sync::CancellationToken;
 use futures::future::BoxFuture;
 
 use crate::{
-    api::BoardRegistration,
     board::{
         BackplaneConnector, BoardAttributes, BoardDescriptor, BoardInfo, VirtualBoardRegistry,
     },
@@ -58,8 +57,6 @@ pub struct Backplane {
     event_rxs: Vec<mpsc::Receiver<TransportEvent>>,
     /// Channel to register hash threads with the scheduler
     scheduler_tx: mpsc::Sender<ThreadRegistration>,
-    /// Channel to forward board registrations to the API server
-    board_reg_tx: mpsc::Sender<BoardRegistration>,
     /// Systree cursor on the collection of boards
     sys_boards: Cursor,
 }
@@ -69,7 +66,6 @@ impl Backplane {
     pub fn new(
         event_rxs: Vec<mpsc::Receiver<TransportEvent>>,
         scheduler_tx: mpsc::Sender<ThreadRegistration>,
-        board_reg_tx: mpsc::Sender<BoardRegistration>,
         sys_boards: Cursor,
     ) -> Self {
         Self {
@@ -78,7 +74,6 @@ impl Backplane {
             boards: HashMap::new(),
             event_rxs,
             scheduler_tx,
-            board_reg_tx,
             sys_boards,
         }
     }
@@ -173,18 +168,8 @@ impl Backplane {
             info,
             attrs,
             threads,
-            telemetry_rx,
             shutdown,
         } = conn;
-
-        let registration = BoardRegistration { telemetry_rx };
-        if let Err(e) = self.board_reg_tx.send(registration).await {
-            error!(
-                board = %info.model,
-                error = %e,
-                "Failed to register board with API server"
-            );
-        }
 
         let board = ActiveBoard {
             info,
@@ -350,10 +335,9 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
 
-    use tokio::{sync::watch, time};
+    use tokio::time;
 
     use super::*;
-    use crate::api_client::types::BoardTelemetry;
     use crate::board::BoardModel;
     use crate::systree::{Tree, Unconfigured};
     use crate::transport::{cpu, usb::DevicePath};
@@ -370,7 +354,6 @@ mod tests {
             name: "Test Board",
             key: "test-board",
         };
-        let (_telemetry_tx, telemetry_rx) = watch::channel(BoardTelemetry::default());
         BackplaneConnector {
             info: BoardInfo {
                 model: MODEL.name.into(),
@@ -379,7 +362,6 @@ mod tests {
             },
             attrs: BoardAttributes::attach(&test_boards(), MODEL, "unknown"),
             threads: Vec::new(),
-            telemetry_rx,
             shutdown: Some(Box::pin({
                 let stopped = stopped.clone();
                 async move { stopped.store(true, Ordering::SeqCst) }
@@ -394,13 +376,7 @@ mod tests {
         let (transport_tx, transport_rx) = mpsc::channel(1);
         drop(transport_tx);
         let (scheduler_tx, _scheduler_rx) = mpsc::channel(10);
-        let (board_reg_tx, _board_reg_rx) = mpsc::channel(10);
-        let mut backplane = Backplane::new(
-            vec![transport_rx],
-            scheduler_tx,
-            board_reg_tx,
-            test_boards(),
-        );
+        let mut backplane = Backplane::new(vec![transport_rx], scheduler_tx, test_boards());
 
         let stopped = Arc::new(AtomicBool::new(false));
         let key = DeviceKey::Cpu(cpu::DeviceId::new("test-board"));
@@ -432,13 +408,7 @@ mod tests {
     async fn unrelated_usb_removal_leaves_boards_running() {
         let (transport_tx, transport_rx) = mpsc::channel(1);
         let (scheduler_tx, _scheduler_rx) = mpsc::channel(10);
-        let (board_reg_tx, _board_reg_rx) = mpsc::channel(10);
-        let mut backplane = Backplane::new(
-            vec![transport_rx],
-            scheduler_tx,
-            board_reg_tx,
-            test_boards(),
-        );
+        let mut backplane = Backplane::new(vec![transport_rx], scheduler_tx, test_boards());
 
         let stopped = Arc::new(AtomicBool::new(false));
         let key = DeviceKey::Usb(DevicePath::new("/sys/devices/test-board"));
@@ -474,13 +444,7 @@ mod tests {
     async fn usb_removal_stops_only_the_board_on_that_device() {
         let (transport_tx, transport_rx) = mpsc::channel(1);
         let (scheduler_tx, _scheduler_rx) = mpsc::channel(10);
-        let (board_reg_tx, _board_reg_rx) = mpsc::channel(10);
-        let mut backplane = Backplane::new(
-            vec![transport_rx],
-            scheduler_tx,
-            board_reg_tx,
-            test_boards(),
-        );
+        let mut backplane = Backplane::new(vec![transport_rx], scheduler_tx, test_boards());
 
         let removed = Arc::new(AtomicBool::new(false));
         let removed_key = DeviceKey::Usb(DevicePath::new("/sys/devices/removed-board"));
@@ -521,13 +485,7 @@ mod tests {
     async fn a_second_board_on_a_device_stops_the_first() {
         let (_transport_tx, transport_rx) = mpsc::channel(1);
         let (scheduler_tx, _scheduler_rx) = mpsc::channel(10);
-        let (board_reg_tx, _board_reg_rx) = mpsc::channel(10);
-        let mut backplane = Backplane::new(
-            vec![transport_rx],
-            scheduler_tx,
-            board_reg_tx,
-            test_boards(),
-        );
+        let mut backplane = Backplane::new(vec![transport_rx], scheduler_tx, test_boards());
 
         let first = Arc::new(AtomicBool::new(false));
         let second = Arc::new(AtomicBool::new(false));

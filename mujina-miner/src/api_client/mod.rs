@@ -43,6 +43,32 @@ impl Client {
         self.get_json("miner").await
     }
 
+    /// Fetches the subtree of the systree at a path.
+    ///
+    /// Returns `None` when no attribute lies at or under the path,
+    /// which is how the API reports a board that is not there.
+    pub async fn get_subtree(&self, path: &str) -> Result<Option<serde_json::Value>> {
+        let url = format!("{}/api/v0/{}", self.base_url, path);
+        let response = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .context("failed to connect to miner API")?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        let status = response.status();
+        if !status.is_success() {
+            anyhow::bail!("API request failed: {}", status);
+        }
+        response
+            .json()
+            .await
+            .context("failed to parse API response")
+            .map(Some)
+    }
+
     /// GET a v0 API endpoint and deserialize the JSON response.
     pub async fn get_json<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<T> {
         let url = format!("{}/api/v0/{}", self.base_url, path);

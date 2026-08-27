@@ -265,16 +265,14 @@ impl Scheduler {
 
     /// Build a [`MinerTelemetry`] snapshot from current scheduler state.
     ///
-    /// The scheduler contributes aggregate stats and source info. Board
-    /// and thread details come from the backplane, not the scheduler, so
-    /// `boards` is left empty here.
+    /// The document holds the scheduler's own totals and its sources.
+    /// Boards are in the systree, which each board writes for itself.
     fn compute_miner_telemetry(&mut self) -> MinerTelemetry {
         MinerTelemetry {
             uptime_secs: self.stats.start_time.elapsed().as_secs(),
             hashrate: u64::from(self.measured_hashrate()),
             shares_submitted: self.stats.shares_submitted,
             paused: self.paused,
-            boards: vec![],
             sources: self
                 .sources
                 .values()

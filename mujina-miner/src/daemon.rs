@@ -83,10 +83,6 @@ impl Daemon {
             transport_rxs.push(cpu_rx);
         }
 
-        // Board registration channel: backplane forwards board
-        // registrations here, the API server collects and serves them.
-        let (board_reg_tx, board_reg_rx) = mpsc::channel(10);
-
         // The layers a setting's value comes from, read before any
         // transport starts, so the first board to attach resolves
         // against a full stack.
@@ -99,12 +95,7 @@ impl Daemon {
         let systree = Tree::new(configuration.clone());
 
         // Create and start backplane
-        let backplane = Backplane::new(
-            transport_rxs,
-            thread_tx,
-            board_reg_tx,
-            systree.root().child("boards"),
-        );
+        let backplane = Backplane::new(transport_rxs, thread_tx, systree.root().child("boards"));
         self.tracker.spawn(backplane.run(self.shutdown.clone()));
 
         // Create job source (Stratum v1 or Dummy)
@@ -265,7 +256,6 @@ impl Daemon {
                     config,
                     shutdown,
                     miner_telemetry_rx,
-                    board_reg_rx,
                     scheduler_cmd_tx,
                     systree,
                     configuration,

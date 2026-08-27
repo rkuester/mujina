@@ -1,6 +1,6 @@
 //! HTTP server lifecycle and router construction.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use anyhow::Result;
 use axum::{Router, response::Redirect, routing};
@@ -14,11 +14,7 @@ use crate::tracing::prelude::*;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_swagger_ui::SwaggerUi;
 
-use super::{
-    commands::SchedulerCommand,
-    registry::{BoardRegistration, BoardRegistry},
-    v0,
-};
+use super::{commands::SchedulerCommand, v0};
 use crate::api_client::types::MinerTelemetry;
 use crate::config::Configuration;
 use crate::systree::Tree;
@@ -34,23 +30,15 @@ pub struct ApiConfig {
 #[derive(Clone)]
 pub(crate) struct SharedState {
     pub miner_telemetry_rx: watch::Receiver<MinerTelemetry>,
-    pub board_registry: Arc<Mutex<BoardRegistry>>,
     pub scheduler_cmd_tx: mpsc::Sender<SchedulerCommand>,
     pub systree: Arc<Tree>,
     pub configuration: Arc<Configuration>,
 }
 
 impl SharedState {
-    /// Build a complete MinerTelemetry by combining scheduler data with board
-    /// snapshots from the registry.
+    /// Returns the current miner telemetry.
     pub fn miner_telemetry(&self) -> MinerTelemetry {
-        let mut telemetry = self.miner_telemetry_rx.borrow().clone();
-        telemetry.boards = self
-            .board_registry
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .boards();
-        telemetry
+        self.miner_telemetry_rx.borrow().clone()
     }
 }
 
@@ -60,38 +48,15 @@ impl SharedState {
 /// cancellation token is triggered. It binds to localhost only by default for
 /// security.
 ///
-/// Board registrations arrive via `board_reg_rx` as boards connect. The
-/// server manages the collection internally and cleans up when boards
-/// disconnect.
 pub async fn serve(
     config: ApiConfig,
     shutdown: CancellationToken,
     miner_telemetry_rx: watch::Receiver<MinerTelemetry>,
-    mut board_reg_rx: mpsc::Receiver<BoardRegistration>,
     scheduler_cmd_tx: mpsc::Sender<SchedulerCommand>,
     systree: Arc<Tree>,
     configuration: Arc<Configuration>,
 ) -> Result<()> {
-    let board_registry = Arc::new(Mutex::new(BoardRegistry::new()));
-
-    // Drain board registrations into the registry as they arrive.
-    // Exits when the sender is dropped (backplane shutdown).
-    tokio::spawn({
-        let registry = board_registry.clone();
-        async move {
-            while let Some(reg) = board_reg_rx.recv().await {
-                registry.lock().unwrap_or_else(|e| e.into_inner()).push(reg);
-            }
-        }
-    });
-
-    let app = build_router(
-        miner_telemetry_rx,
-        board_registry,
-        scheduler_cmd_tx,
-        systree,
-        configuration,
-    );
+    let app = build_router(miner_telemetry_rx, scheduler_cmd_tx, systree, configuration);
 
     let listener = TcpListener::bind(&config.bind_addr).await?;
     let actual_addr = listener.local_addr()?;
@@ -120,14 +85,12 @@ pub async fn serve(
 /// Build the application router with all API routes.
 pub(crate) fn build_router(
     miner_telemetry_rx: watch::Receiver<MinerTelemetry>,
-    board_registry: Arc<Mutex<BoardRegistry>>,
     scheduler_cmd_tx: mpsc::Sender<SchedulerCommand>,
     systree: Arc<Tree>,
     configuration: Arc<Configuration>,
 ) -> Router {
     let state = SharedState {
         miner_telemetry_rx,
-        board_registry,
         scheduler_cmd_tx,
         systree,
         configuration,
@@ -155,14 +118,12 @@ mod tests {
     use http_body_util::BodyExt;
     use tower::ServiceExt;
 
-    use serde_json::{Value, json};
-
     use super::*;
     use crate::api::commands::SchedulerCommand;
-    use crate::api::registry::BoardRegistration;
-    use crate::api_client::types::{BoardTelemetry, SourceTelemetry};
-    use crate::config::Location;
+    use crate::api_client::types::SourceTelemetry;
+    use crate::config::{Configuration, Location};
     use crate::systree::{Cursor, Origin, Setting, within};
+    use serde_json::{Value, json};
 
     /// Test fixtures returned by the router builder.
     struct TestFixtures {
@@ -170,42 +131,22 @@ mod tests {
         /// A cursor on the root of the router's tree, for attaching
         /// attributes a test wants to read or write.
         systree: Cursor,
-        /// Keep alive to prevent board watch channels from closing.
-        _board_senders: Vec<watch::Sender<BoardTelemetry>>,
         /// Publish updated miner telemetry (e.g. after handling a command).
         _miner_tx: watch::Sender<MinerTelemetry>,
         /// Receives commands sent by PATCH handlers.
         _cmd_rx: mpsc::Receiver<SchedulerCommand>,
     }
 
-    fn build_test_router(
-        miner_state: MinerTelemetry,
-        board_states: Vec<BoardTelemetry>,
-    ) -> TestFixtures {
+    fn build_test_router(miner_state: MinerTelemetry) -> TestFixtures {
         let (miner_tx, miner_rx) = watch::channel(miner_state);
         let (cmd_tx, cmd_rx) = mpsc::channel::<SchedulerCommand>(16);
-
-        let mut registry = BoardRegistry::new();
-        let mut board_senders = Vec::new();
-        for state in board_states {
-            let (tx, rx) = watch::channel(state);
-            registry.push(BoardRegistration { telemetry_rx: rx });
-            board_senders.push(tx);
-        }
 
         let configuration = Configuration::load(Location::Defaults);
         let systree = Tree::new(configuration.clone());
 
         TestFixtures {
-            router: build_router(
-                miner_rx,
-                Arc::new(Mutex::new(registry)),
-                cmd_tx,
-                systree.clone(),
-                configuration,
-            ),
+            router: build_router(miner_rx, cmd_tx, systree.clone(), configuration),
             systree: systree.root(),
-            _board_senders: board_senders,
             _miner_tx: miner_tx,
             _cmd_rx: cmd_rx,
         }
@@ -236,22 +177,47 @@ mod tests {
     }
 
     /// Attaches a board with one reported value and one setting.
-    ///
-    /// The path is four segments deep, so the older `/boards` and
-    /// `/boards/{name}` routes do not shadow it.
     fn attach_a_board(systree: &Cursor) -> Setting<Option<f64>> {
-        let core = systree
-            .child("boards")
-            .child("cpu-miner-0")
-            .child("regulators")
-            .child("core");
+        let board = systree.child("boards").child("cpu-miner-0");
+        board.report("model", "CPU Miner".to_string());
+        let core = board.child("regulators").child("core");
         core.report("voltage_v", Some(1.15));
         core.setting_checked("target_voltage_v", None, within(1.0..=1.3))
     }
 
     #[tokio::test]
+    async fn the_collection_of_boards_comes_from_the_tree() {
+        let fixtures = build_test_router(MinerTelemetry::default());
+        attach_a_board(&fixtures.systree);
+
+        let (status, body) = get(fixtures.router.clone(), "/api/v0/boards").await;
+
+        assert_eq!(status, 200);
+        let boards: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(boards["cpu-miner-0"]["model"], "CPU Miner");
+    }
+
+    #[tokio::test]
+    async fn one_board_comes_from_the_tree() {
+        let fixtures = build_test_router(MinerTelemetry::default());
+        attach_a_board(&fixtures.systree);
+
+        let (status, body) = get(fixtures.router.clone(), "/api/v0/boards/cpu-miner-0").await;
+
+        assert_eq!(status, 200);
+        let board: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            board,
+            json!({
+                "model": "CPU Miner",
+                "regulators": {"core": {"voltage_v": 1.15, "target_voltage_v": null}},
+            })
+        );
+    }
+
+    #[tokio::test]
     async fn a_url_names_the_subtree_it_reads() {
-        let fixtures = build_test_router(MinerTelemetry::default(), vec![]);
+        let fixtures = build_test_router(MinerTelemetry::default());
         attach_a_board(&fixtures.systree);
 
         let (status, body) = get(
@@ -269,7 +235,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_url_names_one_attribute_as_readily_as_a_subtree() {
-        let fixtures = build_test_router(MinerTelemetry::default(), vec![]);
+        let fixtures = build_test_router(MinerTelemetry::default());
         attach_a_board(&fixtures.systree);
 
         let (status, body) = get(
@@ -284,7 +250,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_root_reads_the_whole_miner() {
-        let fixtures = build_test_router(MinerTelemetry::default(), vec![]);
+        let fixtures = build_test_router(MinerTelemetry::default());
         attach_a_board(&fixtures.systree);
 
         let (status, body) = get(fixtures.router.clone(), "/api/v0").await;
@@ -292,15 +258,16 @@ mod tests {
         assert_eq!(status, 200);
         assert_eq!(
             serde_json::from_str::<Value>(&body).unwrap(),
-            json!({"boards": {"cpu-miner-0": {"regulators": {"core": {
-                "voltage_v": 1.15, "target_voltage_v": null
-            }}}}})
+            json!({"boards": {"cpu-miner-0": {
+                "model": "CPU Miner",
+                "regulators": {"core": {"voltage_v": 1.15, "target_voltage_v": null}},
+            }}})
         );
     }
 
     #[tokio::test]
     async fn reading_a_path_with_no_attribute_is_not_found() {
-        let fixtures = build_test_router(MinerTelemetry::default(), vec![]);
+        let fixtures = build_test_router(MinerTelemetry::default());
 
         let (status, _body) = get(
             fixtures.router.clone(),
@@ -313,7 +280,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_write_reaches_the_setting() {
-        let fixtures = build_test_router(MinerTelemetry::default(), vec![]);
+        let fixtures = build_test_router(MinerTelemetry::default());
         let target = attach_a_board(&fixtures.systree);
 
         let (status, _body) = send(
@@ -331,7 +298,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_write_the_attribute_refuses_leaves_the_value_alone() {
-        let fixtures = build_test_router(MinerTelemetry::default(), vec![]);
+        let fixtures = build_test_router(MinerTelemetry::default());
         let target = attach_a_board(&fixtures.systree);
 
         let (status, _body) = send(
@@ -348,7 +315,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_client_cannot_write_what_the_daemon_reports() {
-        let fixtures = build_test_router(MinerTelemetry::default(), vec![]);
+        let fixtures = build_test_router(MinerTelemetry::default());
         attach_a_board(&fixtures.systree);
 
         let (status, _body) = send(
@@ -364,7 +331,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_partial_document_writes_only_what_it_names() {
-        let fixtures = build_test_router(MinerTelemetry::default(), vec![]);
+        let fixtures = build_test_router(MinerTelemetry::default());
         let target = attach_a_board(&fixtures.systree);
 
         let (status, body) = send(
@@ -385,7 +352,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_delete_returns_a_setting_to_the_layer_beneath() {
-        let fixtures = build_test_router(MinerTelemetry::default(), vec![]);
+        let fixtures = build_test_router(MinerTelemetry::default());
         let target = attach_a_board(&fixtures.systree);
         let uri = "/api/v0/boards/cpu-miner-0/regulators/core/target_voltage_v";
         send(fixtures.router.clone(), "PUT", uri, Some(json!(1.2))).await;
@@ -399,7 +366,7 @@ mod tests {
 
     #[tokio::test]
     async fn deleting_what_was_never_written_is_not_found() {
-        let fixtures = build_test_router(MinerTelemetry::default(), vec![]);
+        let fixtures = build_test_router(MinerTelemetry::default());
         attach_a_board(&fixtures.systree);
 
         let (status, _body) = send(
@@ -415,7 +382,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_read_names_where_each_setting_came_from_when_asked() {
-        let fixtures = build_test_router(MinerTelemetry::default(), vec![]);
+        let fixtures = build_test_router(MinerTelemetry::default());
         attach_a_board(&fixtures.systree);
         let path = "/boards/cpu-miner-0/regulators/core/target_voltage_v";
         send(
@@ -444,7 +411,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_standing_rule_reaches_every_matching_attribute() {
-        let fixtures = build_test_router(MinerTelemetry::default(), vec![]);
+        let fixtures = build_test_router(MinerTelemetry::default());
         let target = attach_a_board(&fixtures.systree);
 
         let (status, _body) = send(
@@ -461,14 +428,14 @@ mod tests {
 
     #[tokio::test]
     async fn health_returns_ok() {
-        let fixtures = build_test_router(MinerTelemetry::default(), vec![]);
+        let fixtures = build_test_router(MinerTelemetry::default());
         let (status, body) = get(fixtures.router.clone(), "/api/v0/health").await;
         assert_eq!(status, 200);
         assert_eq!(body, "OK");
     }
 
     #[tokio::test]
-    async fn miner_includes_boards_and_sources() {
+    async fn the_miner_document_holds_the_scheduler_totals() {
         let miner_state = MinerTelemetry {
             uptime_secs: 42,
             hashrate: 1_000_000,
@@ -480,12 +447,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let board = BoardTelemetry {
-            name: "test-board".into(),
-            model: "TestModel".into(),
-            ..Default::default()
-        };
-        let fixtures = build_test_router(miner_state, vec![board]);
+        let fixtures = build_test_router(miner_state);
 
         let (status, body) = get(fixtures.router.clone(), "/api/v0/miner").await;
         assert_eq!(status, 200);
@@ -494,60 +456,8 @@ mod tests {
         assert_eq!(state.uptime_secs, 42);
         assert_eq!(state.hashrate, 1_000_000);
         assert_eq!(state.shares_submitted, 5);
-        assert_eq!(state.boards.len(), 1);
-        assert_eq!(state.boards[0].name, "test-board");
         assert_eq!(state.sources.len(), 1);
         assert_eq!(state.sources[0].name, "pool");
-    }
-
-    #[tokio::test]
-    async fn boards_returns_list() {
-        let boards = vec![
-            BoardTelemetry {
-                name: "board-a".into(),
-                model: "A".into(),
-                ..Default::default()
-            },
-            BoardTelemetry {
-                name: "board-b".into(),
-                model: "B".into(),
-                ..Default::default()
-            },
-        ];
-        let fixtures = build_test_router(MinerTelemetry::default(), boards);
-
-        let (status, body) = get(fixtures.router.clone(), "/api/v0/boards").await;
-        assert_eq!(status, 200);
-
-        let boards: Vec<BoardTelemetry> = serde_json::from_str(&body).unwrap();
-        assert_eq!(boards.len(), 2);
-        assert_eq!(boards[0].name, "board-a");
-        assert_eq!(boards[1].name, "board-b");
-    }
-
-    #[tokio::test]
-    async fn board_by_name_returns_match() {
-        let board = BoardTelemetry {
-            name: "bitaxe-abc123".into(),
-            model: "Bitaxe".into(),
-            serial: Some("abc123".into()),
-            ..Default::default()
-        };
-        let fixtures = build_test_router(MinerTelemetry::default(), vec![board]);
-
-        let (status, body) = get(fixtures.router.clone(), "/api/v0/boards/bitaxe-abc123").await;
-        assert_eq!(status, 200);
-
-        let board: BoardTelemetry = serde_json::from_str(&body).unwrap();
-        assert_eq!(board.name, "bitaxe-abc123");
-        assert_eq!(board.serial, Some("abc123".into()));
-    }
-
-    #[tokio::test]
-    async fn board_by_name_returns_404_when_missing() {
-        let fixtures = build_test_router(MinerTelemetry::default(), vec![]);
-        let (status, _body) = get(fixtures.router.clone(), "/api/v0/boards/nonexistent").await;
-        assert_eq!(status, 404);
     }
 
     #[tokio::test]
@@ -567,7 +477,7 @@ mod tests {
             ],
             ..Default::default()
         };
-        let fixtures = build_test_router(miner_state, vec![]);
+        let fixtures = build_test_router(miner_state);
 
         let (status, body) = get(fixtures.router.clone(), "/api/v0/sources").await;
         assert_eq!(status, 200);
@@ -590,7 +500,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let fixtures = build_test_router(miner_state, vec![]);
+        let fixtures = build_test_router(miner_state);
 
         let (status, body) = get(fixtures.router.clone(), "/api/v0/sources/my-pool").await;
         assert_eq!(status, 200);
@@ -602,7 +512,7 @@ mod tests {
 
     #[tokio::test]
     async fn source_by_name_returns_404_when_missing() {
-        let fixtures = build_test_router(MinerTelemetry::default(), vec![]);
+        let fixtures = build_test_router(MinerTelemetry::default());
         let (status, _body) = get(fixtures.router.clone(), "/api/v0/sources/nonexistent").await;
         assert_eq!(status, 404);
     }
@@ -617,7 +527,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let fixtures = build_test_router(miner_state, vec![]);
+        let fixtures = build_test_router(miner_state);
 
         let (status, body) = get(fixtures.router.clone(), "/api/v0/sources/pool").await;
         assert_eq!(status, 200);
@@ -628,7 +538,7 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_route_returns_404() {
-        let fixtures = build_test_router(MinerTelemetry::default(), vec![]);
+        let fixtures = build_test_router(MinerTelemetry::default());
         let (status, _body) = get(fixtures.router.clone(), "/api/v0/nope").await;
         assert_eq!(status, 404);
     }

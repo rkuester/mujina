@@ -17,17 +17,13 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 use super::commands::SchedulerCommand;
 use super::server::SharedState;
 use super::systree;
-use crate::api_client::types::{
-    BoardTelemetry, MinerPatchRequest, MinerTelemetry, SourceTelemetry,
-};
+use crate::api_client::types::{MinerPatchRequest, MinerTelemetry, SourceTelemetry};
 
 /// Build the v0 API routes with OpenAPI metadata.
 pub fn routes() -> OpenApiRouter<SharedState> {
     OpenApiRouter::new()
         .routes(routes!(health))
         .routes(routes!(get_miner, patch_miner))
-        .routes(routes!(get_boards))
-        .routes(routes!(get_board))
         .routes(routes!(get_sources))
         .routes(routes!(get_source))
         .route("/", routing::get(systree::read_root))
@@ -43,8 +39,8 @@ pub fn routes() -> OpenApiRouter<SharedState> {
 /// Every path in the systree, below the more specific routes above.
 ///
 /// MIP-0001 UR4 makes the URL the JSON Pointer into the tree. The
-/// documents above are matched first, so they shadow the tree at
-/// their own three paths until they retire.
+/// miner and source documents are matched first, so they shadow the
+/// tree at their own paths until the tree holds what they report.
 const TREE: &str = "/{*path}";
 
 /// Health check endpoint.
@@ -107,53 +103,6 @@ async fn patch_miner(
     }
 
     Ok(Json(state.miner_telemetry()))
-}
-
-/// Return all connected boards.
-#[utoipa::path(
-    get,
-    path = "/boards",
-    tag = "boards",
-    responses(
-        (status = OK, description = "List of connected boards", body = Vec<BoardTelemetry>),
-    ),
-)]
-async fn get_boards(State(state): State<SharedState>) -> Json<Vec<BoardTelemetry>> {
-    Json(
-        state
-            .board_registry
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .boards(),
-    )
-}
-
-/// Return a single board by name, or 404 if not found.
-#[utoipa::path(
-    get,
-    path = "/boards/{name}",
-    tag = "boards",
-    params(
-        ("name" = String, Path, description = "Board name"),
-    ),
-    responses(
-        (status = OK, description = "Board details", body = BoardTelemetry),
-        (status = NOT_FOUND, description = "Board not found"),
-    ),
-)]
-async fn get_board(
-    State(state): State<SharedState>,
-    Path(name): Path<String>,
-) -> Result<Json<BoardTelemetry>, StatusCode> {
-    state
-        .board_registry
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .boards()
-        .into_iter()
-        .find(|b| b.name == name)
-        .map(Json)
-        .ok_or(StatusCode::NOT_FOUND)
 }
 
 /// Return all registered job sources.

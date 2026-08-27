@@ -5,10 +5,8 @@
 //! require authentication for local access.
 
 pub mod commands;
-mod registry;
 mod server;
 mod systree;
 mod v0;
 
-pub use registry::BoardRegistration;
 pub use server::{ApiConfig, serve};
