@@ -21,6 +21,7 @@ mod guard;
 mod member;
 mod path;
 mod render;
+mod selector;
 mod tree;
 mod values;
 
@@ -32,4 +33,5 @@ pub use cursor::Cursor;
 pub use guard::{ReadGuard, WriteGuard};
 pub use member::MemberStatus;
 pub use path::{Path, PathError};
+pub use selector::Selector;
 pub use tree::Tree;
