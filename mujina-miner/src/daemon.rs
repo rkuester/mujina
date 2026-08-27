@@ -263,6 +263,8 @@ impl Daemon {
         // Start the API server
         self.tracker.spawn({
             let shutdown = self.shutdown.clone();
+            let systree = systree.clone();
+            let configuration = configuration.clone();
             async move {
                 // ASCII 'M' (77) + 'U' (85) = 7785
                 const API_PORT: u16 = 7785;
@@ -279,6 +281,8 @@ impl Daemon {
                     miner_telemetry_rx,
                     board_reg_rx,
                     scheduler_cmd_tx,
+                    systree,
+                    configuration,
                 )
                 .await
                 {
