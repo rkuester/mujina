@@ -79,6 +79,12 @@ pub struct Tps546Config {
     pub vout_uv_warn_limit: Ratio,
     /// Output undervoltage fault limit.
     pub vout_uv_fault_limit: Ratio,
+    /// Output overvoltage fault response byte, or `None` to leave
+    /// the chip's own.
+    pub vout_ov_fault_response: Option<u8>,
+    /// Output undervoltage fault response byte, or `None` to leave
+    /// the chip's own.
+    pub vout_uv_fault_response: Option<u8>,
 
     // Output current protection
     /// Output current overcurrent warning limit (A)
@@ -113,6 +119,32 @@ pub struct Tps546Config {
     // Pin configuration
     /// Pin detect override value
     pub pin_detect_override: u16,
+
+    /// Tuning computed for the board's power stage, or `None` to run
+    /// on what the chip loads from its pin straps and NVM.
+    pub power_stage: Option<PowerStageTuning>,
+}
+
+/// Loop compensation and current-sense tuning for one board's power
+/// stage.
+///
+/// The chip loads these registers from its pin-strap resistors and
+/// NVM at power-up. A board whose designer computed values for its
+/// own inductor and output capacitors writes them at every
+/// bring-up instead.
+#[derive(Debug, Clone)]
+pub struct PowerStageTuning {
+    /// COMPENSATION_CONFIG, the five bytes TI's compensation
+    /// calculator produces.
+    pub compensation: [u8; 5],
+    /// POWER_STAGE_CONFIG.
+    pub power_stage: u8,
+    /// TELEMETRY_CONFIG, six bytes.
+    pub telemetry: [u8; 6],
+    /// IOUT_CAL_GAIN, raw Linear11.
+    pub iout_cal_gain: u16,
+    /// IOUT_CAL_OFFSET, raw Linear11.
+    pub iout_cal_offset: u16,
 }
 
 /// TPS546 error types
@@ -366,6 +398,18 @@ impl<I2C: I2c> Tps546<I2C> {
         self.write_word(PmbusCommand::VoutUvFaultLimit, vout_uv_fault)
             .await?;
 
+        if let Some(response) = self.config.vout_ov_fault_response {
+            trace!("Setting VOUT_OV_FAULT_RESPONSE: 0x{:02X}", response);
+            self.write_byte(PmbusCommand::VoutOvFaultResponse, response)
+                .await?;
+        }
+
+        if let Some(response) = self.config.vout_uv_fault_response {
+            trace!("Setting VOUT_UV_FAULT_RESPONSE: 0x{:02X}", response);
+            self.write_byte(PmbusCommand::VoutUvFaultResponse, response)
+                .await?;
+        }
+
         // Output current protection
         trace!("----- IOUT");
         trace!(
@@ -484,6 +528,31 @@ impl<I2C: I2c> Tps546<I2C> {
             self.config.pin_detect_override,
         )
         .await?;
+
+        if let Some(tuning) = self.config.power_stage.clone() {
+            trace!("----- POWER STAGE");
+            trace!("Setting COMPENSATION_CONFIG: {:02X?}", tuning.compensation);
+            self.write_block(PmbusCommand::CompensationConfig, &tuning.compensation)
+                .await?;
+            // The chip takes time to load new loop coefficients.
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+            trace!("Setting POWER_STAGE_CONFIG: 0x{:02X}", tuning.power_stage);
+            self.write_block(PmbusCommand::PowerStageConfig, &[tuning.power_stage])
+                .await?;
+
+            trace!("Setting TELEMETRY_CONFIG: {:02X?}", tuning.telemetry);
+            self.write_block(PmbusCommand::TelemetryConfig, &tuning.telemetry)
+                .await?;
+
+            trace!("Setting IOUT_CAL_GAIN: 0x{:04X}", tuning.iout_cal_gain);
+            self.write_word(PmbusCommand::IoutCalGain, tuning.iout_cal_gain)
+                .await?;
+
+            trace!("Setting IOUT_CAL_OFFSET: 0x{:04X}", tuning.iout_cal_offset);
+            self.write_word(PmbusCommand::IoutCalOffset, tuning.iout_cal_offset)
+                .await?;
+        }
 
         debug!("TPS546 configuration written successfully");
         Ok(())
@@ -1224,6 +1293,16 @@ impl<I2C: I2c> Tps546<I2C> {
         Ok(())
     }
 
+    async fn write_block(&mut self, command: PmbusCommand, data: &[u8]) -> Result<()> {
+        // PMBus block write: command, byte count, then the bytes
+        let mut buffer = Vec::with_capacity(2 + data.len());
+        buffer.push(command.as_u8());
+        buffer.push(data.len() as u8);
+        buffer.extend_from_slice(data);
+        self.i2c.write(TPS546_I2C_ADDR, &buffer).await?;
+        Ok(())
+    }
+
     async fn read_block(&mut self, command: PmbusCommand, length: usize) -> Result<Vec<u8>> {
         // PMBus block read: first byte is length, then data
         let mut buffer = vec![0u8; length + 1];
@@ -1337,11 +1416,12 @@ mod tests {
 
     /// Mock I2C bus backed by a table of PMBus registers.
     ///
-    /// Reads of registers not in the table fail, and every register
-    /// read is recorded.
+    /// Reads of registers not in the table fail. Every register
+    /// read and every write transaction is recorded.
     struct RegisterTable {
         registers: HashMap<u8, Vec<u8>>,
         reads: Vec<u8>,
+        writes: Vec<Vec<u8>>,
     }
 
     impl RegisterTable {
@@ -1352,13 +1432,24 @@ mod tests {
                     .map(|(cmd, bytes)| (cmd.as_u8(), bytes.to_vec()))
                     .collect(),
                 reads: Vec::new(),
+                writes: Vec::new(),
             }
+        }
+
+        /// The write transactions that began with `command`.
+        fn writes_of(&self, command: PmbusCommand) -> Vec<&[u8]> {
+            self.writes
+                .iter()
+                .filter(|bytes| bytes[0] == command.as_u8())
+                .map(Vec::as_slice)
+                .collect()
         }
     }
 
     #[async_trait]
     impl I2c for RegisterTable {
-        async fn write(&mut self, _addr: u8, _data: &[u8]) -> HwResult<()> {
+        async fn write(&mut self, _addr: u8, data: &[u8]) -> HwResult<()> {
+            self.writes.push(data.to_vec());
             Ok(())
         }
 
@@ -1401,6 +1492,8 @@ mod tests {
             vout_margin_low: Ratio::from_factor(0.90),
             vout_uv_warn_limit: Ratio::from_factor(0.90),
             vout_uv_fault_limit: Ratio::from_factor(0.75),
+            vout_ov_fault_response: None,
+            vout_uv_fault_response: None,
             iout_oc_warn_limit: 25.0,
             iout_oc_fault_limit: 30.0,
             iout_oc_fault_response: 0xC0,
@@ -1414,6 +1507,81 @@ mod tests {
             toff_delay: 0,
             toff_fall: 0,
             pin_detect_override: 0xFFFF,
+            power_stage: None,
+        }
+    }
+
+    /// The registers `init` reads: a TPS546D24S device id, a
+    /// VOUT_MODE with exponent -9, and a clean STATUS_WORD.
+    fn init_table() -> RegisterTable {
+        RegisterTable::new(&[
+            (
+                PmbusCommand::IcDeviceId,
+                &[6, 0x54, 0x49, 0x54, 0x6D, 0x24, 0x62],
+            ),
+            (PmbusCommand::VoutMode, &[0x17]),
+            (PmbusCommand::StatusWord, &[0x00, 0x00]),
+        ])
+    }
+
+    #[tokio::test]
+    async fn init_writes_the_power_stage_tuning_as_blocks() {
+        let config = Tps546Config {
+            power_stage: Some(PowerStageTuning {
+                compensation: [0x13, 0x20, 0xC6, 0x19, 0xC6],
+                power_stage: 0x70,
+                telemetry: [0x03, 0x03, 0x03, 0x03, 0x03, 0x00],
+                iout_cal_gain: 0xC880,
+                iout_cal_offset: 0xE000,
+            }),
+            ..config()
+        };
+        let mut tps = Tps546::new(init_table(), config);
+
+        tps.init().await.expect("init against the mock");
+
+        let i2c = &tps.i2c;
+        assert_eq!(
+            i2c.writes_of(PmbusCommand::CompensationConfig),
+            vec![&[0xB1, 5, 0x13, 0x20, 0xC6, 0x19, 0xC6][..]]
+        );
+        assert_eq!(
+            i2c.writes_of(PmbusCommand::PowerStageConfig),
+            vec![&[0xB5, 1, 0x70][..]]
+        );
+        assert_eq!(
+            i2c.writes_of(PmbusCommand::TelemetryConfig),
+            vec![&[0xD0, 6, 0x03, 0x03, 0x03, 0x03, 0x03, 0x00][..]]
+        );
+        assert_eq!(
+            i2c.writes_of(PmbusCommand::IoutCalGain),
+            vec![&[0x38, 0x80, 0xC8][..]]
+        );
+        assert_eq!(
+            i2c.writes_of(PmbusCommand::IoutCalOffset),
+            vec![&[0x39, 0x00, 0xE0][..]]
+        );
+    }
+
+    #[tokio::test]
+    async fn init_leaves_the_power_stage_alone_without_tuning() {
+        let mut tps = Tps546::new(init_table(), config());
+
+        tps.init().await.expect("init against the mock");
+
+        for command in [
+            PmbusCommand::CompensationConfig,
+            PmbusCommand::PowerStageConfig,
+            PmbusCommand::TelemetryConfig,
+            PmbusCommand::IoutCalGain,
+            PmbusCommand::IoutCalOffset,
+            PmbusCommand::VoutOvFaultResponse,
+            PmbusCommand::VoutUvFaultResponse,
+        ] {
+            assert!(
+                tps.i2c.writes_of(command).is_empty(),
+                "{command:?} written without tuning"
+            );
         }
     }
 

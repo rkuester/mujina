@@ -654,6 +654,8 @@ async fn init_power_controller(i2c: BitaxeRawI2c) -> Result<Tps546<BitaxeRawI2c>
         vout_margin_low: Ratio::from_factor(0.90),
         vout_uv_warn_limit: Ratio::from_factor(0.90),
         vout_uv_fault_limit: Ratio::from_factor(0.75),
+        vout_ov_fault_response: None,
+        vout_uv_fault_response: None,
 
         iout_oc_warn_limit: 25.0,
         iout_oc_fault_limit: 30.0,
@@ -671,6 +673,7 @@ async fn init_power_controller(i2c: BitaxeRawI2c) -> Result<Tps546<BitaxeRawI2c>
         toff_fall: 0,
 
         pin_detect_override: 0xFFFF,
+        power_stage: None,
     };
 
     let mut tps546 = Tps546::new(i2c, config);
