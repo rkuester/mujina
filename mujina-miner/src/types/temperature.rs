@@ -24,7 +24,7 @@ pub struct Temperature(f32);
 
 impl Temperature {
     /// Construct from a value in degrees Celsius.
-    pub fn from_celsius(degrees: f32) -> Self {
+    pub const fn from_celsius(degrees: f32) -> Self {
         Self(degrees)
     }
 

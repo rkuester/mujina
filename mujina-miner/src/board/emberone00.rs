@@ -6,7 +6,7 @@
 use std::{ops::RangeInclusive, sync::Arc, time::Duration};
 
 use crate::tracing::prelude::*;
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use tokio::sync::{Mutex, watch};
 use tokio::task::JoinHandle;
@@ -79,6 +79,21 @@ const INITIAL_CORE_VOLTAGE: Voltage = Voltage::from_volts(3.0);
 
 /// The chips on the chain.
 const CHIP_COUNT: usize = 12;
+
+/// The chip diode temperature at which the board stops its chain.
+///
+/// Conservative until the chain's heat at full clock is measured.
+const CHIP_EMERGENCY: Temperature = Temperature::from_celsius(85.0);
+
+/// The board temperature at which the board stops its chain.
+const PCB_EMERGENCY: Temperature = Temperature::from_celsius(70.0);
+
+/// The rail voltage above which the chips are powered and their
+/// diode is expected to read.
+const RAIL_POWERED: Voltage = Voltage::from_volts(2.5);
+
+/// Consecutive bad thermal passes before the chain stops.
+const BAD_READING_LIMIT: u32 = 3;
 
 // Register this board type with the inventory system
 inventory::submit! {
@@ -217,15 +232,18 @@ async fn create_from_usb(device: UsbDeviceInfo, boards: Cursor) -> Result<Backpl
     let attrs = EmberOne00Attributes::attach(board.clone());
 
     let cancel = CancellationToken::new();
+    let (thread_shutdown_tx, thread_shutdown_rx) = watch::channel(());
     let monitor_task = EmberOne00Monitor {
         temp_left,
         temp_right,
         regulator: regulator.clone(),
+        reset_line: reset_line.clone(),
         attrs,
+        thread_shutdown: thread_shutdown_tx,
+        bad_thermal_count: 0,
     }
     .spawn(cancel.clone());
 
-    let (thread_shutdown_tx, thread_shutdown_rx) = watch::channel(());
     let thread_name = match &info.serial_number {
         Some(serial) => format!("EmberOne00-{}", &serial[..8.min(serial.len())]),
         None => "EmberOne00".to_string(),
@@ -266,7 +284,6 @@ async fn create_from_usb(device: UsbDeviceInfo, boards: Cursor) -> Result<Backpl
         status_led,
         monitor_cancel: cancel,
         monitor_task,
-        thread_shutdown: thread_shutdown_tx,
     };
 
     let shutdown = Box::pin(async move {
@@ -329,16 +346,26 @@ impl EmberOne00Attributes {
     }
 }
 
-/// The task that reads the board's sensors and its rail and obeys
-/// a client's voltage target.
+/// The task that reads the board's sensors and its rail, obeys a
+/// client's voltage target, and stops the chain when the board
+/// runs hot.
 struct EmberOne00Monitor {
     temp_left: Tmp1075<BitaxeRawI2c>,
     temp_right: Tmp451<BitaxeRawI2c>,
     regulator: Arc<Mutex<Tps546<BitaxeRawI2c>>>,
+    reset_line: EmberOne00ResetLine,
 
     /// The board's place in the tree, where the monitor publishes
     /// what it reads and reads what a client asks for.
     attrs: EmberOne00Attributes,
+
+    /// Shutdown signal to the hash thread. A send requests
+    /// shutdown; the thread's exit drops its receiver.
+    thread_shutdown: watch::Sender<()>,
+
+    /// Consecutive passes with a missing, implausible, or
+    /// emergency temperature while the rail was up.
+    bad_thermal_count: u32,
 }
 
 impl EmberOne00Monitor {
@@ -347,7 +374,7 @@ impl EmberOne00Monitor {
     }
 
     async fn run(mut self, cancel: CancellationToken) {
-        const INTERVAL: Duration = Duration::from_secs(5);
+        const INTERVAL: Duration = Duration::from_secs(2);
         let mut ticker = time::interval(INTERVAL);
         ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
@@ -363,12 +390,43 @@ impl EmberOne00Monitor {
         loop {
             tokio::select! {
                 _ = cancel.cancelled() => break,
-                _ = ticker.tick() => self.monitor_tick().await,
+                _ = ticker.tick() => {
+                    if let Err(e) = self.monitor_tick().await {
+                        error!(error = %e, "Board monitor failed");
+                        break;
+                    }
+                }
                 Ok(()) = core_voltage.changed() => {
                     let asked = *core_voltage.borrow_and_update();
                     self.apply_core_voltage(asked).await;
                 }
             }
+        }
+
+        self.stop_chain().await;
+    }
+
+    /// Stops the hash thread, then holds the chips in reset with
+    /// the rail off in case the thread could not.
+    async fn stop_chain(&mut self) {
+        // The thread drops its shutdown receiver on exit, after
+        // disabling the chain, so closed() means it has finished.
+        // A failed send means it is already gone.
+        const THREAD_EXIT_TIMEOUT: Duration = Duration::from_secs(2);
+        let _ = self.thread_shutdown.send(());
+        if time::timeout(THREAD_EXIT_TIMEOUT, self.thread_shutdown.closed())
+            .await
+            .is_err()
+        {
+            warn!("Timed out waiting for thread to exit");
+        }
+
+        if let Err(e) = self.reset_line.assert().await {
+            warn!("Failed to hold chips in reset: {}", e);
+        }
+        match self.regulator.lock().await.disable_output().await {
+            Ok(()) => debug!("Core voltage turned off"),
+            Err(e) => warn!("Failed to disable output: {}", e),
         }
     }
 
@@ -386,8 +444,16 @@ impl EmberOne00Monitor {
         }
     }
 
-    /// Reads every sensor once and publishes the pass.
-    async fn monitor_tick(&mut self) {
+    /// Reads every sensor once and publishes the pass. Returns
+    /// `Err` on a thermal emergency.
+    ///
+    /// While the rail is up, a pass counts as bad when the chip
+    /// diode does not read, or when it or either board sensor is
+    /// at its emergency temperature. [`BAD_READING_LIMIT`] bad
+    /// passes in a row are the emergency. With the rail down the
+    /// chips are cold and their diode reads open, so nothing
+    /// counts.
+    async fn monitor_tick(&mut self) -> Result<()> {
         let t_left = match self.temp_left.read().await {
             Ok(reading) => Some(reading.into()),
             Err(e) => {
@@ -451,6 +517,35 @@ impl EmberOne00Monitor {
             &attrs.core.temperature,
             vr_temp.map(|c| Temperature::from_celsius(c as f32)),
         );
+        drop(published);
+
+        let rail_up = vout.is_some_and(|v| v >= RAIL_POWERED);
+        let pcb_hot = [t_left, t_right]
+            .into_iter()
+            .flatten()
+            .any(|t| t >= PCB_EMERGENCY);
+        let chip_hot = t_chip0.is_none_or(|t| t >= CHIP_EMERGENCY);
+        if rail_up && (pcb_hot || chip_hot) {
+            self.bad_thermal_count += 1;
+            warn!(
+                ?t_chip0,
+                ?t_left,
+                ?t_right,
+                consecutive = self.bad_thermal_count,
+                "Bad thermal reading"
+            );
+        } else {
+            self.bad_thermal_count = 0;
+        }
+
+        if self.bad_thermal_count >= BAD_READING_LIMIT {
+            bail!(
+                "thermal emergency after {} consecutive bad readings",
+                self.bad_thermal_count
+            );
+        }
+
+        Ok(())
     }
 }
 
@@ -567,29 +662,16 @@ struct EmberOne00 {
     status_led: StatusLed,
     monitor_cancel: CancellationToken,
     monitor_task: JoinHandle<()>,
-
-    /// Shutdown signal to the hash thread. A send requests
-    /// shutdown; the thread's exit drops its receiver.
-    thread_shutdown: watch::Sender<()>,
 }
 
 impl EmberOne00 {
     /// Powers the board down in the reverse of its bring-up order.
+    ///
+    /// The monitor stops the chain on its way out; the writes
+    /// below repeat that in case it could not.
     async fn shutdown(&mut self) {
         self.monitor_cancel.cancel();
         let _ = (&mut self.monitor_task).await;
-
-        // The thread drops its shutdown receiver on exit, after
-        // disabling the chain, so closed() means it has finished.
-        // A failed send means it is already gone.
-        const THREAD_EXIT_TIMEOUT: Duration = Duration::from_secs(2);
-        let _ = self.thread_shutdown.send(());
-        if time::timeout(THREAD_EXIT_TIMEOUT, self.thread_shutdown.closed())
-            .await
-            .is_err()
-        {
-            warn!("Timed out waiting for thread to exit");
-        }
 
         if let Err(e) = self.reset_line.assert().await {
             warn!("Failed to hold chips in reset: {}", e);
