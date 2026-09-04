@@ -10,6 +10,7 @@ use std::collections::{HashMap, HashSet};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::{StreamExt, StreamMap};
+use tokio_util::sync::CancellationToken;
 
 use futures::future::BoxFuture;
 
@@ -78,8 +79,29 @@ impl Backplane {
         }
     }
 
-    /// Run the backplane event loop.
-    pub async fn run(&mut self) -> Result<()> {
+    /// Run the backplane until the daemon shuts down, then stop
+    /// every board it started.
+    pub async fn run(&mut self, shutdown: CancellationToken) -> Result<()> {
+        let result = tokio::select! {
+            result = self.route_events() => result,
+            _ = shutdown.cancelled() => Ok(()),
+        };
+
+        // The transports close their channels when they have nothing
+        // more to report, which a CPU-only run does at startup. The
+        // boards run until the daemon stops, not until the transports
+        // fall silent. An error is different: the backplane is done
+        // routing, so its boards come down with it.
+        if result.is_ok() {
+            shutdown.cancelled().await;
+        }
+        self.shutdown_all_boards().await;
+        result
+    }
+
+    /// Route transport events until every transport has closed its
+    /// channel.
+    async fn route_events(&mut self) -> Result<()> {
         // Multiplex the per-transport receivers. The number of transports is
         // how many initial-enumeration completions to wait for.
         let mut streams: StreamMap<usize, ReceiverStream<TransportEvent>> = StreamMap::new();
@@ -118,7 +140,7 @@ impl Backplane {
     }
 
     /// Shutdown all boards managed by this backplane.
-    pub async fn shutdown_all_boards(&mut self) {
+    async fn shutdown_all_boards(&mut self) {
         let board_ids: Vec<String> = self.boards.keys().cloned().collect();
 
         for board_id in board_ids {

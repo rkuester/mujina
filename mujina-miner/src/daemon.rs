@@ -97,16 +97,9 @@ impl Daemon {
         self.tracker.spawn({
             let shutdown = self.shutdown.clone();
             async move {
-                tokio::select! {
-                    result = backplane.run() => {
-                        if let Err(e) = result {
-                            error!("Backplane error: {}", e);
-                        }
-                    }
-                    _ = shutdown.cancelled() => {}
+                if let Err(e) = backplane.run(shutdown).await {
+                    error!("Backplane error: {}", e);
                 }
-
-                backplane.shutdown_all_boards().await;
             }
         });
 
