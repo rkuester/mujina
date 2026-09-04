@@ -33,6 +33,7 @@ use crate::{
     },
     peripheral::{
         led::{CalibratedLed, ColorProfile, Status, StatusLed},
+        regulator::RegulatorAttributes,
         tmp451::Tmp451,
         tmp1075::Tmp1075,
         tps546::{PowerStageTuning, Tps546, Tps546Config},
@@ -189,7 +190,13 @@ async fn create_from_usb(device: UsbDeviceInfo, boards: Cursor) -> Result<Backpl
     let attrs = EmberOne00Attributes::attach(board.clone());
 
     let cancel = CancellationToken::new();
-    let monitor_task = spawn_monitor(temp_left, temp_right, attrs, cancel.clone());
+    let monitor_task = EmberOne00Monitor {
+        temp_left,
+        temp_right,
+        regulator: regulator.clone(),
+        attrs,
+    }
+    .spawn(cancel.clone());
 
     let mut hardware = EmberOne00 {
         control,
@@ -219,7 +226,7 @@ async fn create_from_usb(device: UsbDeviceInfo, boards: Cursor) -> Result<Backpl
 /// What an emberOne/00 holds in the tree.
 ///
 /// It holds what every board owes and adds the three temperatures
-/// the board measures.
+/// the board measures and its core rail.
 struct EmberOne00Attributes {
     board: BoardAttributes,
 
@@ -232,6 +239,9 @@ struct EmberOne00Attributes {
     /// The temperature of the first chip's diode, read through the
     /// sensor on the right side of the board.
     chip_0_temperature: Report<Option<Temperature>>,
+
+    /// The rail that feeds the chain.
+    core: RegulatorAttributes,
 }
 
 impl EmberOne00Attributes {
@@ -243,6 +253,10 @@ impl EmberOne00Attributes {
             pcb_left_temperature: sys.report("pcb_left_temperature", None),
             pcb_right_temperature: sys.report("pcb_right_temperature", None),
             chip_0_temperature: sys.report("chip_0_temperature", None),
+            core: RegulatorAttributes::attach(
+                &sys.child("regulators").child("core"),
+                CORE_VOLTAGE_LIMITS,
+            ),
             board,
         }
     }
@@ -253,14 +267,24 @@ impl EmberOne00Attributes {
     }
 }
 
-/// Spawn a task that periodically reads the board's sensors.
-fn spawn_monitor(
-    mut temp_left: Tmp1075<BitaxeRawI2c>,
-    mut temp_right: Tmp451<BitaxeRawI2c>,
+/// The task that reads the board's sensors and its rail and obeys
+/// a client's voltage target.
+struct EmberOne00Monitor {
+    temp_left: Tmp1075<BitaxeRawI2c>,
+    temp_right: Tmp451<BitaxeRawI2c>,
+    regulator: Arc<Mutex<Tps546<BitaxeRawI2c>>>,
+
+    /// The board's place in the tree, where the monitor publishes
+    /// what it reads and reads what a client asks for.
     attrs: EmberOne00Attributes,
-    cancel: CancellationToken,
-) -> JoinHandle<()> {
-    tokio::spawn(async move {
+}
+
+impl EmberOne00Monitor {
+    fn spawn(self, cancel: CancellationToken) -> JoinHandle<()> {
+        tokio::spawn(self.run(cancel))
+    }
+
+    async fn run(mut self, cancel: CancellationToken) {
         const INTERVAL: Duration = Duration::from_secs(5);
         let mut ticker = time::interval(INTERVAL);
         ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -268,47 +292,104 @@ fn spawn_monitor(
         // Discard first tick (fires immediately)
         ticker.tick().await;
 
+        // Subscribe before reading, so a write between the two wakes
+        // the loop rather than passing unseen.
+        let mut core_voltage = self.attrs.core.target_voltage.subscribe();
+        let asked = *core_voltage.borrow_and_update();
+        self.apply_core_voltage(asked).await;
+
         loop {
             tokio::select! {
                 _ = cancel.cancelled() => break,
-                _ = ticker.tick() => {}
+                _ = ticker.tick() => self.monitor_tick().await,
+                Ok(()) = core_voltage.changed() => {
+                    let asked = *core_voltage.borrow_and_update();
+                    self.apply_core_voltage(asked).await;
+                }
+            }
+        }
+    }
+
+    /// Asks the core rail for the voltage a client set.
+    ///
+    /// An unset target means the daemon decides, and the hash
+    /// thread that runs the chain sets the rail as it ramps.
+    async fn apply_core_voltage(&mut self, target: Option<Voltage>) {
+        let Some(asked) = target else {
+            return;
+        };
+        match self.regulator.lock().await.set_vout_target(asked).await {
+            Ok(()) => debug!(%asked, "Core voltage target set"),
+            Err(e) => warn!(%asked, error = %e, "Failed to set the core voltage target"),
+        }
+    }
+
+    /// Reads every sensor once and publishes the pass.
+    async fn monitor_tick(&mut self) {
+        let t_left = match self.temp_left.read().await {
+            Ok(reading) => Some(reading.into()),
+            Err(e) => {
+                warn!("TMP1075 (left) read failed: {}", e);
+                None
+            }
+        };
+
+        let t_right = match self.temp_right.read_local().await {
+            Ok(reading) => Some(reading.into()),
+            Err(e) => {
+                warn!("TMP451 (right) local read failed: {}", e);
+                None
+            }
+        };
+
+        // TODO: attribute to the chip's hash thread once implemented
+        let t_chip0 = match self.temp_right.read_remote().await {
+            Ok(reading) => Some(reading.into()),
+            Err(e) => {
+                if !matches!(e, crate::peripheral::tmp451::Error::RemoteDiodeOpen) {
+                    warn!("TMP451 remote read failed: {}", e);
+                }
+                None
+            }
+        };
+
+        let (vin, vout, iout_ma, power_mw, vr_temp) = {
+            let mut reg = self.regulator.lock().await;
+
+            if let Err(e) = reg.check_status().await {
+                error!("Power controller fault: {}", e);
+                if let Err(e) = reg.clear_faults().await {
+                    error!("Failed to clear faults: {}", e);
+                }
             }
 
-            let t_left = match temp_left.read().await {
-                Ok(reading) => Some(reading.into()),
-                Err(e) => {
-                    warn!("TMP1075 (left) read failed: {}", e);
-                    None
-                }
-            };
+            (
+                reg.get_vin().await.ok(),
+                reg.get_vout().await.ok(),
+                reg.get_iout().await.ok(),
+                reg.get_power().await.ok(),
+                reg.get_temperature().await.ok(),
+            )
+        };
 
-            let t_right = match temp_right.read_local().await {
-                Ok(reading) => Some(reading.into()),
-                Err(e) => {
-                    warn!("TMP451 (right) local read failed: {}", e);
-                    None
-                }
-            };
-
-            // TODO: attribute to the chip's hash thread once implemented
-            let t_chip0 = match temp_right.read_remote().await {
-                Ok(reading) => Some(reading.into()),
-                Err(e) => {
-                    if !matches!(e, crate::peripheral::tmp451::Error::RemoteDiodeOpen) {
-                        warn!("TMP451 remote read failed: {}", e);
-                    }
-                    None
-                }
-            };
-
-            // Publish the whole pass under one guard, so a render
-            // never mixes this pass with the one before it.
-            let mut published = attrs.write();
-            published.set(&attrs.pcb_left_temperature, t_left);
-            published.set(&attrs.pcb_right_temperature, t_right);
-            published.set(&attrs.chip_0_temperature, t_chip0);
-        }
-    })
+        // Publish the whole pass under one guard, so a render
+        // never mixes this pass with the one before it. A failed
+        // read publishes null rather than leaving the last good
+        // reading to look current.
+        let attrs = &self.attrs;
+        let mut published = attrs.write();
+        published.set(&attrs.pcb_left_temperature, t_left);
+        published.set(&attrs.pcb_right_temperature, t_right);
+        published.set(&attrs.chip_0_temperature, t_chip0);
+        published.set(&attrs.core.input_voltage, vin);
+        published.set(&attrs.core.voltage, vout);
+        published.set(&attrs.core.current, iout_ma.map(|ma| ma as f32 / 1000.0));
+        published.set(&attrs.core.power, power_mw.map(|mw| mw as f32 / 1000.0));
+        published.set(
+            &attrs.core.temperature,
+            vr_temp.map(|c| Temperature::from_celsius(c as f32)),
+        );
+    }
 }
 
 /// Configures the core rail's regulator and leaves its output off.
