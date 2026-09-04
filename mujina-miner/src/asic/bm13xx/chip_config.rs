@@ -12,7 +12,7 @@ use super::register::{
     AnalogMux, ChipModel, CoreCommand, CoreRegister, HashCountingNumber, MiscControl, PllDivider,
     SoftResetControl,
 };
-use crate::types::{Frequency, HashRate};
+use crate::types::{Frequency, HashRate, Voltage};
 
 /// Per-chip-model configuration.
 ///
@@ -52,6 +52,11 @@ pub struct ChipConfig {
     /// Nameplate hashrate of one chip: a production machine's
     /// specified hashrate over its chip count, rounded.
     pub nameplate: HashRate,
+
+    /// The core voltage one chip needs at each frequency, or `None`
+    /// for a model whose curve is unmeasured. A board's rail is
+    /// this voltage times the domains it stacks in series.
+    pub core_voltage: Option<VoltageCurve>,
 
     /// Soft reset value written broadcast before configuration.
     pub soft_reset_defaults: SoftResetControl,
@@ -145,6 +150,18 @@ pub fn bm1362() -> ChipConfig {
         hash_counting_number: HashCountingNumber::from(0x1381),
         // S19j Pro: 104 TH/s over 378 chips
         nameplate: HashRate::from_gigahashes(275.0),
+        // Measured on an EmberOne00, whose twelve chips in series
+        // run on 3.075 V at the reset frequency and 3.6 V at 500 MHz
+        core_voltage: Some(VoltageCurve {
+            low: OperatingPoint {
+                frequency: Frequency::from_mhz(56.25),
+                voltage: Voltage::from_volts(0.25625),
+            },
+            high: OperatingPoint {
+                frequency: Frequency::from_mhz(500.0),
+                voltage: Voltage::from_volts(0.30),
+            },
+        }),
         soft_reset_defaults: SoftResetControl::defaults(ChipModel::BM1362),
         core_reset: SoftResetControl::core_reset(ChipModel::BM1362),
         misc_control: MiscControl::reporting_enabled(ChipModel::BM1362),
@@ -172,6 +189,8 @@ pub fn bm1370() -> ChipConfig {
         hash_counting_number: HashCountingNumber::from(0x1EB5),
         // S21 Pro: 234 TH/s over 195 chips
         nameplate: HashRate::from_terahashes(1.2),
+        // The Bitaxe holds its rail at one target across the ramp
+        core_voltage: None,
         soft_reset_defaults: SoftResetControl::defaults(ChipModel::BM1370),
         core_reset: SoftResetControl::core_reset(ChipModel::BM1370),
         misc_control: MiscControl::reporting_enabled(ChipModel::BM1370),
@@ -184,6 +203,38 @@ pub fn bm1370() -> ChipConfig {
             vco_min_mhz: 1600.0,
             vco_max_mhz: 3200.0,
         },
+    }
+}
+
+/// The core voltage one chip needs at a frequency, as the line
+/// through two measured operating points.
+///
+/// The chip needs more voltage as its clock rises, and the
+/// relation is close to linear over the mining range. The line
+/// extends past either point.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct VoltageCurve {
+    /// The lower point, at the reset frequency.
+    pub low: OperatingPoint,
+    /// The upper point, near the top of the mining range.
+    pub high: OperatingPoint,
+}
+
+/// A frequency and the core voltage one chip runs on at it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OperatingPoint {
+    pub frequency: Frequency,
+    pub voltage: Voltage,
+}
+
+impl VoltageCurve {
+    /// Returns the voltage one chip needs at `freq`.
+    pub fn voltage_at(&self, freq: Frequency) -> Voltage {
+        let volts_per_mhz = (self.high.voltage.volts() - self.low.voltage.volts())
+            / (self.high.frequency.mhz() - self.low.frequency.mhz());
+        let volts =
+            self.low.voltage.volts() + volts_per_mhz * (freq.mhz() - self.low.frequency.mhz());
+        Voltage::from_volts(volts)
     }
 }
 
@@ -233,6 +284,38 @@ mod tests {
             vco_sel: VcoSel::High,
             ..low(fb_div, ref_div, post_div)
         }
+    }
+
+    #[test]
+    fn voltage_curve_interpolates_between_its_points() {
+        let curve = VoltageCurve {
+            low: OperatingPoint {
+                frequency: Frequency::from_mhz(100.0),
+                voltage: Voltage::from_volts(0.2),
+            },
+            high: OperatingPoint {
+                frequency: Frequency::from_mhz(500.0),
+                voltage: Voltage::from_volts(0.3),
+            },
+        };
+
+        assert_eq!(
+            curve.voltage_at(Frequency::from_mhz(100.0)),
+            Voltage::from_volts(0.2)
+        );
+        assert_eq!(
+            curve.voltage_at(Frequency::from_mhz(500.0)),
+            Voltage::from_volts(0.3)
+        );
+        assert_eq!(
+            curve.voltage_at(Frequency::from_mhz(300.0)),
+            Voltage::from_volts(0.25)
+        );
+        // The line extends past its upper point
+        assert_eq!(
+            curve.voltage_at(Frequency::from_mhz(700.0)),
+            Voltage::from_volts(0.35)
+        );
     }
 
     #[test]
