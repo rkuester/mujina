@@ -38,7 +38,7 @@ use crate::{
         HashTask, HashThread, HashThreadCapabilities, HashThreadEvent, HashThreadStatus, Share,
     },
     tracing::prelude::*,
-    types::{Difficulty, Frequency, ShareRate},
+    types::{Difficulty, Frequency, ShareRate, Voltage},
 };
 
 /// BM13xx HashThread implementation.
@@ -532,7 +532,10 @@ where
         &mut self,
         register_responses: &mut mpsc::Receiver<RegisterResponse>,
     ) -> Result<()> {
-        // Power the core rail before releasing reset
+        // Power the core rail before releasing reset, at the voltage
+        // the chips need at their reset frequency
+        self.set_core_voltage(*self.config.freq_range.start())
+            .await?;
         debug!("Enabling core voltage");
         self.peripherals
             .voltage_regulator
@@ -735,7 +738,11 @@ where
         let frequency_steps =
             generate_frequency_ramp_steps(&self.config, ramp, self.config.ramp_step);
 
-        for (i, pll_config) in frequency_steps.iter().enumerate() {
+        for (i, (freq, pll_config)) in frequency_steps.iter().enumerate() {
+            // The rail rises ahead of the clock that needs it
+            self.set_core_voltage(*freq).await?;
+            time::sleep(VOLTAGE_LEAD).await;
+
             self.chip_commands
                 .send(RegisterCommand::WriteRegister(WriteRegister {
                     destination: Destination::Broadcast,
@@ -806,6 +813,26 @@ where
         }
         debug!("Chain configuration verified");
 
+        Ok(())
+    }
+
+    /// Sets the core rail to what the chips need at `freq`.
+    ///
+    /// The rail stacks one voltage per domain in series. A chip
+    /// model without a measured curve leaves the rail where the
+    /// board set it.
+    async fn set_core_voltage(&mut self, freq: Frequency) -> Result<()> {
+        let Some(curve) = &self.config.core_voltage else {
+            return Ok(());
+        };
+        let per_chip = curve.voltage_at(freq);
+        let rail = Voltage::from_volts(per_chip.volts() * self.chain.domain_count() as f32);
+        self.peripherals
+            .voltage_regulator
+            .set_voltage(rail)
+            .await
+            .with_context(|| format!("failed to set the core rail to {rail} for {freq}"))?;
+        trace!(%freq, %per_chip, %rail, "Core rail set for the frequency");
         Ok(())
     }
 
@@ -1011,19 +1038,24 @@ fn task_to_job_full(task: &HashTask, chip_job_id: u8) -> Result<JobFullFormat> {
     })
 }
 
-/// Generate frequency ramp steps for smooth PLL transitions
+/// Settle time between raising the rail and writing the clock
+/// that needs it.
+const VOLTAGE_LEAD: Duration = Duration::from_millis(50);
+
+/// Generates the ramp's steps, each frequency with the PLL
+/// dividers that produce it, for smooth PLL transitions.
 fn generate_frequency_ramp_steps(
     config: &ChipConfig,
     range: RangeInclusive<Frequency>,
     step: Frequency,
-) -> Vec<PllDivider> {
+) -> Vec<(Frequency, PllDivider)> {
     let target = *range.end();
     let mut configs = Vec::new();
     let mut current = *range.start();
 
     while current <= target {
         if let Some(pll) = config.calculate_pll(current) {
-            configs.push(pll);
+            configs.push((current, pll));
         }
         let next = Frequency::from_hz(current.hz() + step.hz());
         // A final short step ends the ramp exactly on the target
@@ -1066,9 +1098,10 @@ mod tests {
 
         // Each step is the solver's answer for the next stepped
         // frequency
-        for (i, step) in steps.iter().enumerate() {
-            let freq = Frequency::from_hz(56_250_000 + i as u64 * 6_250_000);
-            assert_eq!(*step, config.calculate_pll(freq).unwrap(), "step {i}");
+        for (i, (freq, pll)) in steps.iter().enumerate() {
+            let expected = Frequency::from_hz(56_250_000 + i as u64 * 6_250_000);
+            assert_eq!(*freq, expected, "step {i}");
+            assert_eq!(*pll, config.calculate_pll(expected).unwrap(), "step {i}");
         }
     }
 
@@ -1081,10 +1114,10 @@ mod tests {
             Frequency::from_mhz(6.25),
         );
 
-        let expected = [
-            config.calculate_pll(Frequency::from_mhz(56.25)).unwrap(),
-            config.calculate_pll(Frequency::from_mhz(60.0)).unwrap(),
-        ];
+        let expected: Vec<_> = [Frequency::from_mhz(56.25), Frequency::from_mhz(60.0)]
+            .into_iter()
+            .map(|freq| (freq, config.calculate_pll(freq).unwrap()))
+            .collect();
         assert_eq!(steps, expected);
     }
 
