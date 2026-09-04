@@ -151,15 +151,15 @@ pub fn bm1362() -> ChipConfig {
         // S19j Pro: 104 TH/s over 378 chips
         nameplate: HashRate::from_gigahashes(275.0),
         // Measured on an EmberOne00, whose twelve chips in series
-        // run on 3.075 V at the reset frequency and 3.6 V at 500 MHz
+        // run on 3.075 V at the reset frequency and 3.84 V at 525 MHz
         core_voltage: Some(VoltageCurve {
             low: OperatingPoint {
                 frequency: Frequency::from_mhz(56.25),
                 voltage: Voltage::from_volts(0.25625),
             },
             high: OperatingPoint {
-                frequency: Frequency::from_mhz(500.0),
-                voltage: Voltage::from_volts(0.30),
+                frequency: Frequency::from_mhz(525.0),
+                voltage: Voltage::from_volts(0.32),
             },
         }),
         soft_reset_defaults: SoftResetControl::defaults(ChipModel::BM1362),
