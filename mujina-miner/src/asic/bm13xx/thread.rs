@@ -415,9 +415,9 @@ where
 
     /// Declares the thread's expected hashrate to the scheduler.
     async fn configure(&mut self) {
-        // Nameplate rate for one chip; a rough stand-in for a real
-        // frequency-derived estimate.
-        let expected = self.config.nameplate;
+        // Nameplate rate for the chain; a rough stand-in for a
+        // real frequency-derived estimate.
+        let expected = self.config.nameplate * self.chain.chip_count();
         if self
             .event_tx
             .send(HashThreadEvent::ExpectedHashRate(expected))

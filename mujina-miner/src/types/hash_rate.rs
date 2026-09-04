@@ -9,7 +9,7 @@
 //! debug builds, wraps in release builds.
 
 use std::iter::Sum;
-use std::ops::Add;
+use std::ops::{Add, Mul};
 use std::time::Duration;
 
 use serde_json::Value;
@@ -110,6 +110,15 @@ impl Add for HashRate {
     }
 }
 
+/// A chain's rate is one chip's rate times its chip count.
+impl Mul<usize> for HashRate {
+    type Output = Self;
+
+    fn mul(self, rhs: usize) -> Self {
+        Self(self.0 * rhs as u64)
+    }
+}
+
 impl Sum for HashRate {
     fn sum<I: Iterator<Item = Self>>(iter: I) -> Self {
         iter.fold(HashRate(0), |acc, x| acc + x)
@@ -160,6 +169,12 @@ mod tests {
         let a = HashRate::from_gigahashes(1.0);
         let b = HashRate::from_gigahashes(2.0);
         assert_eq!(a + b, HashRate::from_gigahashes(3.0));
+    }
+
+    #[test]
+    fn multiply_by_a_chip_count() {
+        let chip = HashRate::from_gigahashes(275.0);
+        assert_eq!(chip * 12, HashRate::from_terahashes(3.3));
     }
 
     #[test]
