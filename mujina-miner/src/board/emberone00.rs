@@ -8,18 +8,30 @@ use std::{ops::RangeInclusive, sync::Arc, time::Duration};
 use crate::tracing::prelude::*;
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{self, MissedTickBehavior};
 use tokio_serial::SerialPortBuilderExt;
-use tokio_util::sync::CancellationToken;
+use tokio_util::{
+    codec::{FramedRead, FramedWrite},
+    sync::CancellationToken,
+};
 
 use super::{
     BackplaneConnector, BoardAttributes, BoardDescriptor, BoardInfo, BoardModel,
     pattern::{BoardPattern, Match, StringMatch},
 };
 use crate::{
-    asic::bm13xx::peripherals::ResetLine,
+    asic::{
+        bm13xx::{
+            self, chip_config,
+            peripherals::{BoardPeripherals, ResetLine},
+            register::ChipModel,
+            thread::BM13xxThread,
+            topology::TopologySpec,
+        },
+        hash_thread::{HashThread, ThreadAttributes},
+    },
     hw_trait::gpio::{Gpio, GpioPin, PinValue},
     mgmt_protocol::{
         ControlChannel,
@@ -36,11 +48,14 @@ use crate::{
         regulator::RegulatorAttributes,
         tmp451::Tmp451,
         tmp1075::Tmp1075,
-        tps546::{PowerStageTuning, Tps546, Tps546Config},
+        tps546::{PowerStageTuning, Tps546, Tps546Config, Tps546Regulator},
     },
-    systree::{Cursor, Report, WriteGuard},
-    transport::UsbDeviceInfo,
-    types::{Ratio, Temperature, Voltage},
+    systree::{Cursor, MemberStatus, Report, WriteGuard},
+    transport::{
+        UsbDeviceInfo,
+        serial::{SerialStream, TracingReader},
+    },
+    types::{HashRate, Ratio, Temperature, Voltage},
 };
 
 /// The model this board reports.
@@ -61,6 +76,9 @@ const CORE_VOLTAGE_LIMITS: RangeInclusive<Voltage> =
 /// quarter volt per chip, enough for the chain at its reset
 /// frequency.
 const INITIAL_CORE_VOLTAGE: Voltage = Voltage::from_volts(3.0);
+
+/// The chips on the chain.
+const CHIP_COUNT: usize = 12;
 
 // Register this board type with the inventory system
 inventory::submit! {
@@ -130,6 +148,15 @@ async fn create_from_usb(device: UsbDeviceInfo, boards: Cursor) -> Result<Backpl
 
     let i2c = BitaxeRawI2c::new(control.clone());
 
+    let data_stream =
+        SerialStream::new(&serial_ports[1], 115200).context("failed to open data port")?;
+    let (data_reader, data_writer, _data_control) = data_stream.split();
+    let data_reader = FramedRead::new(
+        TracingReader::new(data_reader, "Data"),
+        bm13xx::FrameCodec::new(ChipModel::BM1362),
+    );
+    let data_writer = FramedWrite::new(data_writer, bm13xx::FrameCodec::new(ChipModel::BM1362));
+
     let mut gpio = BitaxeRawGpioController::new(control.clone());
 
     // Hold the chips in reset before any of their rails comes up
@@ -198,6 +225,38 @@ async fn create_from_usb(device: UsbDeviceInfo, boards: Cursor) -> Result<Backpl
     }
     .spawn(cancel.clone());
 
+    let (thread_shutdown_tx, thread_shutdown_rx) = watch::channel(());
+    let thread_name = match &info.serial_number {
+        Some(serial) => format!("EmberOne00-{}", &serial[..8.min(serial.len())]),
+        None => "EmberOne00".to_string(),
+    };
+
+    let peripherals = BoardPeripherals {
+        reset_line: Box::new(reset_line.clone()),
+        voltage_regulator: Box::new(Tps546Regulator::new(regulator.clone())),
+    };
+
+    let chip = chip_config::bm1362();
+    let sys_thread = board.cursor().child("threads").child("0");
+    let thread_attrs = ThreadAttributes::attach(&sys_thread);
+    thread_attrs
+        .write()
+        .set(&thread_attrs.hashrate, chip.nameplate * CHIP_COUNT);
+
+    // Each chip is its own voltage domain, stacked in series. The
+    // BM1362 crosses a domain boundary with no boundary registers
+    // written, as the S19j Pro's chain shows.
+    let thread = BM13xxThread::new(
+        thread_name,
+        chip,
+        TopologySpec::individual_domains(CHIP_COUNT, false),
+        data_reader,
+        data_writer,
+        peripherals,
+        thread_shutdown_rx,
+    );
+    let threads: Vec<Box<dyn HashThread>> = vec![Box::new(thread)];
+
     let mut hardware = EmberOne00 {
         control,
         reset_line,
@@ -207,18 +266,21 @@ async fn create_from_usb(device: UsbDeviceInfo, boards: Cursor) -> Result<Backpl
         status_led,
         monitor_cancel: cancel,
         monitor_task,
+        thread_shutdown: thread_shutdown_tx,
     };
 
     let shutdown = Box::pin(async move {
         hardware.shutdown().await;
-    });
 
-    warn!("emberOne/00 hash threads not yet implemented");
+        let mut gone = thread_attrs.write();
+        gone.set(&thread_attrs.status, MemberStatus::Absent);
+        gone.set(&thread_attrs.hashrate, HashRate::default());
+    });
 
     Ok(BackplaneConnector {
         info,
         attrs: board,
-        threads: Vec::new(),
+        threads,
         shutdown: Some(shutdown),
     })
 }
@@ -470,6 +532,7 @@ async fn init_power_controller(i2c: BitaxeRawI2c) -> Result<Tps546<BitaxeRawI2c>
 
 /// The chain's reset line, driven through the firmware's GPIO
 /// command.
+#[derive(Clone)]
 struct EmberOne00ResetLine {
     nrst_pin: BitaxeRawGpioPin,
 }
@@ -504,6 +567,10 @@ struct EmberOne00 {
     status_led: StatusLed,
     monitor_cancel: CancellationToken,
     monitor_task: JoinHandle<()>,
+
+    /// Shutdown signal to the hash thread. A send requests
+    /// shutdown; the thread's exit drops its receiver.
+    thread_shutdown: watch::Sender<()>,
 }
 
 impl EmberOne00 {
@@ -511,6 +578,18 @@ impl EmberOne00 {
     async fn shutdown(&mut self) {
         self.monitor_cancel.cancel();
         let _ = (&mut self.monitor_task).await;
+
+        // The thread drops its shutdown receiver on exit, after
+        // disabling the chain, so closed() means it has finished.
+        // A failed send means it is already gone.
+        const THREAD_EXIT_TIMEOUT: Duration = Duration::from_secs(2);
+        let _ = self.thread_shutdown.send(());
+        if time::timeout(THREAD_EXIT_TIMEOUT, self.thread_shutdown.closed())
+            .await
+            .is_err()
+        {
+            warn!("Timed out waiting for thread to exit");
+        }
 
         if let Err(e) = self.reset_line.assert().await {
             warn!("Failed to hold chips in reset: {}", e);
