@@ -3,10 +3,12 @@
 //! The emberOne/00 has 12 BM1362 ASIC chips, communicating via USB
 //! using the bitaxe-raw protocol (same as Bitaxe boards).
 
-use std::time::Duration;
+use std::{ops::RangeInclusive, sync::Arc, time::Duration};
 
 use crate::tracing::prelude::*;
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
+use async_trait::async_trait;
+use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tokio::time::{self, MissedTickBehavior};
 use tokio_serial::SerialPortBuilderExt;
@@ -17,6 +19,7 @@ use super::{
     pattern::{BoardPattern, Match, StringMatch},
 };
 use crate::{
+    asic::bm13xx::peripherals::ResetLine,
     hw_trait::gpio::{Gpio, GpioPin, PinValue},
     mgmt_protocol::{
         ControlChannel,
@@ -32,10 +35,11 @@ use crate::{
         led::{CalibratedLed, ColorProfile, Status, StatusLed},
         tmp451::Tmp451,
         tmp1075::Tmp1075,
+        tps546::{PowerStageTuning, Tps546, Tps546Config},
     },
     systree::{Cursor, Report, WriteGuard},
     transport::UsbDeviceInfo,
-    types::Temperature,
+    types::{Ratio, Temperature, Voltage},
 };
 
 /// The model this board reports.
@@ -43,6 +47,19 @@ const MODEL: BoardModel = BoardModel {
     name: "emberOne/00",
     key: "emberone-00",
 };
+
+/// The range the core rail may be asked for.
+///
+/// The rail feeds twelve chips in series, so each chip sees a
+/// twelfth of it. The top chip's LDOs drop out above 4.20 V across
+/// the stack, and 4.0 V keeps margin below that.
+const CORE_VOLTAGE_LIMITS: RangeInclusive<Voltage> =
+    Voltage::from_volts(3.0)..=Voltage::from_volts(4.0);
+
+/// The rail's set point before a hash thread asks for more, a
+/// quarter volt per chip, enough for the chain at its reset
+/// frequency.
+const INITIAL_CORE_VOLTAGE: Voltage = Voltage::from_volts(3.0);
 
 // Register this board type with the inventory system
 inventory::submit! {
@@ -72,6 +89,12 @@ mod i2c_addr {
 /// to the corresponding RP2040 GPIO. See the Command enum in
 /// emberone-usbserial-fw/src/control/gpio.rs for the mapping.
 mod gpio_cmd {
+    /// The chain's reset line, active low. The firmware boots with
+    /// it released.
+    pub const ASIC_RESET: u8 = 0x00;
+    /// The core rail regulator's enable pin.
+    pub const PWR_EN: u8 = 0x01;
+    /// The boost converter that feeds the chips' IO and clock LDOs.
     pub const VDDIO_EN: u8 = 0x02;
 }
 
@@ -107,6 +130,13 @@ async fn create_from_usb(device: UsbDeviceInfo, boards: Cursor) -> Result<Backpl
     let i2c = BitaxeRawI2c::new(control.clone());
 
     let mut gpio = BitaxeRawGpioController::new(control.clone());
+
+    // Hold the chips in reset before any of their rails comes up
+    let mut reset_line = EmberOne00ResetLine {
+        nrst_pin: gpio.pin(gpio_cmd::ASIC_RESET).await?,
+    };
+    reset_line.assert().await?;
+
     let mut vddio_en = gpio.pin(gpio_cmd::VDDIO_EN).await?;
     vddio_en.write(PinValue::High).await?;
     // TPS61041 soft start is ~0.5 ms; MCP1824 LDOs settle in ~0.2 ms
@@ -138,6 +168,13 @@ async fn create_from_usb(device: UsbDeviceInfo, boards: Cursor) -> Result<Backpl
         .await
         .context("TMP451 remote offset failed")?;
 
+    let regulator = Arc::new(Mutex::new(init_power_controller(i2c.clone()).await?));
+
+    // Enable the regulator once it is configured. Its output stays
+    // off until a hash thread commands it on over PMBus.
+    let mut pwr_en = gpio.pin(gpio_cmd::PWR_EN).await?;
+    pwr_en.write(PinValue::High).await?;
+
     let info = BoardInfo {
         model: MODEL.name.to_string(),
         firmware_version: None,
@@ -156,6 +193,9 @@ async fn create_from_usb(device: UsbDeviceInfo, boards: Cursor) -> Result<Backpl
 
     let mut hardware = EmberOne00 {
         control,
+        reset_line,
+        regulator,
+        pwr_en,
         vddio_en,
         status_led,
         monitor_cancel: cancel,
@@ -271,12 +311,114 @@ fn spawn_monitor(
     })
 }
 
+/// Configures the core rail's regulator and leaves its output off.
+async fn init_power_controller(i2c: BitaxeRawI2c) -> Result<Tps546<BitaxeRawI2c>> {
+    let config = Tps546Config {
+        phase: 0xFF,
+        frequency_switch_khz: 325,
+
+        vin_on: Voltage::from_volts(11.0),
+        vin_off: Voltage::from_volts(10.5),
+        vin_uv_warn_limit: Voltage::from_volts(0.0), // Disabled due to TI bug
+        // Above 13.0 V a normal transient on a 12 V input trips the
+        // fault and drops the output
+        vin_ov_fault_limit: Voltage::from_volts(14.0),
+        vin_ov_fault_response: 0xB7,
+
+        vout_scale_loop: 0.125,
+        vout_min: *CORE_VOLTAGE_LIMITS.start(),
+        vout_max: *CORE_VOLTAGE_LIMITS.end(),
+        vout_command: INITIAL_CORE_VOLTAGE,
+
+        vout_ov_fault_limit: Ratio::from_factor(1.25),
+        vout_ov_warn_limit: Ratio::from_factor(1.16),
+        vout_margin_high: Ratio::from_factor(1.10),
+        vout_margin_low: Ratio::from_factor(0.90),
+        vout_uv_warn_limit: Ratio::from_factor(0.90),
+        vout_uv_fault_limit: Ratio::from_factor(0.75),
+        vout_ov_fault_response: Some(0xB7),
+        vout_uv_fault_response: Some(0xB7),
+
+        iout_oc_warn_limit: 50.0,
+        iout_oc_fault_limit: 55.0,
+        iout_oc_fault_response: 0xC0,
+
+        ot_warn_limit: 105,
+        ot_fault_limit: 145,
+        ot_fault_response: 0xFF,
+
+        ton_delay: 0,
+        ton_rise: 3,
+        ton_max_fault_limit: 0,
+        ton_max_fault_response: 0x3B,
+        toff_delay: 0,
+        toff_fall: 0,
+
+        // Take the pin-strapped values for everything not written
+        // below
+        pin_detect_override: 0x0000,
+
+        // Loop coefficients from TI's compensation calculator for
+        // the 740 nH inductor and the output capacitors on this
+        // board
+        power_stage: Some(PowerStageTuning {
+            compensation: [0x13, 0x20, 0xC6, 0x19, 0xC6],
+            power_stage: 0x70,
+            telemetry: [0x03, 0x03, 0x03, 0x03, 0x03, 0x00],
+            iout_cal_gain: 0xC880,
+            iout_cal_offset: 0xE000,
+        }),
+    };
+
+    let mut tps546 = Tps546::new(i2c, config);
+    tps546
+        .init()
+        .await
+        .context("power controller init failed")?;
+    tps546
+        .clear_faults()
+        .await
+        .context("failed to clear faults")?;
+
+    if let Err(e) = tps546.dump_configuration().await {
+        warn!("Failed to dump TPS546 configuration: {}", e);
+    }
+
+    Ok(tps546)
+}
+
+/// The chain's reset line, driven through the firmware's GPIO
+/// command.
+struct EmberOne00ResetLine {
+    nrst_pin: BitaxeRawGpioPin,
+}
+
+#[async_trait]
+impl ResetLine for EmberOne00ResetLine {
+    async fn assert(&mut self) -> Result<()> {
+        self.nrst_pin
+            .write(PinValue::Low)
+            .await
+            .map_err(|e| anyhow!("failed to assert reset: {}", e))
+    }
+
+    async fn release(&mut self) -> Result<()> {
+        self.nrst_pin
+            .write(PinValue::High)
+            .await
+            .map_err(|e| anyhow!("failed to release reset: {}", e))
+    }
+}
+
 /// emberOne/00 hash board state.
 ///
 /// Holds hardware handles needed for the board's lifetime.
 /// Moved into the shutdown future by the factory function.
 struct EmberOne00 {
     control: ControlChannel,
+    reset_line: EmberOne00ResetLine,
+    regulator: Arc<Mutex<Tps546<BitaxeRawI2c>>>,
+    pwr_en: BitaxeRawGpioPin,
     vddio_en: BitaxeRawGpioPin,
     status_led: StatusLed,
     monitor_cancel: CancellationToken,
@@ -284,9 +426,19 @@ struct EmberOne00 {
 }
 
 impl EmberOne00 {
+    /// Powers the board down in the reverse of its bring-up order.
     async fn shutdown(&mut self) {
         self.monitor_cancel.cancel();
         let _ = (&mut self.monitor_task).await;
+
+        if let Err(e) = self.reset_line.assert().await {
+            warn!("Failed to hold chips in reset: {}", e);
+        }
+        match self.regulator.lock().await.disable_output().await {
+            Ok(()) => debug!("Core voltage turned off"),
+            Err(e) => warn!("Failed to disable output: {}", e),
+        }
+        let _ = self.pwr_en.write(PinValue::Low).await;
         let _ = self.vddio_en.write(PinValue::Low).await;
         self.status_led.off().await;
         let _ = system::reboot(&self.control).await;
