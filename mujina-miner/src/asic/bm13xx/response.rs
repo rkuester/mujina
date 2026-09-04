@@ -176,7 +176,7 @@ mod tests {
     use tokio_util::codec::Decoder;
 
     use super::super::codec::FrameCodec;
-    use super::super::register::{ChipId, ChipModel, Register};
+    use super::super::register::{ChipId, ChipModel, CoreRegisterValue, Register};
     use super::*;
     use crate::asic::bm13xx::crc::crc5_is_valid;
 
@@ -263,6 +263,28 @@ mod tests {
             })
             .expect("some five-bit value satisfies the CRC");
         body
+    }
+
+    #[test]
+    fn decode_core_register_value_report() {
+        // An EmberOne00 chip at address 0x08 sends this unasked
+        let wire = &[
+            0xaa, 0x55, 0x00, 0x00, 0x00, 0x00, 0x08, 0x40, 0x00, 0x00, 0x0e,
+        ];
+        let response = decode_frame(wire, ChipModel::BM1362).expect("a valid frame");
+
+        let Response::ReadRegister(RegisterResponse {
+            chip_address,
+            register,
+        }) = response
+        else {
+            panic!("expected a register response, got {response:?}");
+        };
+        assert_eq!(chip_address, 0x08);
+        assert_eq!(
+            register,
+            Register::CoreRegisterValue(CoreRegisterValue([0, 0, 0, 0]))
+        );
     }
 
     #[test]

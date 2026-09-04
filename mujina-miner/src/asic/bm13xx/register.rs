@@ -26,6 +26,7 @@ pub enum RegisterAddress {
     UartBaud = 0x28,
     UartRelay = 0x2C,
     CoreMailbox = 0x3C,
+    CoreRegisterValue = 0x40,
     AnalogMux = 0x54,
     IoDriverStrength = 0x58,
     RingOscPadDisable = 0x68,
@@ -45,6 +46,7 @@ pub enum Register {
     UartBaud(UartBaud),
     UartRelay(UartRelay),
     CoreMailbox(CoreCommand),
+    CoreRegisterValue(CoreRegisterValue),
     AnalogMux(AnalogMux),
     IoDriverStrength(IoDriverStrength),
     RingOscPadDisable(RingOscPadDisable),
@@ -66,6 +68,9 @@ impl Register {
             RegisterAddress::UartBaud => Register::UartBaud(UartBaud::decode(bytes)),
             RegisterAddress::UartRelay => Register::UartRelay(UartRelay::decode(bytes)),
             RegisterAddress::CoreMailbox => Register::CoreMailbox(CoreCommand::decode(bytes)),
+            RegisterAddress::CoreRegisterValue => {
+                Register::CoreRegisterValue(CoreRegisterValue::decode(bytes))
+            }
             RegisterAddress::AnalogMux => Register::AnalogMux(AnalogMux::decode(bytes)),
             RegisterAddress::IoDriverStrength => {
                 Register::IoDriverStrength(IoDriverStrength::decode(bytes))
@@ -93,6 +98,7 @@ impl Register {
             Register::UartBaud(_) => RegisterAddress::UartBaud,
             Register::UartRelay(_) => RegisterAddress::UartRelay,
             Register::CoreMailbox(_) => RegisterAddress::CoreMailbox,
+            Register::CoreRegisterValue(_) => RegisterAddress::CoreRegisterValue,
             Register::AnalogMux(_) => RegisterAddress::AnalogMux,
             Register::IoDriverStrength(_) => RegisterAddress::IoDriverStrength,
             Register::RingOscPadDisable(_) => RegisterAddress::RingOscPadDisable,
@@ -112,6 +118,7 @@ impl Register {
             Register::UartBaud(r) => r.encode(dst),
             Register::UartRelay(r) => r.encode(dst),
             Register::CoreMailbox(r) => r.encode(dst),
+            Register::CoreRegisterValue(r) => r.encode(dst),
             Register::AnalogMux(r) => r.encode(dst),
             Register::IoDriverStrength(r) => r.encode(dst),
             Register::RingOscPadDisable(r) => r.encode(dst),
@@ -957,6 +964,9 @@ macro_rules! opaque_register {
 }
 
 opaque_register! {
+    /// A core register's value (0x40), which a BM1362 reports
+    /// unasked.
+    CoreRegisterValue,
     /// Ring-oscillator pad disable (0x68).
     RingOscPadDisable,
     /// On-die ADC control (0xB9).

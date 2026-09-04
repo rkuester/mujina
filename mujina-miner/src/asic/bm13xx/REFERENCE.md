@@ -42,6 +42,7 @@ Contents:
     - [0x28 - UART_BAUD]
     - [0x2C - UART_RELAY]
     - [0x3C - CORE_MAILBOX]
+    - [0x40 - CORE_REGISTER_VALUE]
     - [0x54 - ANALOG_MUX]
     - [0x58 - IO_DRIVER_STRENGTH]
     - [0x68 - RING_OSC_PAD_DISABLE]
@@ -966,6 +967,7 @@ The registers this document covers:
 | 0x28     | UART_BAUD            | UART baud rate selection                          |
 | 0x2C     | UART_RELAY           | Serial line relay across domain boundaries        |
 | 0x3C     | CORE_MAILBOX         | Indirect access to per-core registers             |
+| 0x40     | CORE_REGISTER_VALUE  | A core register's value, reported by the chip     |
 | 0x54     | ANALOG_MUX           | Analog mux output signal select                   |
 | 0x58     | IO_DRIVER_STRENGTH   | Output pin drive strength                         |
 | 0x68     | RING_OSC_PAD_DISABLE | Ring-oscillator pad disable (BM1368/BM1370)       |
@@ -1269,6 +1271,22 @@ per chip with core enable appended:
 - 0x0B clock select: 0x00 (BM1368/70; BM1362/66 use 0x05 above instead)
 - 0x0D nonce bin overflow control: 0xEE (BM1370, written after mining
     configuration; 0xEE enables the control, 0xEF disables it)
+
+### 0x40 - CORE_REGISTER_VALUE
+
+Holds a core register's value. The BM1397 documents name the register
+Core Register Value in one place and Core Error Status in another, give a
+reset value of 0x00000000, and describe no layout.
+
+A BM1362 sends a read-register response naming this register with no read
+from the host. Evidence: measured on an EmberOne00, where one chip of
+twelve, at address 0x08, sends the response continuously from bring-up
+onward, about 20 per second at the reset frequency and about 200 per
+second at 350 MHz. Nine responses in ten hold 0x00000000; the rest hold
+scattered values, most with a single bit set. One other chip sent the
+response twice in a minute. What the report signals, and why one chip
+sends it, is unknown. The responses arrive between the replies to the
+host's own reads and share the response line with nonces.
 
 ### 0x54 - ANALOG_MUX
 
@@ -2483,6 +2501,7 @@ work above.
 [0x28 - UART_BAUD]: #0x28---uart_baud
 [0x2C - UART_RELAY]: #0x2c---uart_relay
 [0x3C - CORE_MAILBOX]: #0x3c---core_mailbox
+[0x40 - CORE_REGISTER_VALUE]: #0x40---core_register_value
 [0x54 - ANALOG_MUX]: #0x54---analog_mux
 [0x58 - IO_DRIVER_STRENGTH]: #0x58---io_driver_strength
 [0x68 - RING_OSC_PAD_DISABLE]: #0x68---ring_osc_pad_disable
