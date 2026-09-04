@@ -15,7 +15,7 @@ pub mod usb;
 pub use cpu::CpuDeviceInfo;
 pub use serial::{
     Parity, SerialConfig, SerialControl, SerialError, SerialReader, SerialStats, SerialStream,
-    SerialWriter,
+    SerialWriter, TracingReader,
 };
 pub use usb::{UsbDeviceInfo, UsbTransport};
 

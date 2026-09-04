@@ -3,13 +3,10 @@ use async_trait::async_trait;
 use std::{
     fmt,
     ops::RangeInclusive,
-    pin::Pin,
     sync::{Arc, Mutex as StdMutex},
-    task::{Context, Poll},
     time::Duration,
 };
 use tokio::{
-    io::{AsyncRead, ReadBuf},
     sync::{Mutex, watch},
     task::JoinHandle,
     time::{self, Instant, MissedTickBehavior},
@@ -53,7 +50,7 @@ use crate::{
     tracing::prelude::*,
     transport::{
         UsbDeviceInfo,
-        serial::{SerialReader, SerialStream, SerialWriter},
+        serial::{SerialReader, SerialStream, SerialWriter, TracingReader},
     },
     types::{HashRate, Ratio, Temperature, Voltage},
 };
@@ -745,44 +742,6 @@ impl ResetLine for BitaxeResetLine {
             .lock()
             .map_err(|_| anyhow!("reset line state lock poisoned"))? = Some(Instant::now());
         Ok(())
-    }
-}
-/// A wrapper around AsyncRead that traces raw bytes as they're read.
-struct TracingReader<R> {
-    inner: R,
-    name: &'static str,
-}
-
-impl<R: AsyncRead + Unpin> TracingReader<R> {
-    fn new(inner: R, name: &'static str) -> Self {
-        Self { inner, name }
-    }
-}
-
-impl<R: AsyncRead + Unpin> AsyncRead for TracingReader<R> {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        let before_len = buf.filled().len();
-
-        let result = Pin::new(&mut self.inner).poll_read(cx, buf);
-
-        if let Poll::Ready(Ok(())) = &result {
-            let after_len = buf.filled().len();
-            if after_len > before_len {
-                let new_bytes = &buf.filled()[before_len..after_len];
-                trace!(
-                    "{} RX: {} bytes => {:02x?}",
-                    self.name,
-                    new_bytes.len(),
-                    new_bytes
-                );
-            }
-        }
-
-        result
     }
 }
 

@@ -32,6 +32,8 @@ use rustix::termios::{ControlModes, tcgetattr, tcsetattr};
 use tokio::io::unix::AsyncFd;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
+use crate::tracing::prelude::*;
+
 /// Parity configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Parity {
@@ -516,6 +518,48 @@ impl SerialControl {
     pub fn reset_stats(&self) {
         self.inner.bytes_read.store(0, Ordering::Relaxed);
         self.inner.bytes_written.store(0, Ordering::Relaxed);
+    }
+}
+
+/// A reader that logs every byte it passes through at trace level.
+///
+/// The name labels the log lines, so a board with more than one
+/// serial port can tell them apart.
+pub struct TracingReader<R> {
+    inner: R,
+    name: &'static str,
+}
+
+impl<R: AsyncRead + Unpin> TracingReader<R> {
+    pub fn new(inner: R, name: &'static str) -> Self {
+        Self { inner, name }
+    }
+}
+
+impl<R: AsyncRead + Unpin> AsyncRead for TracingReader<R> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let before_len = buf.filled().len();
+
+        let result = Pin::new(&mut self.inner).poll_read(cx, buf);
+
+        if let Poll::Ready(Ok(())) = &result {
+            let after_len = buf.filled().len();
+            if after_len > before_len {
+                let new_bytes = &buf.filled()[before_len..after_len];
+                trace!(
+                    "{} RX: {} bytes => {:02x?}",
+                    self.name,
+                    new_bytes.len(),
+                    new_bytes
+                );
+            }
+        }
+
+        result
     }
 }
 
