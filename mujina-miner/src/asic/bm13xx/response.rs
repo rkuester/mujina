@@ -246,6 +246,41 @@ mod tests {
         codec.decode(&mut buf).expect("Failed to decode frame")
     }
 
+    /// A chip id reply from the Bitaxe capture, with its preamble.
+    const CHIP_ID_FRAME: [u8; 11] = [
+        0xaa, 0x55, 0x13, 0x70, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10,
+    ];
+
+    /// Fills in the CRC5 of a response body whose last byte holds
+    /// the response type in its top three bits.
+    fn with_crc5(mut body: [u8; 9]) -> [u8; 9] {
+        let type_bits = body[8] & 0xe0;
+        body[8] = (0..32)
+            .map(|crc| type_bits | crc)
+            .find(|&last| {
+                body[8] = last;
+                crc5_is_valid(&body)
+            })
+            .expect("some five-bit value satisfies the CRC");
+        body
+    }
+
+    #[test]
+    fn decoder_drops_an_undecodable_frame_whole() {
+        // A CRC-valid chip id reply naming no known model, ahead of
+        // a good reply in the same buffer
+        let unknown_chip = with_crc5([0x12, 0x34, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+        let mut buf = BytesMut::from(&[0xaa, 0x55][..]);
+        buf.put_slice(&unknown_chip);
+        buf.put_slice(&CHIP_ID_FRAME);
+        let mut codec = FrameCodec::new(ChipModel::BM1370);
+
+        let response = codec.decode(&mut buf).unwrap();
+
+        assert!(matches!(response, Some(Response::ReadRegister(_))));
+        assert!(buf.is_empty(), "both frames are consumed");
+    }
+
     #[test]
     fn reject_register_response_with_unknown_chip_id() {
         // A ChipId register read response whose id bytes match no
@@ -474,12 +509,8 @@ mod tests {
             0xaa, 0x55, 0x13, 0x70, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10,
         ]); // Valid frame
 
-        // First calls should skip garbage
-        assert!(codec.decode(&mut buf).unwrap().is_none());
-        assert!(codec.decode(&mut buf).unwrap().is_none());
-        assert!(codec.decode(&mut buf).unwrap().is_none());
-
-        // Should find valid frame
+        // One call skips the garbage and returns the frame behind
+        // it; returning None would make the reader wait for bytes
         let result = codec.decode(&mut buf).unwrap();
         assert!(result.is_some(), "Should find valid frame after garbage");
         assert_eq!(buf.len(), 0, "All data should be consumed");
@@ -496,33 +527,11 @@ mod tests {
             0xaa, 0x55, 0x13, 0x70, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10,
         ]); // Valid frame
 
-        // Total buffer: [AA, 00, AA, 55, 13, 70, 00, 00, 00, 00, 00, 00, 10] = 13 bytes
-        assert_eq!(buf.len(), 13, "Initial buffer should have 13 bytes");
-
-        // First decode: sees AA at pos 0, but 00 at pos 1, so should skip 1 byte
-        let first = codec.decode(&mut buf).unwrap();
-        assert!(first.is_none(), "First decode should return None");
-        assert_eq!(buf.len(), 12, "Should have consumed 1 byte");
-
-        // Buffer now: [00, AA, 55, 13, 70, 00, 00, 00, 00, 00, 00, 10] = 12 bytes
-        // Second decode: sees 00 at pos 0, should skip 1 byte
-        let second = codec.decode(&mut buf).unwrap();
-        assert!(second.is_none(), "Second decode should return None");
-        assert_eq!(buf.len(), 11, "Should have consumed another byte");
-
-        // Buffer now: [AA, 55, 13, 70, 00, 00, 00, 00, 00, 00, 10] = 11 bytes = valid frame
-        // Third decode should succeed
-        let result = codec.decode(&mut buf);
-        match result {
-            Ok(Some(Response::ReadRegister(_))) => {} // Success
-            Ok(Some(other)) => panic!("Expected ReadRegister, got {:?}", other),
-            Ok(None) => panic!(
-                "Expected Some, got None. Buffer len: {}, contents: {:02x?}",
-                buf.len(),
-                &buf[..]
-            ),
-            Err(e) => panic!("Decode error: {}", e),
-        }
+        // One call skips the false start and the byte after it
+        // and returns the frame
+        let result = codec.decode(&mut buf).unwrap();
+        assert!(matches!(result, Some(Response::ReadRegister(_))));
+        assert_eq!(buf.len(), 0, "All data should be consumed");
     }
 
     #[test]
@@ -622,21 +631,9 @@ mod tests {
             0xaa, 0x55, 0x50, 0x03, 0x41, 0xd6, 0x00, 0x81, 0x18, 0x01, 0x9b,
         ]);
 
-        // Total: 5 + 11 = 16 bytes
-        // Should skip the partial frame bytes one by one until finding the valid frame
-        for i in 0..5 {
-            let result = codec.decode(&mut buf).unwrap();
-            assert!(result.is_none(), "Decode {} should return None", i + 1);
-            assert_eq!(
-                buf.len(),
-                16 - i - 1,
-                "Should have consumed {} bytes",
-                i + 1
-            );
-        }
-
-        // Now we should have the valid frame
+        // One call skips the partial frame and returns the whole one
         let result = codec.decode(&mut buf).unwrap();
+        assert_eq!(buf.len(), 0, "All data should be consumed");
         assert!(
             result.is_some(),
             "Should find valid frame after partial data"

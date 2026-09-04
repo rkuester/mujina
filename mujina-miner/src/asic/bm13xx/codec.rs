@@ -76,75 +76,63 @@ impl Decoder for FrameCodec {
     type Error = io::Error;
 
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
-        // Return Ok(Item) with a valid frame, or Ok(None) if to be called again, potentially with
-        // more data. Returning an Error causes the stream to be terminated, so don't do that.
+        // Return Ok(Some) with a decoded frame, or Ok(None) when the
+        // buffer holds less than a frame. Never return an error, which
+        // would end the stream.
         //
-        // There are three cases:
-        //
-        // 1. More data needed
-        // 2. Invalid frame
-        // 3. Valid frame
-        //
-        // In the case of an invalid frame, consume the first byte and request another call by
-        // returning Ok(None). In the case of a valid frame, consume that frame's worth of bytes.
+        // Bytes that fail the CRC5 are junk: skip one and scan again.
+        // A frame that passes the CRC5 but does not decode is one the
+        // chip sent and this codec does not understand: skip it whole.
+        // Both continue within this call. The framed reader answers
+        // Ok(None) by waiting for more bytes, so returning early would
+        // leave a frame already in the buffer unread until the next
+        // bytes arrived.
 
         const PREAMBLE: [u8; 2] = [0xaa, 0x55];
         // All BM13xx responses are 11 bytes (2 preamble + 9 data)
         const FRAME_LEN: usize = PREAMBLE.len() + 9;
-        const CALL_AGAIN: Result<Option<Response>, io::Error> = Ok(None);
 
-        if src.len() < FRAME_LEN {
-            return CALL_AGAIN;
-        }
-
-        // Check preamble without consuming the buffer
-        if src[0] != PREAMBLE[0] {
-            src.advance(1);
-            return CALL_AGAIN;
-        }
-
-        if src[1] != PREAMBLE[1] {
-            src.advance(1);
-            return CALL_AGAIN;
-        }
-
-        // Validate CRC5 over the entire frame (excluding preamble)
-        // CRC5 is computed over the 9 data bytes after the preamble
-        if !crc5_is_valid(&src[2..FRAME_LEN]) {
-            trace!(
-                "Frame sync lost: CRC5 failed for potential frame at position 0. Searching for next frame..."
-            );
-            src.advance(1);
-            return CALL_AGAIN;
-        }
-
-        // We have a valid frame with correct CRC
-        // Save the frame bytes before consuming
-        let frame_bytes = src[..FRAME_LEN].to_vec();
-
-        // Create a buffer for decoding
-        let mut decode_buf = BytesMut::from(&src[..FRAME_LEN]);
-        decode_buf.advance(2); // Skip preamble for Response::decode
-
-        match Response::decode(&mut decode_buf, self.model) {
-            Ok(response) => {
-                // Only advance if decode was successful
-                src.advance(FRAME_LEN);
-
-                // Log the received frame for debugging
-                trace!(
-                    resp = ?response,
-                    bytes = FRAME_LEN,
-                    frame = %HexBytes(&frame_bytes),
-                    "RX BM13xx"
-                );
-                Ok(Some(response))
+        loop {
+            if src.len() < FRAME_LEN {
+                return Ok(None);
             }
-            Err(err) => {
-                warn!("Failed to decode response: {}", err);
-                // Advance by 1 to try to find next valid frame
+
+            if src[..PREAMBLE.len()] != PREAMBLE {
                 src.advance(1);
-                CALL_AGAIN
+                continue;
+            }
+
+            // CRC5 covers the 9 data bytes after the preamble
+            if !crc5_is_valid(&src[PREAMBLE.len()..FRAME_LEN]) {
+                trace!(
+                    "Frame sync lost: CRC5 failed at the preamble. Searching for the next frame"
+                );
+                src.advance(1);
+                continue;
+            }
+
+            let frame_bytes = src[..FRAME_LEN].to_vec();
+            let mut decode_buf = BytesMut::from(&src[PREAMBLE.len()..FRAME_LEN]);
+            let decoded = Response::decode(&mut decode_buf, self.model);
+            src.advance(FRAME_LEN);
+
+            match decoded {
+                Ok(response) => {
+                    trace!(
+                        resp = ?response,
+                        bytes = FRAME_LEN,
+                        frame = %HexBytes(&frame_bytes),
+                        "RX BM13xx"
+                    );
+                    return Ok(Some(response));
+                }
+                Err(err) => {
+                    warn!(
+                        error = %err,
+                        frame = %HexBytes(&frame_bytes),
+                        "Dropping a response the codec cannot decode"
+                    );
+                }
             }
         }
     }
