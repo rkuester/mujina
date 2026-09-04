@@ -188,7 +188,7 @@ where
 
     fn drain_stale(&mut self) {
         while let Ok(stale) = self.responses.try_recv() {
-            warn!(?stale, "Discarding stale register response");
+            trace!(?stale, "Discarding stale register response");
         }
     }
 }
