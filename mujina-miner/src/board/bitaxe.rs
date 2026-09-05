@@ -198,6 +198,7 @@ async fn create_from_usb(
 
     let thread = BM13xxThread::new(
         thread_name,
+        &sys_thread,
         chip,
         TopologySpec::single_domain(1),
         data_reader,

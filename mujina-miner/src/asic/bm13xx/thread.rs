@@ -31,14 +31,15 @@ use super::register::{
     PllDivider, Register, RegisterAddress, TicketMask,
 };
 use super::register_client::RegisterClient;
-use super::response::{NonceResponse, RegisterResponse, Response};
+use super::response::{NonceFields, NonceResponse, RegisterResponse, Response};
 use super::topology::TopologySpec;
 use crate::{
     asic::hash_thread::{
         HashTask, HashThread, HashThreadCapabilities, HashThreadEvent, HashThreadStatus, Share,
     },
+    systree::{Cursor, Report},
     tracing::prelude::*,
-    types::{Difficulty, Frequency, ShareRate, Voltage},
+    types::{Difficulty, Frequency, HashRate, HashrateEstimator, ShareRate, Voltage},
 };
 
 /// BM13xx HashThread implementation.
@@ -71,6 +72,8 @@ impl BM13xxThread {
     ///
     /// # Arguments
     /// * `name` - Human-readable name for logging (e.g., "Bitaxe Gamma (e2f56f9b)")
+    /// * `sys` - The thread's place in the tree, where it publishes
+    ///   what each chip does
     /// * `config` - Chip model configuration (identity, PLL parameters)
     /// * `topology` - The board's declared chip wiring
     /// * `chip_responses` - Stream of decoded responses from chips
@@ -78,8 +81,13 @@ impl BM13xxThread {
     /// * `peripherals` - Hardware interfaces from board (reset line, regulator, etc.)
     /// * `shutdown_rx` - Shutdown signal from the board; a send or a
     ///   dropped sender requests shutdown
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one argument per thing the board supplies"
+    )]
     pub fn new<R, W>(
         name: String,
+        sys: &Cursor,
         config: ChipConfig,
         topology: TopologySpec,
         chip_responses: R,
@@ -99,6 +107,7 @@ impl BM13xxThread {
 
         let (reader, channels) = Reader::spawn(chip_responses);
         let actor = Actor::new(
+            sys,
             config,
             topology,
             event_tx,
@@ -246,6 +255,12 @@ struct Actor<W> {
     /// ASIC ticket mask difficulty.
     asic_difficulty: Log2Difficulty,
 
+    /// The thread's place in the tree.
+    sys: Cursor,
+
+    /// What each chip has done, by chain index.
+    chips: Vec<ChipTelemetry>,
+
     /// Whether lazy chain initialization has run.
     chain_initialized: bool,
 
@@ -261,7 +276,12 @@ where
     W: ChipCommandSink + Unpin,
     SinkError<W>: std::error::Error + Send + Sync + 'static,
 {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one argument per thing the board supplies"
+    )]
     fn new(
+        sys: &Cursor,
         config: ChipConfig,
         topology: TopologySpec,
         event_tx: mpsc::Sender<HashThreadEvent>,
@@ -275,15 +295,23 @@ where
             ShareRate::per_second(1.0).to_difficulty(config.nameplate),
         );
 
+        let chain = Chain::from_topology(&topology);
+        let sys_chips = sys.child("chips");
+        let chips = (0..chain.chip_count())
+            .map(|i| ChipTelemetry::attach(&sys_chips.child(&i.to_string())))
+            .collect();
+
         Self {
             config,
-            chain: Chain::from_topology(&topology),
+            chain,
             event_tx,
             status,
             chip_commands,
             peripherals,
             _reader: reader,
             asic_difficulty,
+            sys: sys.clone(),
+            chips,
             chain_initialized: false,
             current_task: None,
             chip_jobs: ChipJobTracker::new(),
@@ -316,6 +344,9 @@ where
 
         let mut ntime_ticker = time::interval(Duration::from_secs(1));
         ntime_ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+        let mut telemetry_ticker = time::interval(Duration::from_secs(1));
+        telemetry_ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
         loop {
             tokio::select! {
@@ -387,6 +418,15 @@ where
                         register = ?response.register,
                         "Register read response"
                     );
+                    if let Register::CoreRegisterValue(_) = response.register
+                        && let Some(id) = self.chain.index_of_address(response.chip_address)
+                    {
+                        self.chips[id.index()].core_register_reports += 1;
+                    }
+                }
+
+                _ = telemetry_ticker.tick() => {
+                    self.publish_chips();
                 }
 
                 // ntime rolling timer (roll forward every second)
@@ -614,6 +654,12 @@ where
         self.chain
             .assign_addresses()
             .context("chip address assignment failed")?;
+        {
+            let mut published = self.sys.write();
+            for (id, chip) in self.chain.chips() {
+                published.set(&self.chips[id.index()].attrs.address, chip.address);
+            }
+        }
         for (_, chip) in self.chain.chips() {
             self.chip_commands
                 .send(RegisterCommand::SetChipAddress(SetChipAddress {
@@ -836,6 +882,45 @@ where
         Ok(())
     }
 
+    /// Names the chip a nonce came from, by chain index.
+    ///
+    /// A BM1362 stamps its address into the nonce. A BM1370 does
+    /// not, so its nonces are attributed only on a chain of one.
+    fn chip_for_nonce(&self, nonce: u32) -> Option<usize> {
+        match NonceFields::from_nonce(self.config.model, nonce) {
+            NonceFields::BM1362 { chip_address, .. } => self
+                .chain
+                .index_of_address(chip_address)
+                .map(|id| id.index()),
+            NonceFields::BM1370 { .. } => (self.chain.chip_count() == 1).then_some(0),
+        }
+    }
+
+    /// Publishes every chip's counts and rate under one guard.
+    fn publish_chips(&mut self) {
+        let rows: Vec<_> = self
+            .chips
+            .iter_mut()
+            .map(|chip| {
+                (
+                    chip.nonces,
+                    chip.hardware_errors,
+                    chip.core_register_reports,
+                    chip.estimator.hashrate(),
+                )
+            })
+            .collect();
+        let mut published = self.sys.write();
+        for (chip, (nonces, hardware_errors, core_register_reports, hashrate)) in
+            self.chips.iter().zip(rows)
+        {
+            published.set(&chip.attrs.nonces, nonces);
+            published.set(&chip.attrs.hardware_errors, hardware_errors);
+            published.set(&chip.attrs.core_register_reports, core_register_reports);
+            published.set(&chip.attrs.hashrate, hashrate);
+        }
+    }
+
     /// Handles one nonce report from the chips.
     async fn handle_nonce(&mut self, nonce_response: NonceResponse) {
         let NonceResponse {
@@ -845,6 +930,11 @@ where
             excess_difficulty,
             subcore_id,
         } = nonce_response;
+
+        let chip = self.chip_for_nonce(nonce);
+        if let Some(i) = chip {
+            self.chips[i].nonces += 1;
+        }
 
         // Look up the task for this job_id
         if let Some(task) = self.chip_jobs.get(job_id) {
@@ -872,6 +962,19 @@ where
 
                     // Compute hash
                     let hash = header.block_hash();
+
+                    // A hash under the chip's own ticket mask is a
+                    // hardware error; one over it is a sample of the
+                    // mask's expected work, whatever the source's
+                    // target makes of it.
+                    if let Some(i) = chip {
+                        let telemetry = &mut self.chips[i];
+                        if Difficulty::from_hash(&hash) >= self.asic_difficulty.to_difficulty() {
+                            telemetry.estimator.record(self.asic_difficulty.to_work());
+                        } else {
+                            telemetry.hardware_errors += 1;
+                        }
+                    }
 
                     // Validate against task share target
                     if task.share_target.is_met_by(hash) {
@@ -1042,6 +1145,64 @@ fn task_to_job_full(task: &HashTask, chip_job_id: u8) -> Result<JobFullFormat> {
 /// that needs it.
 const VOLTAGE_LEAD: Duration = Duration::from_millis(50);
 
+/// The window a chip's hashrate is estimated over.
+const CHIP_HASHRATE_WINDOW: Duration = Duration::from_secs(5 * 60);
+
+/// What one chip has done, kept by the actor and published each
+/// second.
+struct ChipTelemetry {
+    attrs: ChipAttributes,
+    estimator: HashrateEstimator,
+    nonces: u64,
+    hardware_errors: u64,
+    core_register_reports: u64,
+}
+
+impl ChipTelemetry {
+    fn attach(sys: &Cursor) -> Self {
+        Self {
+            attrs: ChipAttributes::attach(sys),
+            estimator: HashrateEstimator::new(CHIP_HASHRATE_WINDOW),
+            nonces: 0,
+            hardware_errors: 0,
+            core_register_reports: 0,
+        }
+    }
+}
+
+/// What one chip holds in the tree, under its thread.
+struct ChipAttributes {
+    /// The address the chip took at enumeration.
+    address: Report<u8>,
+
+    /// Nonces the chip has reported since the thread started.
+    nonces: Report<u64>,
+
+    /// Reported nonces whose hash fell short of the chip's own
+    /// ticket mask.
+    hardware_errors: Report<u64>,
+
+    /// Core register value responses the chip sent with no read
+    /// from the host.
+    core_register_reports: Report<u64>,
+
+    /// The rate estimated from the chip's nonces over the last few
+    /// minutes.
+    hashrate: Report<HashRate>,
+}
+
+impl ChipAttributes {
+    fn attach(sys: &Cursor) -> Self {
+        Self {
+            address: sys.report("address", 0),
+            nonces: sys.report("nonces", 0),
+            hardware_errors: sys.report("hardware_errors", 0),
+            core_register_reports: sys.report("core_register_reports", 0),
+            hashrate: sys.report("hashes", HashRate::default()),
+        }
+    }
+}
+
 /// Generates the ramp's steps, each frequency with the PLL
 /// dividers that produce it, for smooth PLL transitions.
 fn generate_frequency_ramp_steps(
@@ -1082,6 +1243,7 @@ mod tests {
     use crate::asic::bm13xx::chip_config;
     use crate::asic::bm13xx::peripherals::ResetLine;
     use crate::peripheral::regulator::VoltageRegulator;
+    use crate::systree::{Tree, Unconfigured};
     use crate::types::Voltage;
 
     #[test]
@@ -1320,6 +1482,24 @@ mod tests {
         W: ChipCommandSink + Unpin + Send + 'static,
         SinkError<W>: std::error::Error + Send + Sync + 'static,
     {
+        let sys = Tree::new(Arc::new(Unconfigured)).root();
+        spawn_thread_in(
+            &sys.child("threads").child("0"),
+            chip_responses,
+            chip_commands,
+        )
+    }
+
+    fn spawn_thread_in<R, W>(
+        sys: &Cursor,
+        chip_responses: R,
+        chip_commands: W,
+    ) -> (BM13xxThread, watch::Sender<()>, PeripheralFlags)
+    where
+        R: Stream<Item = Result<Response, std::io::Error>> + Unpin + Send + 'static,
+        W: ChipCommandSink + Unpin + Send + 'static,
+        SinkError<W>: std::error::Error + Send + Sync + 'static,
+    {
         let flags = PeripheralFlags::default();
         let peripherals = BoardPeripherals {
             reset_line: Box::new(MockResetLine(flags.clone())),
@@ -1329,6 +1509,7 @@ mod tests {
 
         let thread = BM13xxThread::new(
             "test".into(),
+            sys,
             chip_config::bm1370(),
             TopologySpec::single_domain(1),
             chip_responses,
@@ -1422,6 +1603,29 @@ mod tests {
 
         assert!(flags.reset_asserted.load(Ordering::SeqCst));
         assert!(flags.rail_disabled.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn publishes_a_node_per_chip() {
+        let root = Tree::new(Arc::new(Unconfigured)).root();
+        let (_thread, _shutdown_tx, _flags) = spawn_thread_in(
+            &root.child("threads").child("0"),
+            stream::pending::<Result<Response, std::io::Error>>(),
+            NullSink,
+        );
+
+        assert_eq!(
+            root.render_json(),
+            Some(serde_json::json!({
+                "threads": {"0": {"chips": {"0": {
+                    "address": 0,
+                    "nonces": 0,
+                    "hardware_errors": 0,
+                    "core_register_reports": 0,
+                    "hashes_per_s": 0,
+                }}}}
+            }))
+        );
     }
 
     #[tokio::test(start_paused = true)]
