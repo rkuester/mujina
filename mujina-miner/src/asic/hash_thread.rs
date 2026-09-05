@@ -196,6 +196,16 @@ pub trait HashThread: Send {
     /// Thread enters low-power mode, stops hashing.
     async fn go_idle(&mut self) -> Result<Option<HashTask>>;
 
+    /// Runs the thread at a share of its full power, 0.0 to 1.0,
+    /// where 0.0 is off.
+    ///
+    /// This is the scheduler's allocation. A client's own setting on
+    /// the thread takes precedence while it stands. A backend with
+    /// no such knob ignores the call.
+    async fn set_power_fraction(&mut self, _fraction: f32) -> Result<()> {
+        Ok(())
+    }
+
     /// Take ownership of the event receiver for this thread
     ///
     /// Called once by scheduler after thread creation. The scheduler uses this

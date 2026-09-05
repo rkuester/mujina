@@ -37,7 +37,7 @@ use crate::{
     asic::hash_thread::{
         HashTask, HashThread, HashThreadCapabilities, HashThreadEvent, HashThreadStatus, Share,
     },
-    systree::{Cursor, Report},
+    systree::{Cursor, Report, Setting, within},
     tracing::prelude::*,
     types::{Difficulty, Frequency, HashRate, HashrateEstimator, ShareRate, Voltage},
 };
@@ -190,6 +190,13 @@ impl HashThread for BM13xxThread {
             .map_err(|_| anyhow!("no response from thread"))?
     }
 
+    async fn set_power_fraction(&mut self, fraction: f32) -> Result<()> {
+        self.command_tx
+            .send(ThreadCommand::SetPowerFraction { fraction })
+            .await
+            .map_err(|_| anyhow!("command channel closed"))
+    }
+
     fn take_event_receiver(&mut self) -> Option<mpsc::Receiver<HashThreadEvent>> {
         self.event_rx.take()
     }
@@ -216,6 +223,9 @@ enum ThreadCommand {
         new_task: HashTask,
         response_tx: oneshot::Sender<Result<Option<HashTask>>>,
     },
+
+    /// Run at the scheduler's share of full power
+    SetPowerFraction { fraction: f32 },
 
     /// Go idle (stop hashing, low power)
     GoIdle {
@@ -258,6 +268,13 @@ struct Actor<W> {
     /// The thread's place in the tree.
     sys: Cursor,
 
+    /// The share of full power a client asks of this thread. Unset
+    /// means the scheduler decides.
+    target_power_fraction: Setting<Option<f32>>,
+
+    /// The share of full power the scheduler allocated.
+    scheduled_fraction: f32,
+
     /// What each chip has done, by chain index.
     chips: Vec<ChipTelemetry>,
 
@@ -267,6 +284,10 @@ struct Actor<W> {
     /// The frequency the chips run at, or `None` while they sit in
     /// reset.
     current_freq: Option<Frequency>,
+
+    /// A ramp in progress, stepped from the actor loop so chip
+    /// responses keep draining while the chain moves.
+    ramp: Option<Ramp>,
 
     /// The task currently being hashed.
     current_task: Option<HashTask>,
@@ -315,9 +336,16 @@ where
             _reader: reader,
             asic_difficulty,
             sys: sys.clone(),
+            target_power_fraction: sys.setting_checked(
+                "target_power_fraction",
+                None,
+                within(0.0..=1.0),
+            ),
+            scheduled_fraction: 1.0,
             chips,
             chain_initialized: false,
             current_freq: None,
+            ramp: None,
             current_task: None,
             chip_jobs: ChipJobTracker::new(),
         }
@@ -352,6 +380,14 @@ where
 
         let mut telemetry_ticker = time::interval(Duration::from_secs(1));
         telemetry_ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+        let mut ramp_ticker = time::interval(RAMP_STEP_INTERVAL);
+        ramp_ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+        // Subscribe before the loop, so a write between the two
+        // wakes the loop rather than passing unseen.
+        let mut client_fraction = self.target_power_fraction.subscribe();
+        client_fraction.borrow_and_update();
 
         loop {
             tokio::select! {
@@ -399,6 +435,29 @@ where
                             self.set_active(false);
                             response_tx.send(Ok(old_task)).ok();
                         }
+
+                        ThreadCommand::SetPowerFraction { fraction } => {
+                            self.scheduled_fraction = fraction;
+                            if self
+                                .apply_power_fraction(&mut shutdown_rx, &mut register_responses)
+                                .await
+                                .is_break()
+                            {
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                // A client's own power fraction for this thread
+                Ok(()) = client_fraction.changed() => {
+                    client_fraction.borrow_and_update();
+                    if self
+                        .apply_power_fraction(&mut shutdown_rx, &mut register_responses)
+                        .await
+                        .is_break()
+                    {
+                        break;
                     }
                 }
 
@@ -434,8 +493,19 @@ where
                     self.publish_chips();
                 }
 
+                // One step of a ramp in progress
+                _ = ramp_ticker.tick(), if self.ramp.is_some() => {
+                    if let Err(e) = self.ramp_step().await {
+                        error!(error = %e, "Failed to move the chain");
+                        self.ramp = None;
+                    }
+                    if self.ramp.is_none() {
+                        self.declare_expected_hashrate().await;
+                    }
+                }
+
                 // ntime rolling timer (roll forward every second)
-                _ = ntime_ticker.tick(), if self.current_task.is_some() => {
+                _ = ntime_ticker.tick(), if self.current_task.is_some() && self.chain_initialized => {
                     self.roll_ntime().await;
                 }
             }
@@ -457,21 +527,115 @@ where
             warn!(error = %e, "Failed to disable core voltage on exit");
         }
         self.current_freq = None;
+        self.ramp = None;
     }
 
     /// Declares the thread's expected hashrate to the scheduler.
     async fn configure(&mut self) {
-        // Nameplate rate for the chain; a rough stand-in for a
-        // real frequency-derived estimate.
-        let expected = self.config.nameplate * self.chain.chip_count();
+        self.declare_expected_hashrate().await;
+    }
+
+    /// The share of full power the thread runs at: the client's
+    /// own setting when it stands, else the scheduler's allocation.
+    fn effective_power_fraction(&self) -> f32 {
+        self.target_power_fraction
+            .get()
+            .unwrap_or(self.scheduled_fraction)
+    }
+
+    /// The frequency the chain should run at, or `None` for off.
+    fn target_frequency(&self) -> Option<Frequency> {
+        self.config
+            .frequency_for_power_fraction(self.effective_power_fraction())
+    }
+
+    /// The rate the chain sustains at its target frequency: the
+    /// nameplate scaled by the clock, and zero when off.
+    fn expected_hashrate(&self) -> HashRate {
+        match self.target_frequency() {
+            Some(freq) => {
+                let scale = freq.hz() as f64 / self.config.default_freq.hz() as f64;
+                let full = self.config.nameplate * self.chain.chip_count();
+                HashRate::from_megahashes(full.as_megahashes() * scale)
+            }
+            None => HashRate::default(),
+        }
+    }
+
+    /// Tells the scheduler the rate to expect at the current
+    /// operating point.
+    async fn declare_expected_hashrate(&mut self) {
+        let expected = self.expected_hashrate();
         if self
             .event_tx
             .send(HashThreadEvent::ExpectedHashRate(expected))
             .await
             .is_err()
         {
-            debug!("Event channel closed during configure");
+            debug!("Event channel closed while declaring the hashrate");
         }
+    }
+
+    /// Moves the chain to the operating point the effective power
+    /// fraction asks for: off when it is zero, brought up when it
+    /// was off and work is waiting, ramped otherwise. Returns
+    /// `Break` when the board's shutdown signal cut a bring-up
+    /// short.
+    async fn apply_power_fraction(
+        &mut self,
+        shutdown_rx: &mut watch::Receiver<()>,
+        register_responses: &mut mpsc::Receiver<RegisterResponse>,
+    ) -> ControlFlow<()> {
+        let fraction = self.effective_power_fraction();
+        match self.target_frequency() {
+            None => {
+                if self.chain_initialized {
+                    info!(fraction, "Power fraction is zero; holding the chain off");
+                    self.disable_chain().await;
+                    self.chain_initialized = false;
+                    self.chip_jobs.clear();
+                    self.set_active(false);
+                }
+            }
+            Some(target) if self.chain_initialized => {
+                if self.current_freq != Some(target) {
+                    info!(
+                        fraction,
+                        target_mhz = target.mhz(),
+                        "Moving the chain to a new operating point"
+                    );
+                    if let Err(e) = self.start_ramp(target) {
+                        error!(error = %e, "Failed to move the chain");
+                    }
+                }
+            }
+            Some(target) => {
+                let Some(task) = self.current_task.clone() else {
+                    return ControlFlow::Continue(());
+                };
+                info!(fraction, target_mhz = target.mhz(), "Bringing the chain up");
+                tokio::select! {
+                    result = self.initialize_chain(target, register_responses) => {
+                        match result {
+                            Ok(()) => {
+                                self.chain_initialized = true;
+                                match self.send_job(&task).await {
+                                    Ok(()) => self.set_active(true),
+                                    Err(e) => error!(error = %e, "Failed to send the waiting job"),
+                                }
+                            }
+                            Err(e) => error!(error = %e, "Chain initialization failed"),
+                        }
+                    }
+                    _ = shutdown_rx.changed() => {
+                        debug!("Shutdown requested during bring-up");
+                        return ControlFlow::Break(());
+                    }
+                }
+            }
+        }
+        self.declare_expected_hashrate().await;
+        ControlFlow::Continue(())
     }
 
     /// Takes a new task and sends its first job to the chip,
@@ -524,32 +688,41 @@ where
             self.chip_jobs.clear();
         }
 
-        // Send the task's first job; the ntime roller sends the rest
-        let chip_job_id = self.chip_jobs.insert(new_task.clone());
         let old_task = self.current_task.replace(new_task.clone());
-        match task_to_job_full(&new_task, chip_job_id) {
-            Ok(job_data) => {
-                if let Err(e) = self.chip_commands.send(JobCommand::JobFull(job_data)).await {
-                    error!(error = ?e, "Failed to send first JobFull to chip");
-                    let err = anyhow!("failed to send job to chip: {e:?}");
-                    response_tx.send(Err(err)).ok();
-                    return ControlFlow::Continue(());
-                } else if replace {
-                    debug!("Sent first job to chip (old work invalidated)");
-                } else {
-                    debug!("Sent first job to chip");
-                }
-            }
-            Err(e) => {
-                error!(error = %e, "Failed to convert task to JobFull");
-                response_tx.send(Err(e)).ok();
-                return ControlFlow::Continue(());
-            }
+
+        // A chain held off keeps the task for when it comes back
+        if !self.chain_initialized {
+            debug!("Chain is off; holding the work");
+            self.set_active(false);
+            response_tx.send(Ok(old_task)).ok();
+            return ControlFlow::Continue(());
+        }
+
+        // Send the task's first job; the ntime roller sends the rest
+        if let Err(e) = self.send_job(&new_task).await {
+            error!(error = %e, "Failed to send first job to chip");
+            response_tx.send(Err(e)).ok();
+            return ControlFlow::Continue(());
+        }
+        if replace {
+            debug!("Sent first job to chip (old work invalidated)");
+        } else {
+            debug!("Sent first job to chip");
         }
 
         self.set_active(true);
         response_tx.send(Ok(old_task)).ok();
         ControlFlow::Continue(())
+    }
+
+    /// Sends a task's job to the chain under a fresh chip job id.
+    async fn send_job(&mut self, task: &HashTask) -> Result<()> {
+        let chip_job_id = self.chip_jobs.insert(task.clone());
+        let job_data = task_to_job_full(task, chip_job_id).context("failed to convert task")?;
+        self.chip_commands
+            .send(JobCommand::JobFull(job_data))
+            .await
+            .map_err(|e| anyhow!("failed to send job to chip: {e:?}"))
     }
 
     /// Initializes the chain on the first call; later calls are
@@ -561,9 +734,13 @@ where
         if self.chain_initialized {
             return Ok(());
         }
+        let Some(target) = self.target_frequency() else {
+            debug!("Power fraction is zero; leaving the chain off");
+            return Ok(());
+        };
 
         trace!("Initializing chain on first assignment.");
-        self.initialize_chain(register_responses).await?;
+        self.initialize_chain(target, register_responses).await?;
         self.chain_initialized = true;
         Ok(())
     }
@@ -573,9 +750,10 @@ where
     /// Powers the core rail, releases the chips from reset,
     /// enumerates them against the declared topology, assigns
     /// addresses, configures all registers, and ramps the frequency
-    /// to target.
+    /// to `target`.
     async fn initialize_chain(
         &mut self,
+        target: Frequency,
         register_responses: &mut mpsc::Receiver<RegisterResponse>,
     ) -> Result<()> {
         // Power the core rail before releasing reset, at the voltage
@@ -780,9 +958,8 @@ where
             }))
             .await?;
 
-        // Frequency ramping from the reset frequency to the
-        // configured target
-        self.ramp_to(self.config.default_freq).await?;
+        // Frequency ramping from the reset frequency to the target
+        self.ramp_to(target).await?;
 
         // Final configuration
         self.chip_commands
@@ -806,7 +983,7 @@ where
         debug!("Verifying chain configuration");
         let target_pll = self
             .config
-            .calculate_pll(self.config.default_freq)
+            .calculate_pll(target)
             .context("no PLL solution for the target frequency")?;
         // What each chip should answer. The registers answer as
         // written, except PLL_DIVIDER bit 31, the lock report
@@ -840,15 +1017,13 @@ where
         Ok(())
     }
 
-    /// Ramps the chips from the frequency they run at to `target`
-    /// in steps, moving the rail with the clock: ahead of it on the
-    /// way up, behind it on the way down, so the chips never run a
-    /// clock the rail does not yet support.
-    async fn ramp_to(&mut self, target: Frequency) -> Result<()> {
+    /// Starts a ramp from the frequency the chips run at to
+    /// `target`. The actor loop steps it; a ramp already in progress
+    /// is replaced from wherever it got to.
+    fn start_ramp(&mut self, target: Frequency) -> Result<()> {
         let from = self
             .current_freq
             .context("cannot ramp a chain that is in reset")?;
-        let rising = target >= from;
         debug!(
             "Ramping frequency from {} MHz to {} MHz",
             from.mhz(),
@@ -856,35 +1031,67 @@ where
         );
         let steps =
             generate_frequency_ramp_steps(&self.config, from, target, self.config.ramp_step);
+        self.ramp = Some(Ramp {
+            rising: target >= from,
+            steps,
+            next: 0,
+        });
+        Ok(())
+    }
 
-        for (i, (freq, pll_config)) in steps.iter().enumerate() {
-            if rising {
-                self.set_core_voltage(*freq).await?;
-                time::sleep(VOLTAGE_LEAD).await;
-            }
+    /// Ramps to `target` and waits for the ramp to finish, for
+    /// bring-up, where the chain sends nothing the loop must drain.
+    async fn ramp_to(&mut self, target: Frequency) -> Result<()> {
+        self.start_ramp(target)?;
+        while self.ramp.is_some() {
+            self.ramp_step().await?;
+            time::sleep(RAMP_STEP_INTERVAL).await;
+        }
+        Ok(())
+    }
 
-            self.chip_commands
-                .send(RegisterCommand::WriteRegister(WriteRegister {
-                    destination: Destination::Broadcast,
-                    register: Register::PllDivider(*pll_config),
-                }))
-                .await
-                .context("PLL ramp failed")?;
+    /// Takes one step of the ramp in progress, moving the rail with
+    /// the clock: ahead of it on the way up, behind it on the way
+    /// down, so the chips never run a clock the rail does not yet
+    /// support. Clears the ramp after its last step.
+    async fn ramp_step(&mut self) -> Result<()> {
+        let Some(ramp) = &self.ramp else {
+            return Ok(());
+        };
+        let rising = ramp.rising;
+        let total = ramp.steps.len();
+        let index = ramp.next;
+        let (freq, pll_config) = ramp.steps[index];
 
-            if !rising {
-                time::sleep(VOLTAGE_LEAD).await;
-                self.set_core_voltage(*freq).await?;
-            }
-            self.current_freq = Some(*freq);
-
-            time::sleep(Duration::from_millis(100)).await;
-
-            if i % 10 == 0 || i == steps.len() - 1 {
-                trace!("Frequency ramp step {}/{}", i + 1, steps.len());
-            }
+        if rising {
+            self.set_core_voltage(freq).await?;
+            time::sleep(VOLTAGE_LEAD).await;
         }
 
-        debug!("Frequency ramping complete");
+        self.chip_commands
+            .send(RegisterCommand::WriteRegister(WriteRegister {
+                destination: Destination::Broadcast,
+                register: Register::PllDivider(pll_config),
+            }))
+            .await
+            .context("PLL ramp failed")?;
+
+        if !rising {
+            time::sleep(VOLTAGE_LEAD).await;
+            self.set_core_voltage(freq).await?;
+        }
+        self.current_freq = Some(freq);
+
+        if index % 10 == 0 || index + 1 == total {
+            trace!("Frequency ramp step {}/{}", index + 1, total);
+        }
+
+        if index + 1 == total {
+            debug!("Frequency ramping complete");
+            self.ramp = None;
+        } else if let Some(ramp) = &mut self.ramp {
+            ramp.next = index + 1;
+        }
         Ok(())
     }
 
@@ -1170,6 +1377,21 @@ fn task_to_job_full(task: &HashTask, chip_job_id: u8) -> Result<JobFullFormat> {
 /// Settle time between raising the rail and writing the clock
 /// that needs it.
 const VOLTAGE_LEAD: Duration = Duration::from_millis(50);
+
+/// Time between one ramp step and the next.
+const RAMP_STEP_INTERVAL: Duration = Duration::from_millis(100);
+
+/// A frequency ramp in progress.
+struct Ramp {
+    /// Whether the clock is rising, which decides whether the rail
+    /// moves before or after each PLL write.
+    rising: bool,
+    /// Every step of the ramp, the first being the frequency the
+    /// chips were at.
+    steps: Vec<(Frequency, PllDivider)>,
+    /// The step to take next.
+    next: usize,
+}
 
 /// The window a chip's hashrate is estimated over.
 const CHIP_HASHRATE_WINDOW: Duration = Duration::from_secs(5 * 60);
@@ -1690,15 +1912,37 @@ mod tests {
         assert_eq!(
             root.render_json(),
             Some(serde_json::json!({
-                "threads": {"0": {"chips": {"0": {
-                    "address": 0,
-                    "nonces": 0,
-                    "hardware_errors": 0,
-                    "core_register_reports": 0,
-                    "hashes_per_s": 0,
-                }}}}
+                "threads": {"0": {
+                    "target_power_fraction": null,
+                    "chips": {"0": {
+                        "address": 0,
+                        "nonces": 0,
+                        "hardware_errors": 0,
+                        "core_register_reports": 0,
+                        "hashes_per_s": 0,
+                    }},
+                }}
             }))
         );
+    }
+
+    #[tokio::test]
+    async fn a_zero_power_fraction_holds_the_chain_off() {
+        // The stalling sink would park bring-up at its first chip
+        // command, so a task that returns proves no bring-up ran
+        let (mut thread, _shutdown_tx, flags) = spawn_thread(
+            stream::pending::<Result<Response, std::io::Error>>(),
+            StallSink,
+        );
+        thread.set_power_fraction(0.0).await.unwrap();
+
+        let result = time::timeout(Duration::from_secs(5), thread.update_task(test_task()))
+            .await
+            .expect("a chain held off takes the task at once");
+
+        assert!(result.unwrap().is_none());
+        assert!(flags.reset_asserted.load(Ordering::SeqCst));
+        assert!(!thread.status().is_active);
     }
 
     #[tokio::test(start_paused = true)]
