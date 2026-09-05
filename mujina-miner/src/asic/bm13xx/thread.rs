@@ -8,7 +8,7 @@
 //! chip responses, filters shares, and manages work assignment.
 
 use std::cmp::max;
-use std::ops::{ControlFlow, RangeInclusive};
+use std::ops::ControlFlow;
 use std::sync::{Arc, RwLock};
 
 use anyhow::{Context as _, Result, anyhow, bail};
@@ -264,6 +264,10 @@ struct Actor<W> {
     /// Whether lazy chain initialization has run.
     chain_initialized: bool,
 
+    /// The frequency the chips run at, or `None` while they sit in
+    /// reset.
+    current_freq: Option<Frequency>,
+
     /// The task currently being hashed.
     current_task: Option<HashTask>,
 
@@ -313,6 +317,7 @@ where
             sys: sys.clone(),
             chips,
             chain_initialized: false,
+            current_freq: None,
             current_task: None,
             chip_jobs: ChipJobTracker::new(),
         }
@@ -451,6 +456,7 @@ where
         if let Err(e) = self.peripherals.voltage_regulator.disable().await {
             warn!(error = %e, "Failed to disable core voltage on exit");
         }
+        self.current_freq = None;
     }
 
     /// Declares the thread's expected hashrate to the scheduler.
@@ -591,6 +597,7 @@ where
             .release()
             .await
             .context("failed to release chip reset")?;
+        self.current_freq = Some(*self.config.freq_range.start());
 
         time::sleep(Duration::from_millis(200)).await;
 
@@ -775,36 +782,7 @@ where
 
         // Frequency ramping from the reset frequency to the
         // configured target
-        let ramp = *self.config.freq_range.start()..=self.config.default_freq;
-        debug!(
-            "Ramping frequency from {} MHz to {} MHz",
-            ramp.start().mhz(),
-            ramp.end().mhz()
-        );
-        let frequency_steps =
-            generate_frequency_ramp_steps(&self.config, ramp, self.config.ramp_step);
-
-        for (i, (freq, pll_config)) in frequency_steps.iter().enumerate() {
-            // The rail rises ahead of the clock that needs it
-            self.set_core_voltage(*freq).await?;
-            time::sleep(VOLTAGE_LEAD).await;
-
-            self.chip_commands
-                .send(RegisterCommand::WriteRegister(WriteRegister {
-                    destination: Destination::Broadcast,
-                    register: Register::PllDivider(*pll_config),
-                }))
-                .await
-                .context("PLL ramp failed")?;
-
-            time::sleep(Duration::from_millis(100)).await;
-
-            if i % 10 == 0 || i == frequency_steps.len() - 1 {
-                trace!("Frequency ramp step {}/{}", i + 1, frequency_steps.len());
-            }
-        }
-
-        debug!("Frequency ramping complete");
+        self.ramp_to(self.config.default_freq).await?;
 
         // Final configuration
         self.chip_commands
@@ -859,6 +837,54 @@ where
         }
         debug!("Chain configuration verified");
 
+        Ok(())
+    }
+
+    /// Ramps the chips from the frequency they run at to `target`
+    /// in steps, moving the rail with the clock: ahead of it on the
+    /// way up, behind it on the way down, so the chips never run a
+    /// clock the rail does not yet support.
+    async fn ramp_to(&mut self, target: Frequency) -> Result<()> {
+        let from = self
+            .current_freq
+            .context("cannot ramp a chain that is in reset")?;
+        let rising = target >= from;
+        debug!(
+            "Ramping frequency from {} MHz to {} MHz",
+            from.mhz(),
+            target.mhz()
+        );
+        let steps =
+            generate_frequency_ramp_steps(&self.config, from, target, self.config.ramp_step);
+
+        for (i, (freq, pll_config)) in steps.iter().enumerate() {
+            if rising {
+                self.set_core_voltage(*freq).await?;
+                time::sleep(VOLTAGE_LEAD).await;
+            }
+
+            self.chip_commands
+                .send(RegisterCommand::WriteRegister(WriteRegister {
+                    destination: Destination::Broadcast,
+                    register: Register::PllDivider(*pll_config),
+                }))
+                .await
+                .context("PLL ramp failed")?;
+
+            if !rising {
+                time::sleep(VOLTAGE_LEAD).await;
+                self.set_core_voltage(*freq).await?;
+            }
+            self.current_freq = Some(*freq);
+
+            time::sleep(Duration::from_millis(100)).await;
+
+            if i % 10 == 0 || i == steps.len() - 1 {
+                trace!("Frequency ramp step {}/{}", i + 1, steps.len());
+            }
+        }
+
+        debug!("Frequency ramping complete");
         Ok(())
     }
 
@@ -1203,27 +1229,35 @@ impl ChipAttributes {
     }
 }
 
-/// Generates the ramp's steps, each frequency with the PLL
-/// dividers that produce it, for smooth PLL transitions.
+/// Generates a ramp's steps from `from` to `target` in either
+/// direction, each frequency with the PLL dividers that produce
+/// it, for smooth PLL transitions.
+///
+/// The first step is `from` itself and the last is `target`; a
+/// final short step ends the ramp exactly on the target.
 fn generate_frequency_ramp_steps(
     config: &ChipConfig,
-    range: RangeInclusive<Frequency>,
+    from: Frequency,
+    target: Frequency,
     step: Frequency,
 ) -> Vec<(Frequency, PllDivider)> {
-    let target = *range.end();
     let mut configs = Vec::new();
-    let mut current = *range.start();
+    let mut current = from;
+    let rising = target >= from;
 
-    while current <= target {
+    loop {
         if let Some(pll) = config.calculate_pll(current) {
             configs.push((current, pll));
         }
-        let next = Frequency::from_hz(current.hz() + step.hz());
-        // A final short step ends the ramp exactly on the target
-        current = if next > target && current < target {
-            target
+        if current == target {
+            break;
+        }
+        current = if rising {
+            let next = Frequency::from_hz(current.hz() + step.hz());
+            if next > target { target } else { next }
         } else {
-            next
+            let next = Frequency::from_hz(current.hz().saturating_sub(step.hz()));
+            if next < target { target } else { next }
         };
     }
 
@@ -1251,7 +1285,8 @@ mod tests {
         let config = chip_config::bm1370();
         let steps = generate_frequency_ramp_steps(
             &config,
-            Frequency::from_mhz(56.25)..=Frequency::from_mhz(525.0),
+            Frequency::from_mhz(56.25),
+            Frequency::from_mhz(525.0),
             Frequency::from_mhz(6.25),
         );
 
@@ -1268,11 +1303,49 @@ mod tests {
     }
 
     #[test]
+    fn ramp_descends_to_a_lower_target() {
+        let config = chip_config::bm1370();
+        let steps = generate_frequency_ramp_steps(
+            &config,
+            Frequency::from_mhz(525.0),
+            Frequency::from_mhz(500.0),
+            Frequency::from_mhz(6.25),
+        );
+
+        let freqs: Vec<u64> = steps.iter().map(|(f, _)| f.hz()).collect();
+        assert_eq!(
+            freqs,
+            [
+                525_000_000,
+                518_750_000,
+                512_500_000,
+                506_250_000,
+                500_000_000
+            ]
+        );
+    }
+
+    #[test]
+    fn ramp_stays_put_when_already_on_target() {
+        let config = chip_config::bm1370();
+        let steps = generate_frequency_ramp_steps(
+            &config,
+            Frequency::from_mhz(400.0),
+            Frequency::from_mhz(400.0),
+            Frequency::from_mhz(6.25),
+        );
+
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].0, Frequency::from_mhz(400.0));
+    }
+
+    #[test]
     fn ramp_ends_on_target_when_step_overshoots() {
         let config = chip_config::bm1370();
         let steps = generate_frequency_ramp_steps(
             &config,
-            Frequency::from_mhz(56.25)..=Frequency::from_mhz(60.0),
+            Frequency::from_mhz(56.25),
+            Frequency::from_mhz(60.0),
             Frequency::from_mhz(6.25),
         );
 
