@@ -266,6 +266,7 @@ async fn create_from_usb(device: UsbDeviceInfo, boards: Cursor) -> Result<Backpl
     // written, as the S19j Pro's chain shows.
     let thread = BM13xxThread::new(
         thread_name,
+        &sys_thread,
         chip,
         TopologySpec::individual_domains(CHIP_COUNT, false),
         data_reader,

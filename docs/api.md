@@ -73,6 +73,18 @@ An attribute's name carries its unit, and its Rust type supplies
 the suffix, so every attribute of one type takes the same one.
 Hashrate is `hashes_per_s`.
 
+### Chips
+
+A thread over a chain of BM13xx chips holds a `chips` subtree with
+one node per chip, keyed by chain index. Each node reports the
+chip's `address`, the `nonces` it has reported since the thread
+started, the `hardware_errors` among them (a hash short of the
+chip's own ticket mask), the `core_register_reports` it sent with
+no read from the host, and `hashes_per_s` estimated from its
+nonces over the last five minutes. A BM1362 stamps its address
+into each nonce, so every nonce is attributed; a BM1370 does not,
+so its nonces are attributed only on a chain of one chip.
+
 ### Naming
 
 A board's key is its model and its serial joined, one segment, as
