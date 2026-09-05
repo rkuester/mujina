@@ -47,6 +47,7 @@ use crate::asic::hash_thread::{HashTask, HashThread, HashThreadEvent, Share};
 use crate::job_source::{
     JobTemplate, MerkleRootKind, Share as SourceShare, SourceCommand, SourceEvent,
 };
+use crate::systree::{Cursor, Setting};
 use crate::tracing::prelude::*;
 use crate::types::{
     AlarmStatus, DebouncedAlarm, Difficulty, HashRate, HashrateEstimator, ShareRate, Target,
@@ -207,6 +208,10 @@ struct Scheduler {
     /// Holds the first source broadcast until startup enumeration completes
     startup_gate: StartupGate,
 
+    /// The share of full power the miner runs at, allocated to
+    /// every thread alike.
+    power_fraction: f32,
+
     /// Mining paused
     paused: bool,
 }
@@ -219,6 +224,7 @@ impl Scheduler {
             tasks: SlotMap::new(),
             stats: MiningStats::default(),
             last_thread_count: 0,
+            power_fraction: 1.0,
             startup_gate: StartupGate::new(),
             paused: false,
         }
@@ -689,12 +695,16 @@ impl Scheduler {
         thread_events.insert(thread_id, ReceiverStream::new(event_rx));
         debug!(thread = %thread_name, "Thread registered");
 
-        // Configure the thread; it replies with ExpectedHashRate on its event
-        // channel, handled in handle_thread_event.
+        // Allocate the thread its share of power, then configure it;
+        // it replies with ExpectedHashRate on its event channel,
+        // handled in handle_thread_event.
         let entry = self
             .threads
             .get_mut(thread_id)
             .expect("Just inserted thread");
+        if let Err(e) = entry.thread.set_power_fraction(self.power_fraction).await {
+            warn!(thread = %thread_name, error = %e, "Failed to set the thread's power fraction");
+        }
         if let Err(e) = entry.thread.configure().await {
             error!(thread = %thread_name, error = %e, "Failed to configure thread");
         }
@@ -828,6 +838,27 @@ impl Scheduler {
         }
     }
 
+    /// Runs the miner at a share of its full power by giving every
+    /// thread that share.
+    ///
+    /// The same fraction on every thread is the efficient split for
+    /// chips whose energy per hash improves as their clock and
+    /// voltage fall; a policy that switches boards off below some
+    /// floor can replace it here without touching the threads.
+    async fn apply_power_fraction(&mut self, fraction: f32) {
+        self.power_fraction = fraction;
+        info!(fraction, "Miner power fraction set");
+        for entry in self.threads.values_mut() {
+            if let Err(e) = entry.thread.set_power_fraction(fraction).await {
+                warn!(
+                    thread = %entry.thread.name(),
+                    error = %e,
+                    "Failed to set the thread's power fraction"
+                );
+            }
+        }
+    }
+
     /// Main scheduler loop.
     async fn run(
         &mut self,
@@ -836,11 +867,17 @@ impl Scheduler {
         mut source_reg_rx: mpsc::Receiver<SourceRegistration>,
         miner_telemetry_tx: watch::Sender<MinerTelemetry>,
         mut cmd_rx: mpsc::Receiver<SchedulerCommand>,
+        target_power: Setting<f32>,
     ) {
         // StreamMaps as locals (not in self) to avoid borrow conflicts in select!
         let mut source_events: SourceEventStream = StreamMap::new();
         let mut thread_events: ThreadEventStream = StreamMap::new();
         let mut share_channels: ShareStream = StreamMap::new();
+
+        // Subscribe before reading, so a write between the two wakes
+        // the loop rather than passing unseen.
+        let mut power_rx = target_power.subscribe();
+        self.power_fraction = *power_rx.borrow_and_update();
 
         // Create interval for periodic status logging
         let mut status_interval = tokio::time::interval(Duration::from_secs(30));
@@ -960,6 +997,12 @@ impl Scheduler {
                     self.handle_api_command(cmd, &miner_telemetry_tx);
                 }
 
+                // The miner's power fraction, written by a client
+                Ok(()) = power_rx.changed() => {
+                    let fraction = *power_rx.borrow_and_update();
+                    self.apply_power_fraction(fraction).await;
+                }
+
                 // Periodic state publishing
                 _ = telemetry_interval.tick() => {
                     let _ = miner_telemetry_tx.send(self.compute_miner_telemetry());
@@ -1019,13 +1062,27 @@ fn is_difficulty_too_high(job: &JobTemplate, hashrate: HashRate) -> bool {
 }
 
 /// Run the scheduler task, receiving hash threads and job sources.
+///
+/// `sys` is the root of the tree, where the scheduler attaches the
+/// miner's power fraction setting.
 pub async fn task(
     running: CancellationToken,
     thread_rx: mpsc::Receiver<ThreadRegistration>,
     source_reg_rx: mpsc::Receiver<SourceRegistration>,
     miner_telemetry_tx: watch::Sender<MinerTelemetry>,
     cmd_rx: mpsc::Receiver<SchedulerCommand>,
+    sys: Cursor,
 ) {
+    // The share of full power a client asks of the whole miner,
+    // 0.0 to 1.0, where 0.0 is off. Full power when nothing asks.
+    let target_power = sys.setting_checked("target_power_fraction", 1.0_f32, |fraction| {
+        if (0.0..=1.0).contains(fraction) {
+            Ok(())
+        } else {
+            Err(format!("{fraction} lies outside 0..=1"))
+        }
+    });
+
     let mut scheduler = Scheduler::new();
     scheduler
         .run(
@@ -1034,6 +1091,7 @@ pub async fn task(
             source_reg_rx,
             miner_telemetry_tx,
             cmd_rx,
+            target_power,
         )
         .await;
 }
