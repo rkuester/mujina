@@ -235,6 +235,7 @@ impl Daemon {
             source_reg_rx,
             miner_telemetry_tx,
             scheduler_cmd_rx,
+            systree.root(),
         ));
 
         // Start the API server
