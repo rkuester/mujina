@@ -257,16 +257,13 @@ async fn create_from_usb(device: UsbDeviceInfo, boards: Cursor) -> Result<Backpl
     let chip = chip_config::bm1362();
     let sys_thread = board.cursor().child("threads").child("0");
     let thread_attrs = ThreadAttributes::attach(&sys_thread);
-    thread_attrs
-        .write()
-        .set(&thread_attrs.hashrate, chip.nameplate * CHIP_COUNT);
 
     // Each chip is its own voltage domain, stacked in series. The
     // BM1362 crosses a domain boundary with no boundary registers
     // written, as the S19j Pro's chain shows.
     let thread = BM13xxThread::new(
         thread_name,
-        &sys_thread,
+        thread_attrs.clone(),
         chip,
         TopologySpec::individual_domains(CHIP_COUNT, false),
         data_reader,

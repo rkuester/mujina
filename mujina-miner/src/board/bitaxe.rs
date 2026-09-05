@@ -188,17 +188,13 @@ async fn create_from_usb(
         voltage_regulator: Box::new(voltage_regulator),
     };
 
-    // One chip, so the chain's nameplate rate is the chip's.
     let chip = chip_config::bm1370();
     let sys_thread = board.cursor().child("threads").child("0");
     let thread_attrs = ThreadAttributes::attach(&sys_thread);
-    thread_attrs
-        .write()
-        .set(&thread_attrs.hashrate, chip.nameplate);
 
     let thread = BM13xxThread::new(
         thread_name,
-        &sys_thread,
+        thread_attrs.clone(),
         chip,
         TopologySpec::single_domain(1),
         data_reader,
