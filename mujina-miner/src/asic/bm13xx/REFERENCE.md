@@ -1710,7 +1710,7 @@ hash clock.[^bitaxeinit]
     HASH_COUNTING_NUMBER (0x10) = 0x00001EB5: the BM1370 constant
     inherited from the S21 Pro and its 65-chip chain (see [Factory
     Values]). On one chip, each version batch sweeps about 1% of each
-    core's slice; the version epoch stays the donor's 1.29 s (see [The
+    core's slice; the version epoch stays the donor's 2.58 s (see [The
     Version Epoch]).
 
 10. **Baud raise**: speed up the serial link.
@@ -1987,7 +1987,7 @@ remaining steps differently.
 
     HASH_COUNTING_NUMBER (0x10) = 0x00001381: the S19j Pro factory
     constant, deliberately short of full coverage for 126 chips at 525
-    MHz (see [Computing HASH_COUNTING_NUMBER]); it sets a 1.64 s version
+    MHz (see [Computing HASH_COUNTING_NUMBER]); it sets a 3.27 s version
     epoch (see [The Version Epoch]).
 
     MIDSTATE_CONFIG (0xA4) = 0x9000FFFF once more:
@@ -2209,25 +2209,25 @@ window. Past one epoch, the chip re-hashes the same headers until the
 job changes, and it gives no "work complete" signal.[^cadence] The host
 should therefore replace a chip's work within one epoch.
 
-Each batch lasts HASH_COUNTING_NUMBER crystal ticks plus the overrun of
-about 130 ticks, and each batch consumes one version per sub-core of a
-core. Ignoring the overrun:
+Each batch lasts HASH_COUNTING_NUMBER register units of two crystal
+periods plus the overrun of about 130 units, and each batch consumes one
+version per sub-core of a core. Ignoring the overrun:
 
 ```text
-epoch = (2^16 / sub_cores_per_core) * hcn / 25 MHz
+epoch = (2^16 / sub_cores_per_core) * hcn * 2 / 25 MHz
 ```
 
 #### Factory Values
 
-The factory values all set an epoch of about one second.[^rollrate]
+The factory values set epochs of two to four seconds.[^rollrate]
 
 | Machine           | Chip   | Sub-cores | hcn    | Epoch  |
 |-------------------|--------|-----------|--------|--------|
-| Antminer S21      | BM1368 | 16        | 0x15A4 | 0.91 s |
-| Antminer S21 Pro  | BM1370 | 16        | 0x1EB5 | 1.29 s |
-| Antminer S19k Pro | BM1366 | 8         | 0x115A | 1.46 s |
-| Antminer S19j Pro | BM1362 | 8         | 0x1381 | 1.64 s |
-| Antminer S19 XP   | BM1366 | 8         | 0x151C | 1.77 s |
+| Antminer S21      | BM1368 | 16        | 0x15A4 | 1.82 s |
+| Antminer S21 Pro  | BM1370 | 16        | 0x1EB5 | 2.58 s |
+| Antminer S19k Pro | BM1366 | 8         | 0x115A | 2.92 s |
+| Antminer S19j Pro | BM1362 | 8         | 0x1381 | 3.27 s |
+| Antminer S19 XP   | BM1366 | 8         | 0x151C | 3.54 s |
 
 
 ### Distribution Across Hash Chains
@@ -2506,8 +2506,8 @@ work above.
 [^cadence]: The version field is the roll counter, restarting at zero on
     each job, so it gauges epoch progress (see [Nonce Response]). On the
     S19j Pro the per-job maximum averages 64% of the version space,
-    about one second of rolling against the machine's 1.64 s epoch; on
-    the S21 Pro, 18%, about a quarter second against 1.29 s. Both stock
+    about two seconds of rolling against the machine's 3.27 s epoch; on
+    the S21 Pro, 18%, about half a second against 2.58 s. Both stock
     firmwares replace work comfortably inside their epochs, so the roll
     never completes and no header repeats.
 
