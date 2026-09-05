@@ -45,9 +45,13 @@ pub struct ChipConfig {
     /// Frequency increase per ramp write.
     pub ramp_step: Frequency,
 
-    /// Nonce sweep length, the factory value observed in captures at
-    /// the default frequency.
-    pub hash_counting_number: HashCountingNumber,
+    /// Hashing cores on the die.
+    pub cores: u32,
+
+    /// Width of the nonce counter each core sweeps per version
+    /// batch, which bounds a core's slice of the nonce space
+    /// whatever the chain length.
+    pub sweep_counter_bits: u32,
 
     /// Nameplate hashrate of one chip: a production machine's
     /// specified hashrate over its chip count, rounded.
@@ -81,6 +85,32 @@ impl ChipConfig {
     /// Returns true if `model` matches this chip's model.
     pub fn verify_model(&self, model: ChipModel) -> bool {
         self.model == model
+    }
+
+    /// Returns the sweep deadline that covers each core's slice of
+    /// the nonce space at the clock `pll` produces, on a chain of
+    /// `chip_count` chips.
+    ///
+    /// A core's slice is the nonce space divided among the cores
+    /// and the chips, each rounded up to a power of two, and no
+    /// wider than the counter the core sweeps. A core advances two
+    /// candidates per hash clock, and the hash clock is the crystal
+    /// times `fb_div` over the other three dividers, so the slice
+    /// in crystal ticks reduces to integer arithmetic. The sweep
+    /// overruns its deadline by about 130 ticks, so a 200-tick guard
+    /// comes off, keeping the sweep inside the slice.
+    pub fn hash_counting_number(&self, pll: PllDivider, chip_count: usize) -> HashCountingNumber {
+        const GUARD_TICKS: u64 = 200;
+        let cores_up = u64::from(self.cores.next_power_of_two());
+        let chips_up = (chip_count.max(1) as u64).next_power_of_two();
+        let slice = (1u64 << 32) / cores_up / chips_up;
+        let slice = slice.min(1u64 << self.sweep_counter_bits);
+        let post_div1 = u64::from((pll.post_div >> 4) + 1);
+        let post_div2 = u64::from((pll.post_div & 0x0f) + 1);
+        let ticks =
+            slice * u64::from(pll.ref_div) * post_div1 * post_div2 / (2 * u64::from(pll.fb_div));
+        let ticks = ticks.saturating_sub(GUARD_TICKS).max(1);
+        HashCountingNumber::from(ticks as u32)
     }
 
     /// Returns the share of full power the chip draws at `freq`.
@@ -194,7 +224,6 @@ pub fn bm1362() -> ChipConfig {
         freq_range: Frequency::from_mhz(56.25)..=Frequency::from_mhz(525.0),
         default_freq: Frequency::from_mhz(525.0),
         ramp_step: Frequency::from_mhz(6.25),
-        hash_counting_number: HashCountingNumber::from(0x1381),
         // S19j Pro: 104 TH/s over 378 chips
         nameplate: HashRate::from_gigahashes(275.0),
         // Measured on an EmberOne00, whose twelve chips in series
@@ -213,6 +242,9 @@ pub fn bm1362() -> ChipConfig {
         core_reset: SoftResetControl::core_reset(ChipModel::BM1362),
         misc_control: MiscControl::reporting_enabled(ChipModel::BM1362),
         analog_mux: AnalogMux::bring_up(ChipModel::BM1362),
+        cores: 65,
+        // The nonce holds an 18-bit counter below the chip's address
+        sweep_counter_bits: 18,
         // Register offset and value from the S19j Pro capture
         clock_select: CoreCommand::write_all(CoreRegister::ClockSelectBM1362, 0x40),
         pll_params: PllParams {
@@ -233,7 +265,6 @@ pub fn bm1370() -> ChipConfig {
         freq_range: Frequency::from_mhz(56.25)..=Frequency::from_mhz(600.0),
         default_freq: Frequency::from_mhz(525.0),
         ramp_step: Frequency::from_mhz(6.25),
-        hash_counting_number: HashCountingNumber::from(0x1EB5),
         // S21 Pro: 234 TH/s over 195 chips
         nameplate: HashRate::from_terahashes(1.2),
         // esp-miner runs a Bitaxe Gamma at 1.15 V and 525 MHz and
@@ -253,6 +284,9 @@ pub fn bm1370() -> ChipConfig {
         core_reset: SoftResetControl::core_reset(ChipModel::BM1370),
         misc_control: MiscControl::reporting_enabled(ChipModel::BM1370),
         analog_mux: AnalogMux::bring_up(ChipModel::BM1370),
+        cores: 128,
+        // The nonce holds a 25-bit counter below the core id
+        sweep_counter_bits: 25,
         // Register offset and value from the Bitaxe capture
         clock_select: CoreCommand::write_all(CoreRegister::ClockSelectBM1368, 0x00),
         pll_params: PllParams {
@@ -427,6 +461,41 @@ mod tests {
         );
         let modeled = config.power_fraction_at(half);
         assert!((modeled - 0.5).abs() < 0.02, "{modeled}");
+    }
+
+    #[test]
+    fn sweep_deadline_matches_the_factory_value_at_eighty_percent() {
+        // The S19j Pro writes 0x1381 at 525 MHz on a 126-chip chain,
+        // which REFERENCE.md puts at 80% of full coverage
+        let config = bm1362();
+        let pll = config.calculate_pll(Frequency::from_mhz(525.0)).unwrap();
+        let ours = config.hash_counting_number(pll, 126);
+        let full = f64::from(u32::from(ours)) + 200.0;
+        let factory = f64::from(0x1381_u32);
+        let ratio = factory / full;
+        assert!((0.78..=0.82).contains(&ratio), "{ratio}");
+    }
+
+    #[test]
+    fn sweep_deadline_is_bounded_by_the_counter_width() {
+        // A short BM1362 chain gets the same per-core slice as a
+        // long one, because the nonce's 18-bit counter is the slice
+        let config = bm1362();
+        let pll = config.calculate_pll(Frequency::from_mhz(525.0)).unwrap();
+        assert_eq!(
+            config.hash_counting_number(pll, 12),
+            config.hash_counting_number(pll, 126)
+        );
+    }
+
+    #[test]
+    fn sweep_deadline_doubles_when_the_clock_halves() {
+        let config = bm1370();
+        let fast = config.calculate_pll(Frequency::from_mhz(525.0)).unwrap();
+        let slow = config.calculate_pll(Frequency::from_mhz(262.5)).unwrap();
+        let fast = u64::from(u32::from(config.hash_counting_number(fast, 1))) + 200;
+        let slow = u64::from(u32::from(config.hash_counting_number(slow, 1))) + 200;
+        assert!(slow.abs_diff(2 * fast) <= 2, "{slow} vs 2 x {fast}");
     }
 
     #[test]

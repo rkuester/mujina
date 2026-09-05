@@ -613,7 +613,7 @@ where
                         target_mhz = target.mhz(),
                         "Moving the chain to a new operating point"
                     );
-                    if let Err(e) = self.start_ramp(target) {
+                    if let Err(e) = self.start_ramp(target).await {
                         error!(error = %e, "Failed to move the chain");
                     }
                 }
@@ -967,16 +967,11 @@ where
             }))
             .await?;
 
-        // Frequency ramping from the reset frequency to the target
+        // Frequency ramping from the reset frequency to the target;
+        // the sweep deadline for the target is written along the way
         self.ramp_to(target).await?;
 
         // Final configuration
-        self.chip_commands
-            .send(RegisterCommand::WriteRegister(WriteRegister {
-                destination: Destination::Broadcast,
-                register: Register::HashCountingNumber(self.config.hash_counting_number),
-            }))
-            .await?;
         self.chip_commands
             .send(RegisterCommand::WriteRegister(WriteRegister {
                 destination: Destination::Broadcast,
@@ -1029,29 +1024,62 @@ where
     /// Starts a ramp from the frequency the chips run at to
     /// `target`. The actor loop steps it; a ramp already in progress
     /// is replaced from wherever it got to.
-    fn start_ramp(&mut self, target: Frequency) -> Result<()> {
+    ///
+    /// The sweep deadline for the target is written before a rising
+    /// ramp and after a falling one. A deadline sized for a slower
+    /// clock is too long for a faster one, and a sweep that outruns
+    /// its slice wraps and repeats work, so the shorter of the two
+    /// deadlines holds throughout.
+    async fn start_ramp(&mut self, target: Frequency) -> Result<()> {
         let from = self
             .current_freq
             .context("cannot ramp a chain that is in reset")?;
+        let rising = target >= from;
         debug!(
             "Ramping frequency from {} MHz to {} MHz",
             from.mhz(),
             target.mhz()
         );
+        if rising {
+            self.write_hash_counting_number(target).await?;
+        }
         let steps =
             generate_frequency_ramp_steps(&self.config, from, target, self.config.ramp_step);
         self.ramp = Some(Ramp {
-            rising: target >= from,
+            rising,
             steps,
             next: 0,
         });
         Ok(())
     }
 
+    /// Writes every core's sweep deadline for the clock at `freq`.
+    async fn write_hash_counting_number(&mut self, freq: Frequency) -> Result<()> {
+        let pll = self
+            .config
+            .calculate_pll(freq)
+            .context("no PLL solution for the frequency")?;
+        let deadline = self
+            .config
+            .hash_counting_number(pll, self.chain.chip_count());
+        trace!(
+            freq_mhz = freq.mhz(),
+            ?deadline,
+            "Writing the sweep deadline"
+        );
+        self.chip_commands
+            .send(RegisterCommand::WriteRegister(WriteRegister {
+                destination: Destination::Broadcast,
+                register: Register::HashCountingNumber(deadline),
+            }))
+            .await
+            .context("failed to write the sweep deadline")
+    }
+
     /// Ramps to `target` and waits for the ramp to finish, for
     /// bring-up, where the chain sends nothing the loop must drain.
     async fn ramp_to(&mut self, target: Frequency) -> Result<()> {
-        self.start_ramp(target)?;
+        self.start_ramp(target).await?;
         while self.ramp.is_some() {
             self.ramp_step().await?;
             time::sleep(RAMP_STEP_INTERVAL).await;
@@ -1098,6 +1126,9 @@ where
         if index + 1 == total {
             debug!("Frequency ramping complete");
             self.ramp = None;
+            if !rising {
+                self.write_hash_counting_number(freq).await?;
+            }
         } else if let Some(ramp) = &mut self.ramp {
             ramp.next = index + 1;
         }
