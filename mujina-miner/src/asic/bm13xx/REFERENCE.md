@@ -2448,10 +2448,12 @@ work above.
     https://github.com/skot/BM1397/blob/master/bm1366_registers.md
 [^bm1362topo]: The S19j Pro's stock firmware records the BM1362's counts
     in a topology config. The config counts 514 hashing units, not the
-    520 of 65 full cores. Three of the six missing units are the dead
-    sub-cores of the runt core, every chip's core 64. The other three
-    presumably sit in the other cores; one missing sub-core lowers a
-    core's nonce rate too little to show in the captures.
+    520 of 65 full cores. The six missing units are the top three
+    sub-cores of core 4 and of core 64, the runt, at the same positions
+    on every die. Evidence: measured on the EmberOne00's eleven healthy
+    chips over an hour at difficulty 8, where those six (core, lane)
+    cells alone never report a nonce, against about 54 reports per live
+    cell.
 [^pr420]: https://github.com/bitaxeorg/ESP-Miner/pull/420
 [^bm1370bits]: The S21 Pro capture (65 chips, per-chip offsets stepping
     evenly across the 16-bit range) shows no fixed per-chip bit and none
