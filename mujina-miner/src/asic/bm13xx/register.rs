@@ -397,14 +397,17 @@ impl Log2Difficulty {
         self.exponent
     }
 
+    /// The difficulty as a plain value.
+    pub fn to_difficulty(&self) -> Difficulty {
+        Difficulty::from(1_u64 << self.exponent)
+    }
+
     /// Expected work per nonce at this difficulty.
     ///
     /// A nonce that passes the ASIC's difficulty filter represents
     /// this many hashes of work on average.
     pub fn to_work(&self) -> Work {
-        Difficulty::from(1_u64 << self.exponent)
-            .to_target()
-            .to_work()
+        self.to_difficulty().to_target().to_work()
     }
 }
 
