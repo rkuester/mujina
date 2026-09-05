@@ -66,9 +66,6 @@ const MODEL: BoardModel = BoardModel {
     key: "bitaxe-gamma",
 };
 
-/// The core voltage the daemon asks for when nothing else does.
-const DEFAULT_CORE_VOLTAGE: Voltage = Voltage::from_volts(1.15);
-
 /// The range a client may ask of the core rail.
 ///
 /// The board sets the limits, and these are narrower than the
@@ -412,11 +409,14 @@ impl BitaxeMonitor {
 
     /// Asks the core rail for the voltage a client set.
     ///
-    /// An unset target means the daemon decides, which is
-    /// [`DEFAULT_CORE_VOLTAGE`]. What the rail actually reaches is a
-    /// separate reading, published each pass.
+    /// An unset target means the daemon decides, and the hash
+    /// thread that runs the chip sets the rail as it ramps. What
+    /// the rail actually reaches is a separate reading, published
+    /// each pass.
     async fn apply_core_voltage(&mut self, target: Option<Voltage>) {
-        let asked = target.unwrap_or(DEFAULT_CORE_VOLTAGE);
+        let Some(asked) = target else {
+            return;
+        };
         match self.regulator.lock().await.set_vout_target(asked).await {
             Ok(()) => debug!(%asked, "Core voltage target set"),
             Err(e) => warn!(%asked, error = %e, "Failed to set the core voltage target"),
