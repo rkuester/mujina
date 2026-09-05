@@ -18,6 +18,10 @@ use crate::types::HashRate;
 
 use super::topology::TopologySpec;
 
+/// The spacing between chip addresses. Even addresses are a protocol
+/// requirement; see REFERENCE.md, Set Chip Address.
+const ADDRESS_INTERVAL: usize = 2;
+
 /// The complete chain model.
 ///
 /// Owns all chips and domains. Structure reflects physical wiring; state
@@ -59,36 +63,29 @@ impl Chain {
         Self { chips, domains }
     }
 
-    /// Assigns chip addresses with the standard interval of 2.
+    /// Assigns even chip addresses in chain order: 0x00, 0x02, 0x04,
+    /// and so on.
     ///
-    /// Interval 2 is the convention observed in firmware captures:
-    /// - S21 Pro (65 chips): addresses 0x00, 0x02, ... 0x80
-    /// - S19 J Pro (126 chips): addresses 0x00, 0x02, ... 0xFA
+    /// Even addresses are a protocol requirement, and this is the only
+    /// way to assign an address, so no chip gets an odd one. See
+    /// REFERENCE.md, Set Chip Address, and The Address in the Sweep
+    /// Counter for the reason.
     ///
-    /// Returns error if chip count exceeds address space (max 128 chips).
+    /// Returns an error if the chain has more than 128 chips.
     pub fn assign_addresses(&mut self) -> Result<(), AddressOverflowError> {
-        self.assign_addresses_with_interval(2)
-    }
-
-    /// Assigns addresses with an explicit interval for unusual boards.
-    pub fn assign_addresses_with_interval(
-        &mut self,
-        interval: u8,
-    ) -> Result<(), AddressOverflowError> {
         if self.chips.is_empty() {
             return Ok(());
         }
 
-        let last_address = (self.chips.len() - 1) * interval as usize;
+        let last_address = (self.chips.len() - 1) * ADDRESS_INTERVAL;
         if last_address > 0xFF {
             return Err(AddressOverflowError {
                 chip_count: self.chips.len(),
-                interval,
             });
         }
 
         for (i, chip) in self.chips.iter_mut().enumerate() {
-            chip.address = (i * interval as usize) as u8;
+            chip.address = (i * ADDRESS_INTERVAL) as u8;
         }
 
         Ok(())
@@ -200,15 +197,14 @@ impl DomainId {
 #[derive(Debug, Clone)]
 pub struct AddressOverflowError {
     pub chip_count: usize,
-    pub interval: u8,
 }
 
 impl std::fmt::Display for AddressOverflowError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "address overflow: {} chips with interval {} exceeds 0xFF",
-            self.chip_count, self.interval
+            "address overflow: {} chips at interval {} exceeds 0xFF",
+            self.chip_count, ADDRESS_INTERVAL
         )
     }
 }

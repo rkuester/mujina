@@ -53,12 +53,15 @@ pub enum NonceFields {
     /// The BM1362 and BM1366 layout.
     ///
     /// - bits 31-25: core ID
-    /// - bits 24-18: the chip's assigned address, address bits 7-1
+    /// - bits 24-18: the chip's address shifted right one
     /// - bits 17-0: sweep counter
+    ///
+    /// The chip seeds the 25 bits below the core ID with its address
+    /// in bits 24-17, so bits 24-18 name the chip only while addresses
+    /// are even; the chain assigns them that way.
     BM1362 {
         core_id: u8,
-        /// The chip's whole assigned address, restored from the
-        /// field's seven bits (address bit 0 is always zero).
+        /// The chip's address, bits 24-18 shifted left one.
         chip_address: u8,
         counter: u32,
     },

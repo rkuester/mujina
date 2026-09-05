@@ -166,8 +166,8 @@ and each chip divides its slice of the nonce space again, inside itself:
 
 - **Chips sweep disjoint slices of the nonce space.** Each chip starts
     its sweep at a different point in the nonce space. The BM1362 and
-    BM1366 derive that point from the chip's address. BM1370 chains take
-    the point from CHIP_NONCE_OFFSET (0x0C). On every model,
+    BM1366 load the chip's address into the sweep counter. BM1370
+    chains take the point from CHIP_NONCE_OFFSET (0x0C). On every model,
     HASH_COUNTING_NUMBER sets how far the sweep runs from that point.
 
 - **Cores split their chip's slice of the nonce space.** A fixed field
@@ -203,6 +203,39 @@ hard-coded tables.[^bm1362topo]
 | BM1366 | 112   | 8         | address           | S19 XP, S19k Pro      |
 | BM1368 |       | 16        |                   | S21                   |
 | BM1370 | 128   | 16        | CHIP_NONCE_OFFSET | Bitaxe Gamma, S21 Pro |
+
+### The Address in the Sweep Counter
+
+A BM1362 or BM1366 starts each sweep from its address. At the start of
+every sweep the chip loads the 25 bits below the core ID with its 8-bit
+address in bits 24-17 and zeros below, then advances one candidate per
+hash clock until the HASH_COUNTING_NUMBER deadline, 2^18 candidates at
+full coverage:
+
+```text
+ 31       25 24              17 16                      0
++-----------+------------------+-------------------------+
+|  core ID  |   chip address   |          zero           |  loaded at
+|  (7 bits) |     (8 bits)     |                         |  sweep start
++-----------+---------------+--+-------------------------+
+|                           |       sweep counter        |  advances
+|                           |         (18 bits)          |  during the sweep
++---------------------------+----------------------------+
+```
+
+Bit 17 belongs to both fields. A sweep of 2^18 candidates is one bit
+wider than the seventeen zeroed bits, so bit 17 changes once per sweep
+and the bits above it hold still. With an even address bit 17 starts at
+zero, the counter fills its 18 bits exactly once, and bits 24-18 read
+the address shifted right one for the whole sweep. With an odd address
+bit 17 starts at one, the counter overflows halfway through the sweep,
+and the carry moves bits 24-18 to the next value, so half of the chip's
+nonces read as its lower neighbor's and half as its upper neighbor's.
+Even addresses at an interval of two therefore give every chip a slice
+of its own, and a nonce names its chip in bits 24-18. That is the
+reason for the requirement in [Set Chip Address]. The chip itself takes
+any 8-bit address; the BM1370 does too, and its sweep start does not
+follow the address at all.[^addrseed]
 
 ## The Serial Chain
 
@@ -416,8 +449,9 @@ The example row assigns address 0x04.
 - **Type/Flags** (1 byte): 0x40. The broadcast bit is clear, so delivery
     relies on the forwarding mechanism below.
 - **Length** (1 byte): Always 0x05 (5 bytes excluding preamble)
-- **New_Addr** (1 byte): The address to assign (typically increments by
-    2: 0x00, 0x02, 0x04...)
+- **New_Addr** (1 byte): The address to assign. The host MUST assign
+    even addresses at an interval of two (0x00, 0x02, 0x04, ...);
+    [Searching Nonces and Versions] gives the reason.
 - **Reserved** (1 byte): Always 0x00 (no semantic meaning,
     possibly padding)
 
@@ -845,20 +879,24 @@ The BM1362 sends the same 11-byte response format.
     byte first, the value divides into these fields:
 
   ```text
-   31       25 24        18 17                     0
-  +-----------+------------+------------------------+
-  |  core ID  | chip addr  |     sweep counter      |
-  |  (7 bits) |  bits 7-1  |       (18 bits)        |
-  +-----------+------------+------------------------+
+   31       25 24              17 16                      0
+  +-----------+------------------+-------------------------+
+  |  core ID  |   chip address   |          zero           |  loaded at
+  |  (7 bits) |     (8 bits)     |                         |  sweep start
+  +-----------+---------------+--+-------------------------+
+  |                           |       sweep counter        |  advances
+  |                           |         (18 bits)          |  during the sweep
+  +---------------------------+----------------------------+
   ```
 
-    The address field holds the assigned chip address's bits 7-1;
-    addresses step by two, so bit 0 is always zero and the seven bits
-    recover the whole address.[^bm1362nonce] The core ID runs 0 through
-    64 on the BM1362 and 0 through 111 on the BM1366, and the 18-bit
-    counter sweeps 2^18 candidates per version batch. The BM1370
-    differs: its nonce fixes no chip field, and its counter spans the
-    low 25 bits.
+    The chip loads its address into bits 24-17 at the start of each
+    sweep and the counter advances below it. Addresses are even, so bit
+    17 starts at zero and bits 24-18 hold the address shifted right one
+    for the whole sweep; [Searching Nonces and Versions] gives the
+    mechanism.[^bm1362nonce] The core ID runs 0 through 64 on the
+    BM1362 and 0 through 111 on the BM1366, and the counter sweeps 2^18
+    candidates per version batch. The BM1370 differs: its nonce fixes
+    no chip field, and its counter spans the low 25 bits.
 
 - **Excess_Difficulty** (1 byte): the same difficulty report as
     the BM1370's.[^bm1362exdiff]
@@ -899,8 +937,8 @@ Example response: `AA 55 6D B8 8E E1 01 04 03 54 94`
   +-----------+------------+------------------------+
   ```
 
-    Core 54. The address field 0x6E holds address bits 7-1, so the
-    chip's address is 0xDC, chip 110 of the S19j Pro's 126.
+    Core 54. Bits 24-18 read 0x6E, the address shifted right one, so
+    the chip's address is 0xDC, chip 110 of the S19j Pro's 126.
 
 - **Excess_Difficulty:** 0x01, half a bit of difficulty over the
     reporting threshold
@@ -2442,6 +2480,15 @@ work above.
 [^bm1362nonce]: The nonce fields are capture-verified across chains of
     77, 110, and 126 chips; the S19j Pro's stock miner decodes the
     same positions.
+[^addrseed]: Measured on the EmberOne00's twelve BM1362s with addresses
+    at an interval of one and again with all-odd addresses. A chip at an
+    odd address reports half its nonces with bits 24-18 equal to the
+    address shifted right one and bit 17 set, and half with the next
+    value and bit 17 clear; the chips at the two ends of the run leave
+    the half fields nobody sweeps empty. CHIP_ID reads back odd
+    addresses as written, so the address is eight bits wide. A single
+    BM1370 found the same nonces at addresses 0x00, 0x41, and 0x80, so
+    its sweep start does not follow the address.
 [^bm1362exdiff]: Capture statistics step in whole bits (each value half
     as frequent as the last); the field is unchecked against
     reconstructed hashes.

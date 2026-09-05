@@ -1157,8 +1157,10 @@ where
 
     /// Names the chip a nonce came from, by chain index.
     ///
-    /// A BM1362 stamps its address into the nonce. A BM1370 does
-    /// not, so its nonces are attributed only on a chain of one.
+    /// A BM1362 seeds its nonce counter with its address, and the
+    /// chain's even addresses keep that address readable in every
+    /// nonce. A BM1370 does not, so its nonces are attributed only on
+    /// a chain of one.
     fn chip_for_nonce(&self, nonce: u32) -> Option<usize> {
         match NonceFields::from_nonce(self.config.model, nonce) {
             NonceFields::BM1362 { chip_address, .. } => self
