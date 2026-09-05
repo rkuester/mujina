@@ -83,6 +83,53 @@ impl ChipConfig {
         self.model == model
     }
 
+    /// Returns the share of full power the chip draws at `freq`.
+    ///
+    /// Dynamic power goes as the core voltage squared times the
+    /// clock, and the voltage follows the curve, so power rises
+    /// faster than the clock. Full power is the default frequency.
+    /// A model without a curve runs at one voltage, where power is
+    /// linear in the clock. Static power is ignored.
+    pub fn power_fraction_at(&self, freq: Frequency) -> f32 {
+        let volts = |f: Frequency| match &self.core_voltage {
+            Some(curve) => curve.voltage_at(f).volts(),
+            None => 1.0,
+        };
+        let at = |f: Frequency| volts(f) * volts(f) * f.mhz();
+        at(freq) / at(self.default_freq)
+    }
+
+    /// Returns the ramp-grid frequency whose modeled power is
+    /// nearest `fraction` of full, or `None` for a fraction of zero
+    /// or less, which means off.
+    ///
+    /// The grid runs from the reset frequency to the default
+    /// frequency in ramp steps, so a small fraction floors at the
+    /// reset frequency and 1.0 is the default frequency.
+    pub fn frequency_for_power_fraction(&self, fraction: f32) -> Option<Frequency> {
+        if fraction <= 0.0 {
+            return None;
+        }
+        let start = *self.freq_range.start();
+        let full = self.default_freq;
+        let mut best = start;
+        let mut best_error = f32::MAX;
+        let mut current = start;
+        loop {
+            let error = (self.power_fraction_at(current) - fraction).abs();
+            if error < best_error {
+                best_error = error;
+                best = current;
+            }
+            if current >= full {
+                break;
+            }
+            let next = Frequency::from_hz(current.hz() + self.ramp_step.hz());
+            current = if next > full { full } else { next };
+        }
+        Some(best)
+    }
+
     /// Calculates the optimal PLL configuration for `freq`.
     ///
     /// Searches the space defined by `pll_params` for dividers that
@@ -316,6 +363,57 @@ mod tests {
             curve.voltage_at(Frequency::from_mhz(700.0)),
             Voltage::from_volts(0.35)
         );
+    }
+
+    #[test]
+    fn power_fraction_is_one_at_full_and_rises_with_the_clock() {
+        let config = bm1362();
+        assert_eq!(config.power_fraction_at(config.default_freq), 1.0);
+
+        let mut last = 0.0;
+        for mhz in [56.25, 100.0, 200.0, 350.0, 500.0, 525.0] {
+            let fraction = config.power_fraction_at(Frequency::from_mhz(mhz));
+            assert!(fraction > last, "{mhz} MHz");
+            last = fraction;
+        }
+        // Voltage rises with the clock, so power rises faster than
+        // the clock: 350 of 525 MHz is two thirds of the clock and
+        // about half the power
+        let at_350 = config.power_fraction_at(Frequency::from_mhz(350.0));
+        assert!(at_350 > 0.45 && at_350 < 0.60, "{at_350}");
+    }
+
+    #[test]
+    fn power_fraction_is_linear_in_the_clock_without_a_curve() {
+        let config = bm1370();
+        assert!(config.core_voltage.is_none());
+        let half = config.power_fraction_at(Frequency::from_mhz(262.5));
+        assert!((half - 0.5).abs() < 1e-6, "{half}");
+    }
+
+    #[test]
+    fn frequency_for_power_fraction_walks_the_ramp_grid() {
+        let config = bm1362();
+
+        assert_eq!(config.frequency_for_power_fraction(0.0), None);
+        assert_eq!(config.frequency_for_power_fraction(-0.5), None);
+        assert_eq!(
+            config.frequency_for_power_fraction(1.0),
+            Some(config.default_freq)
+        );
+        assert_eq!(
+            config.frequency_for_power_fraction(0.001),
+            Some(*config.freq_range.start())
+        );
+
+        // Each answer lies on the grid and models nearest the ask
+        let half = config.frequency_for_power_fraction(0.5).unwrap();
+        assert_eq!(
+            (half.hz() - config.freq_range.start().hz()) % config.ramp_step.hz(),
+            0
+        );
+        let modeled = config.power_fraction_at(half);
+        assert!((modeled - 0.5).abs() < 0.02, "{modeled}");
     }
 
     #[test]
