@@ -36,6 +36,7 @@ use super::topology::TopologySpec;
 use crate::{
     asic::hash_thread::{
         HashTask, HashThread, HashThreadCapabilities, HashThreadEvent, HashThreadStatus, Share,
+        ThreadAttributes,
     },
     systree::{Cursor, Report, Setting, within},
     tracing::prelude::*,
@@ -72,8 +73,8 @@ impl BM13xxThread {
     ///
     /// # Arguments
     /// * `name` - Human-readable name for logging (e.g., "Bitaxe Gamma (e2f56f9b)")
-    /// * `sys` - The thread's place in the tree, where it publishes
-    ///   what each chip does
+    /// * `attrs` - The thread's attributes in the tree, under which
+    ///   it publishes what each chip does
     /// * `config` - Chip model configuration (identity, PLL parameters)
     /// * `topology` - The board's declared chip wiring
     /// * `chip_responses` - Stream of decoded responses from chips
@@ -87,7 +88,7 @@ impl BM13xxThread {
     )]
     pub fn new<R, W>(
         name: String,
-        sys: &Cursor,
+        attrs: ThreadAttributes,
         config: ChipConfig,
         topology: TopologySpec,
         chip_responses: R,
@@ -107,7 +108,7 @@ impl BM13xxThread {
 
         let (reader, channels) = Reader::spawn(chip_responses);
         let actor = Actor::new(
-            sys,
+            attrs,
             config,
             topology,
             event_tx,
@@ -265,6 +266,9 @@ struct Actor<W> {
     /// ASIC ticket mask difficulty.
     asic_difficulty: Log2Difficulty,
 
+    /// The thread's attributes in the tree.
+    thread_attrs: ThreadAttributes,
+
     /// The thread's place in the tree.
     sys: Cursor,
 
@@ -306,7 +310,7 @@ where
         reason = "one argument per thing the board supplies"
     )]
     fn new(
-        sys: &Cursor,
+        thread_attrs: ThreadAttributes,
         config: ChipConfig,
         topology: TopologySpec,
         event_tx: mpsc::Sender<HashThreadEvent>,
@@ -321,6 +325,7 @@ where
         );
 
         let chain = Chain::from_topology(&topology);
+        let sys = thread_attrs.cursor().clone();
         let sys_chips = sys.child("chips");
         let chips = (0..chain.chip_count())
             .map(|i| ChipTelemetry::attach(&sys_chips.child(&i.to_string())))
@@ -335,13 +340,14 @@ where
             peripherals,
             _reader: reader,
             asic_difficulty,
-            sys: sys.clone(),
             target_power_fraction: sys.setting_checked(
                 "target_power_fraction",
                 None,
                 within(0.0..=1.0),
             ),
             scheduled_fraction: 1.0,
+            thread_attrs,
+            sys,
             chips,
             chain_initialized: false,
             current_freq: None,
@@ -562,10 +568,13 @@ where
         }
     }
 
-    /// Tells the scheduler the rate to expect at the current
-    /// operating point.
+    /// Tells the scheduler and the tree the rate to expect at the
+    /// current operating point.
     async fn declare_expected_hashrate(&mut self) {
         let expected = self.expected_hashrate();
+        self.thread_attrs
+            .write()
+            .set(&self.thread_attrs.hashrate, expected);
         if self
             .event_tx
             .send(HashThreadEvent::ExpectedHashRate(expected))
@@ -1804,7 +1813,7 @@ mod tests {
 
         let thread = BM13xxThread::new(
             "test".into(),
-            sys,
+            ThreadAttributes::attach(sys),
             chip_config::bm1370(),
             TopologySpec::single_domain(1),
             chip_responses,
@@ -1913,6 +1922,8 @@ mod tests {
             root.render_json(),
             Some(serde_json::json!({
                 "threads": {"0": {
+                    "status": "present",
+                    "hashes_per_s": 0,
                     "target_power_fraction": null,
                     "chips": {"0": {
                         "address": 0,
