@@ -98,6 +98,13 @@ impl Chain {
         &self.chips[id.index()]
     }
 
+    /// Finds the chip holding an assigned address.
+    pub fn index_of_address(&self, address: u8) -> Option<ChipId> {
+        self.chips()
+            .find(|(_, chip)| chip.address == address)
+            .map(|(id, _)| id)
+    }
+
     pub fn chip_mut(&mut self, id: ChipId) -> &mut Chip {
         &mut self.chips[id.index()]
     }
@@ -239,6 +246,16 @@ mod tests {
             pub const CHIP_COUNT: usize = 1;
             pub const CHIP_ADDRESS: u8 = 0x00;
         }
+    }
+
+    #[test]
+    fn index_of_address_finds_the_chip_holding_it() {
+        let mut chain = Chain::from_topology(&TopologySpec::single_domain(3));
+        chain.assign_addresses().unwrap();
+
+        assert_eq!(chain.index_of_address(0x04), Some(ChipId(2)));
+        assert_eq!(chain.index_of_address(0x03), None);
+        assert_eq!(chain.index_of_address(0x06), None);
     }
 
     #[test]
