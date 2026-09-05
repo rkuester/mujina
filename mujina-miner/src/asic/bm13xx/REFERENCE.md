@@ -1149,7 +1149,11 @@ Gates the chip's nonce reporting.
     hashing (power draw does not move), but the chip never reports their
     nonces.[^quartermap] The quarter map does not transfer to the
     65-core BM1362 as-is. Its constant clears bit 30, yet its core 64
-    reports in the S19j Pro capture.[^refind]
+    reports in the S19j Pro capture.[^refind] On the BM1362, bit 31
+    covers at least cores 50 through 64: clearing it alone on one chip
+    of an EmberOne00 chain stopped those cores' nonces and no other
+    chip's. The chip measured has cores 0 through 49 dead, so the bits
+    covering them could not be mapped.[^bm1362sections]
 - **unexplained** (bits 27-16): purpose unknown. Only the BM1366/68
     broadcast constant 0xFF0FC100 sets bits in this range (27-24 and
     19-16). Bits 19-16 track the reset sequencing described under
@@ -1286,7 +1290,11 @@ second at 350 MHz. Nine responses in ten hold 0x00000000; the rest hold
 scattered values, most with a single bit set. One other chip sent the
 response twice in a minute. What the report signals, and why one chip
 sends it, is unknown. The responses arrive between the replies to the
-host's own reads and share the response line with nonces.
+host's own reads and share the response line with nonces. Clearing all
+four report enables of MISC_CONTROL (0x18) on that chip stops them, at
+the cost of the chip's own nonces; no single enable bit does, and
+clearing bit 29 alone doubles their rate. Writing core enable 0x00
+through CORE_MAILBOX (0x3C) to the dead cores changes nothing.
 
 ### 0x54 - ANALOG_MUX
 
@@ -2346,6 +2354,11 @@ work above.
     driver code. In an S21 capture, a BM1370 chain receives 0xFF0FC100
     instead. Factory firmware builds its value by ORing the high bits
     over the register's current contents.
+[^bm1362sections]: Measured on an EmberOne00 at difficulty 8 with each
+    bit cleared for 30 s by a directed write while the chain mined. The
+    chip's own nonces fell to zero with bit 31 clear and held with bit
+    28 or bit 29 clear; the other eleven chips held their rate in every
+    trial.
 [^refind]: Masking also has an unexplained side effect, measured on a
     live BM1370 fed recycled identical headers. With some quarters
     masked and no offset written, re-sent identical work re-finds
