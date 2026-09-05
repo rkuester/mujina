@@ -211,7 +211,7 @@ async fn create_from_usb(device: UsbDeviceInfo, boards: Cursor) -> Result<Backpl
         .await
         .context("TMP451 remote offset failed")?;
 
-    let regulator = Arc::new(Mutex::new(init_power_controller(i2c.clone()).await?));
+    let regulator = Arc::new(Mutex::new(init_power_controller(i2c.clone()).await));
 
     // Enable the regulator once it is configured. Its output stays
     // off until a hash thread commands it on over PMBus.
@@ -482,20 +482,34 @@ impl EmberOne00Monitor {
         let (vin, vout, iout_ma, power_mw, vr_temp) = {
             let mut reg = self.regulator.lock().await;
 
-            if let Err(e) = reg.check_status().await {
-                error!("Power controller fault: {}", e);
-                if let Err(e) = reg.clear_faults().await {
-                    error!("Failed to clear faults: {}", e);
+            // A regulator the 12 V supply has not yet reached answers
+            // nothing; try to configure it each pass and read nothing
+            // until that succeeds
+            if !reg.is_configured() {
+                match configure_power_controller(&mut reg).await {
+                    Ok(()) => info!("Core rail regulator configured; the 12 V supply is on"),
+                    Err(e) => trace!(error = %e, "Core rail regulator still not answering"),
                 }
             }
 
-            (
-                reg.get_vin().await.ok(),
-                reg.get_vout().await.ok(),
-                reg.get_iout().await.ok(),
-                reg.get_power().await.ok(),
-                reg.get_temperature().await.ok(),
-            )
+            if !reg.is_configured() {
+                (None, None, None, None, None)
+            } else {
+                if let Err(e) = reg.check_status().await {
+                    error!("Power controller fault: {}", e);
+                    if let Err(e) = reg.clear_faults().await {
+                        error!("Failed to clear faults: {}", e);
+                    }
+                }
+
+                (
+                    reg.get_vin().await.ok(),
+                    reg.get_vout().await.ok(),
+                    reg.get_iout().await.ok(),
+                    reg.get_power().await.ok(),
+                    reg.get_temperature().await.ok(),
+                )
+            }
         };
 
         // Publish the whole pass under one guard, so a render
@@ -548,7 +562,12 @@ impl EmberOne00Monitor {
 }
 
 /// Configures the core rail's regulator and leaves its output off.
-async fn init_power_controller(i2c: BitaxeRawI2c) -> Result<Tps546<BitaxeRawI2c>> {
+///
+/// The regulator answers nothing while the board's 12 V supply is
+/// off, and the control processor runs on USB alone, so the board
+/// comes up either way. A regulator left unconfigured here is
+/// configured by the monitor once the supply appears.
+async fn init_power_controller(i2c: BitaxeRawI2c) -> Tps546<BitaxeRawI2c> {
     let config = Tps546Config {
         phase: 0xFF,
         frequency_switch_khz: 325,
@@ -607,6 +626,18 @@ async fn init_power_controller(i2c: BitaxeRawI2c) -> Result<Tps546<BitaxeRawI2c>
     };
 
     let mut tps546 = Tps546::new(i2c, config);
+    match configure_power_controller(&mut tps546).await {
+        Ok(()) => {}
+        Err(e) => warn!(
+            error = %e,
+            "Core rail regulator not answering; is the 12 V supply on?"
+        ),
+    }
+    tps546
+}
+
+/// Writes the regulator's configuration and clears its faults.
+async fn configure_power_controller(tps546: &mut Tps546<BitaxeRawI2c>) -> Result<()> {
     tps546
         .init()
         .await
@@ -619,8 +650,7 @@ async fn init_power_controller(i2c: BitaxeRawI2c) -> Result<Tps546<BitaxeRawI2c>
     if let Err(e) = tps546.dump_configuration().await {
         warn!("Failed to dump TPS546 configuration: {}", e);
     }
-
-    Ok(tps546)
+    Ok(())
 }
 
 /// The chain's reset line, driven through the firmware's GPIO
