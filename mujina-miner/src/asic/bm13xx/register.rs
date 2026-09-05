@@ -280,39 +280,40 @@ pub enum VcoSel {
 /// Hash counting number (0x10), the nonce sweep deadline.
 ///
 /// Sets how long each core sweeps nonces for the current batch of
-/// rolled versions: the register counts ticks of the 25 MHz
-/// crystal, a deadline rather than a nonce quota. When the count
+/// rolled versions: the register counts units of two periods of
+/// the 25 MHz crystal, 80 ns each, a deadline rather than a nonce
+/// quota. When the count
 /// runs out, the chip rolls the next batch of versions and the
 /// core re-sweeps the same nonce window. Zero halts hashing. A
 /// value is correct only for the hash frequency it was computed
 /// at; REFERENCE.md gives the formula and the factory values.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct HashCountingNumber {
-    /// Ticks of the 25 MHz crystal.
-    ticks: u32,
+    /// Units of two periods of the 25 MHz crystal, 80 ns each.
+    units: u32,
 }
 
 impl HashCountingNumber {
     pub fn encode(&self, dst: &mut BytesMut) {
-        dst.put_u32(self.ticks);
+        dst.put_u32(self.units);
     }
 
     pub fn decode(bytes: [u8; 4]) -> Self {
         Self {
-            ticks: u32::from_be_bytes(bytes),
+            units: u32::from_be_bytes(bytes),
         }
     }
 }
 
 impl From<u32> for HashCountingNumber {
-    fn from(ticks: u32) -> Self {
-        Self { ticks }
+    fn from(units: u32) -> Self {
+        Self { units }
     }
 }
 
 impl From<HashCountingNumber> for u32 {
     fn from(hcn: HashCountingNumber) -> Self {
-        hcn.ticks
+        hcn.units
     }
 }
 

@@ -961,7 +961,7 @@ The registers this document covers:
 | 0x00     | CHIP_ID              | Chip model identifier and assigned address        |
 | 0x08     | PLL_DIVIDER          | Hash clock frequency control (PLL dividers)       |
 | 0x0C     | CHIP_NONCE_OFFSET    | Explicit per-chip sweep start                     |
-| 0x10     | HASH_COUNTING_NUMBER | Nonce sweep length (deadline in crystal ticks)    |
+| 0x10     | HASH_COUNTING_NUMBER | Nonce sweep length (deadline, 80 ns units)        |
 | 0x14     | TICKET_MASK          | Difficulty threshold for nonce reporting          |
 | 0x18     | MISC_CONTROL         | Nonce reporting enables (open core)               |
 | 0x28     | UART_BAUD            | UART baud rate selection                          |
@@ -1068,11 +1068,11 @@ Sets the length of each core's nonce sweep. A core sweeps nonces for the
 current batch of rolled versions (one version per sub-core) until the
 count runs out; the chip then rolls the next batch of versions and the
 core re-sweeps the same nonce window. The count is not a nonce count.
-The register counts ticks of the 25 MHz reference crystal, a deadline
-rather than a quota, so the correct value depends on the hash frequency.
-Each core advances two nonce candidates per hash clock, so a register
-value of N ticks sweeps 2 x N x (f / 25 MHz) nonces at hash frequency f.
-Zero halts hashing entirely.
+The register counts in units of two periods of the 25 MHz reference
+crystal, 80 ns each, a deadline rather than a quota, so the correct value
+depends on the hash frequency. A core advances one nonce candidate per
+hash clock, so a register value of N sweeps 2 x N x (f / 25 MHz) nonces
+at hash frequency f.[^deadlineunit] Zero halts hashing entirely.
 
 The count bounds the sweep on every model; the models differ only in
 where the sweep starts. The BM1362 and BM1366 derive the starting point
@@ -2162,13 +2162,15 @@ slice    = 2^32 / cores_up / chips_up
 hcn      = slice * (25 / freq_mhz) * 0.5
 ```
 
-Per-model core and sub-core counts are in [The Parallel Hierarchy].
+The 0.5 is the register's unit: a slice of nonces takes as many hash
+clocks, and the register counts two crystal periods at a time. Per-model
+core and sub-core counts are in [The Parallel Hierarchy].
 
 Three rules govern the formula's use:
 
 1. **Round down.** Rounding up spills the sweep into the neighboring
-    slice, while rounding down leaves only a sub-tick sliver unswept
-    (one crystal tick spans a couple dozen nonce iterations at 600 MHz).
+    slice, while rounding down leaves only a sub-unit sliver unswept
+    (one register unit spans about fifty nonce iterations at 600 MHz).
 2. **Subtract a guard.** The sweep overruns its deadline (below).
 3. **Recompute on every frequency change.** The value is correct only
     for the hash frequency it was computed at. Slower cores need a
@@ -2189,8 +2191,8 @@ inside the megahertz arithmetic can push the value one high, and
 computing from a requested frequency that the PLL ends up exceeding
 recreates exactly the overshoot the floor avoids.
 
-The sweep overruns its deadline by about 130 crystal ticks on every
-batch, constant in ticks across clocks.[^overrun] A 200-tick guard
+The sweep overruns its deadline by about 130 register units on every
+batch, constant in units across clocks.[^overrun] A 200-unit guard
 covers the overrun with margin, negligible against a single chip's
 window and under 4% of a chain-sized window.
 
@@ -2479,14 +2481,25 @@ work above.
 [^pr546]: https://github.com/shufps/ESP-Miner-NerdQAxePlus/pull/546
 [^overrun]: Measured on a single BM1370 at 525 and 262.5 MHz; the BM1362
     is unmeasured. Window-edge fits across four deadlines and two clocks
-    put the overrun at 109-132 ticks, constant in ticks while halving in
-    nonces with the clock. The wrap experiment (see [The Parallel
-    Hierarchy]) agrees, its wrapped fraction and its deepest wrapped
-    value giving 127 and 131 ticks; the wrapped values fall uniformly
+    put the overrun at 109-132 register units, constant in units while
+    halving in nonces with the clock. The wrap experiment (see [The
+    Parallel Hierarchy]) agrees, its wrapped fraction and its deepest
+    wrapped value giving 127 and 131 units; the wrapped values fall uniformly
     over the overrun, so the overrun is constant batch to batch. The
     NerdQAxePlus duplicate rates[^pr546] fit the same decomposition, a
     frequency term matching their solver's PLL quantization error plus a
     fixed ~96 ticks.
+[^deadlineunit]: The unit is measured by the version epoch on the
+    EmberOne00's twelve BM1362s, with one job held for 30 s: at 525 MHz a
+    deadline of 6041 gave an epoch of 4.01 s and at 318.75 MHz a deadline
+    of 10080 gave 6.67 s, each twice what single 40 ns ticks would give
+    and within 1% of 80 ns units, while the sweep counter reached the top
+    of its 18-bit window in the same batches. A batch therefore sweeps
+    2^18 candidates in about 2^18 hash clocks. The factory deadlines and
+    the wrap thresholds fit either reading, which is why an earlier
+    version of this entry read the register as single crystal ticks and
+    the sweep as two candidates per clock; rated hashrates, at one hash
+    per clock per hashing unit, agree with the measurement.
 [^rollrate]: NerdQAxePlus once drove the register as a "version rolling
     frequency" targeting a 25 kHz roll rate; its value (about 7,864)
     comes within 0.04% of the S21 Pro factory default (7,861).
