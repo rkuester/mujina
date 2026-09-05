@@ -85,6 +85,35 @@ nonces over the last five minutes. A BM1362 stamps its address
 into each nonce, so every nonce is attributed; a BM1370 does not,
 so its nonces are attributed only on a chain of one chip.
 
+### Power
+
+`target_power_fraction` at the root of the tree is the share of
+full power a client asks of the whole miner, 0.0 to 1.0, where
+0.0 is off and 1.0, the default, is full. The scheduler gives
+every thread that share. Each thread has a `target_power_fraction`
+of its own, unset by default; a value written there pins that
+thread over the miner's share while it stands, and writing `null`
+or deleting it returns the thread to the miner's share.
+
+What a share of full power means is the thread's business. A
+BM13xx thread models its power as core voltage squared times
+clock along its voltage curve, picks the frequency whose modeled
+power is that share of full, and ramps there; at 0.0 it holds
+the chain in reset with the rail off and keeps its work for when
+the share comes back. A CPU thread scales its default duty. Each
+thread reports the rate it expects at its operating point in
+`hashes_per_s`.
+
+```bash
+# Run the whole miner at half power
+curl -X PUT -H 'content-type: application/json' -d '0.5' \
+  http://127.0.0.1:7785/api/v0/target_power_fraction
+
+# Hold one thread at three quarters whatever the miner's share
+curl -X PUT -H 'content-type: application/json' -d '0.75' \
+  http://127.0.0.1:7785/api/v0/boards/emberone-00-184d7fe4/threads/0/target_power_fraction
+```
+
 ### Naming
 
 A board's key is its model and its serial joined, one segment, as
