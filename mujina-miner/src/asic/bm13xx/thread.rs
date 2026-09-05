@@ -633,7 +633,7 @@ where
                                     Err(e) => error!(error = %e, "Failed to send the waiting job"),
                                 }
                             }
-                            Err(e) => error!(error = %e, "Chain initialization failed"),
+                            Err(e) => error!(error = %format!("{e:#}"), "Chain initialization failed"),
                         }
                     }
                     _ = shutdown_rx.changed() => {
@@ -679,7 +679,7 @@ where
         tokio::select! {
             result = self.ensure_chain_initialized(register_responses) => {
                 if let Err(e) = result {
-                    error!(error = %e, "Chain initialization failed");
+                    error!(error = %format!("{e:#}"), "Chain initialization failed");
                     response_tx.send(Err(e)).ok();
                     return ControlFlow::Continue(());
                 }
