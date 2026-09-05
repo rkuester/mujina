@@ -11,10 +11,10 @@ use std::sync::{
 
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
-use tokio::sync::mpsc as tokio_mpsc;
+use tokio::sync::{mpsc as tokio_mpsc, watch};
 use tokio::task::JoinHandle;
 
-use super::attributes::{CpuThreadAttributes, DEFAULT_DUTY};
+use super::attributes::{CpuThreadAttributes, effective_duty};
 use super::hasher::{self, MinerCommand};
 use crate::{
     asic::hash_thread::{
@@ -59,6 +59,13 @@ pub struct CpuHashThread {
 
     /// Re-declares the expected hashrate when the duty changes.
     duty_watcher: Option<JoinHandle<()>>,
+
+    /// The scheduler's share of full power, read by the mining
+    /// thread each cycle.
+    power_tx: watch::Sender<f32>,
+
+    /// This CPU's peak rate, measured at configuration.
+    peak: Option<HashRate>,
 }
 
 impl CpuHashThread {
@@ -82,6 +89,7 @@ impl CpuHashThread {
         let shutdown_clone = Arc::clone(&shutdown);
         let thread_name = name.clone();
         let duty = attrs.target_duty.subscribe();
+        let (power_tx, power_rx) = watch::channel(1.0_f32);
         let published = attrs.thread.clone();
 
         // Spawn the mining thread
@@ -93,6 +101,7 @@ impl CpuHashThread {
                     cmd_rx,
                     status_clone,
                     duty,
+                    power_rx,
                     published,
                     shutdown_clone,
                 );
@@ -110,6 +119,8 @@ impl CpuHashThread {
             shutdown,
             _thread_handle: Some(handle),
             duty_watcher: None,
+            power_tx,
+            peak: None,
         }
     }
 
@@ -120,8 +131,7 @@ impl CpuHashThread {
     }
 
     /// The hashrate this thread expects to sustain at a duty.
-    fn expected(peak: HashRate, duty: Option<Ratio>) -> HashRate {
-        let duty = duty.unwrap_or(DEFAULT_DUTY);
+    fn expected(peak: HashRate, duty: Ratio) -> HashRate {
         HashRate::from_megahashes(peak.as_megahashes() * f64::from(duty.factor()))
     }
 }
@@ -150,10 +160,11 @@ impl HashThread for CpuHashThread {
         // the effective rate the thread expects to sustain. Probing beats a
         // fixed constant because peak throughput varies widely across CPUs.
         let peak = tokio::task::spawn_blocking(hasher::probe_peak_hashrate).await?;
+        self.peak = Some(peak);
+        let duty = effective_duty(self.attrs.target_duty.get(), *self.power_tx.borrow());
         self.event_tx
             .send(HashThreadEvent::ExpectedHashRate(Self::expected(
-                peak,
-                self.attrs.target_duty.get(),
+                peak, duty,
             )))
             .await
             .map_err(|_| anyhow!("event channel closed"))?;
@@ -161,17 +172,14 @@ impl HashThread for CpuHashThread {
         // A duty a client changes moves the rate the scheduler
         // should expect, so declare the new one as it happens.
         let mut duty = self.attrs.target_duty.subscribe();
+        let power = self.power_tx.subscribe();
         let events = self.event_tx.clone();
         let name = self.name.clone();
         duty.borrow_and_update();
         self.duty_watcher = Some(tokio::spawn(async move {
             while duty.changed().await.is_ok() {
-                let asked = *duty.borrow_and_update();
-                debug!(
-                    thread = %name,
-                    duty = %asked.unwrap_or(DEFAULT_DUTY),
-                    "CPU thread duty changed"
-                );
+                let asked = effective_duty(*duty.borrow_and_update(), *power.borrow());
+                debug!(thread = %name, duty = %asked, "CPU thread duty changed");
                 if events
                     .send(HashThreadEvent::ExpectedHashRate(Self::expected(
                         peak, asked,
@@ -184,6 +192,22 @@ impl HashThread for CpuHashThread {
             }
         }));
 
+        Ok(())
+    }
+
+    async fn set_power_fraction(&mut self, fraction: f32) -> Result<()> {
+        self.power_tx
+            .send(fraction)
+            .map_err(|_| anyhow!("mining thread gone"))?;
+        if let Some(peak) = self.peak {
+            let duty = effective_duty(self.attrs.target_duty.get(), fraction);
+            self.event_tx
+                .send(HashThreadEvent::ExpectedHashRate(Self::expected(
+                    peak, duty,
+                )))
+                .await
+                .map_err(|_| anyhow!("event channel closed"))?;
+        }
         Ok(())
     }
 

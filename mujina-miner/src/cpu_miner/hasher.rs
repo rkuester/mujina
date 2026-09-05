@@ -32,7 +32,7 @@ use bitcoin::block::Header as BlockHeader;
 use bitcoin::hashes::Hash;
 use tokio::sync::watch;
 
-use super::attributes::DEFAULT_DUTY;
+use super::attributes::effective_duty;
 use crate::{
     asic::hash_thread::{HashTask, HashThreadStatus, Share, ThreadAttributes},
     job_source::MerkleRootKind,
@@ -75,8 +75,11 @@ pub enum MinerCommand {
 /// * `thread_name` - Name for logging
 /// * `cmd_rx` - Channel for receiving commands
 /// * `status` - Shared status for queries
-/// * `duty` - The share of each second to spend hashing, read afresh
-///   each cycle so a client's change takes effect at once
+/// * `duty` - The share of each second a client asks to spend
+///   hashing, read afresh each cycle so a change takes effect at
+///   once
+/// * `power` - The scheduler's share of full power, which sets the
+///   duty when no client does
 /// * `attrs` - The thread's attributes, where it publishes its rate
 /// * `shutdown` - Atomic flag for graceful shutdown
 pub fn run_mining_loop(
@@ -84,6 +87,7 @@ pub fn run_mining_loop(
     cmd_rx: mpsc::Receiver<MinerCommand>,
     status: Arc<RwLock<HashThreadStatus>>,
     mut duty: watch::Receiver<Option<Ratio>>,
+    mut power: watch::Receiver<f32>,
     attrs: ThreadAttributes,
     shutdown: Arc<AtomicBool>,
 ) {
@@ -140,7 +144,10 @@ pub fn run_mining_loop(
         // Mine if we have a task
         if current_task.is_some() {
             let cycle_start = Instant::now();
-            let work = working_span(*duty.borrow_and_update(), CYCLE);
+            let work = working_span(
+                effective_duty(*duty.borrow_and_update(), *power.borrow_and_update()),
+                CYCLE,
+            );
 
             // Hash for the working span, checking the time only every 10000 hashes
             loop {
@@ -254,11 +261,8 @@ pub fn run_mining_loop(
 }
 
 /// Returns how long of a cycle to spend hashing.
-///
-/// An unset duty means the daemon decides, which is
-/// [`DEFAULT_DUTY`].
-fn working_span(duty: Option<Ratio>, cycle: Duration) -> Duration {
-    cycle.mul_f32(duty.unwrap_or(DEFAULT_DUTY).factor())
+fn working_span(duty: Ratio, cycle: Duration) -> Duration {
+    cycle.mul_f32(duty.factor())
 }
 
 /// Measure this CPU's peak single-thread hashrate.
