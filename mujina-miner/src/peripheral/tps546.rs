@@ -607,7 +607,12 @@ impl<I2C: I2c> Tps546<I2C> {
     }
 
     /// Sets the target voltage without changing the output state.
+    ///
+    /// Fails before the configuration has reached the chip.
     pub async fn set_vout_target(&mut self, voltage: Voltage) -> Result<()> {
+        if !self.configured {
+            bail!(Tps546Error::NotConfigured);
+        }
         if voltage < self.config.vout_min || voltage > self.config.vout_max {
             bail!(Tps546Error::VoltageOutOfRange(
                 voltage.volts(),
@@ -1589,6 +1594,18 @@ mod tests {
         let err = tps.enable_output().await.expect_err("unconfigured");
         assert!(err.to_string().contains("not configured"), "{err}");
         assert!(tps.i2c.writes_of(PmbusCommand::Operation).is_empty());
+    }
+
+    #[tokio::test]
+    async fn set_point_cannot_be_written_before_configuration() {
+        let mut tps = Tps546::new(init_table(), config());
+
+        let err = tps
+            .set_vout_target(Voltage::from_volts(1.1))
+            .await
+            .expect_err("unconfigured");
+        assert!(err.to_string().contains("not configured"), "{err}");
+        assert!(tps.i2c.writes_of(PmbusCommand::VoutCommand).is_empty());
     }
 
     #[tokio::test]
