@@ -158,6 +158,8 @@ pub enum Tps546Error {
     FaultDetected(String),
     #[error("OPERATION reads back 0x{readback:02x} after commanding 0x{commanded:02x}")]
     OperationNotAccepted { commanded: u8, readback: u8 },
+    #[error("regulator not configured; its input supply may be off")]
+    NotConfigured,
 }
 
 /// TPS546 driver
@@ -166,6 +168,8 @@ pub struct Tps546<I2C> {
     config: Tps546Config,
     /// Cached VOUT_MODE value to avoid redundant reads
     cached_vout_mode: Option<u8>,
+    /// Whether the configuration has been written to the chip.
+    configured: bool,
 }
 
 impl<I2C: I2c> Tps546<I2C> {
@@ -175,7 +179,16 @@ impl<I2C: I2c> Tps546<I2C> {
             i2c,
             config,
             cached_vout_mode: None,
+            configured: false,
         }
+    }
+
+    /// Whether the configuration has reached the chip.
+    ///
+    /// False until `init` succeeds, which it cannot while the chip's
+    /// input supply is off and it answers nothing.
+    pub fn is_configured(&self) -> bool {
+        self.configured
     }
 
     /// Initialize the TPS546
@@ -244,6 +257,7 @@ impl<I2C: I2c> Tps546<I2C> {
             );
         }
 
+        self.configured = true;
         Ok(())
     }
 
@@ -618,8 +632,12 @@ impl<I2C: I2c> Tps546<I2C> {
 
     /// Enables the output (OPERATION = ON).
     ///
-    /// Fails unless the command reads back from the device.
+    /// Fails unless the configuration has reached the chip and the
+    /// command reads back from it.
     pub async fn enable_output(&mut self) -> Result<()> {
+        if !self.configured {
+            bail!(Tps546Error::NotConfigured);
+        }
         self.write_operation(pmbus::Operation::On).await?;
         debug!("Output enabled");
         Ok(())
@@ -1561,6 +1579,23 @@ mod tests {
             i2c.writes_of(PmbusCommand::IoutCalOffset),
             vec![&[0x39, 0x00, 0xE0][..]]
         );
+    }
+
+    #[tokio::test]
+    async fn output_cannot_be_enabled_before_configuration() {
+        let mut tps = Tps546::new(init_table(), config());
+        assert!(!tps.is_configured());
+
+        let err = tps.enable_output().await.expect_err("unconfigured");
+        assert!(err.to_string().contains("not configured"), "{err}");
+        assert!(tps.i2c.writes_of(PmbusCommand::Operation).is_empty());
+    }
+
+    #[tokio::test]
+    async fn init_marks_the_regulator_configured() {
+        let mut tps = Tps546::new(init_table(), config());
+        tps.init().await.expect("init against the mock");
+        assert!(tps.is_configured());
     }
 
     #[tokio::test]
