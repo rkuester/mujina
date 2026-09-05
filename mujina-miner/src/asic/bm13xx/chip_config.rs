@@ -93,24 +93,25 @@ impl ChipConfig {
     ///
     /// A core's slice is the nonce space divided among the cores
     /// and the chips, each rounded up to a power of two, and no
-    /// wider than the counter the core sweeps. A core advances two
-    /// candidates per hash clock, and the hash clock is the crystal
-    /// times `fb_div` over the other three dividers, so the slice
-    /// in crystal ticks reduces to integer arithmetic. The sweep
-    /// overruns its deadline by about 130 ticks, so a 200-tick guard
+    /// wider than the counter the core sweeps. A core advances one
+    /// candidate per hash clock, the register counts two crystal
+    /// periods at a time, and the hash clock is the crystal times
+    /// `fb_div` over the other three dividers, so the slice in
+    /// register units reduces to integer arithmetic. The sweep
+    /// overruns its deadline by about 130 units, so a 200-unit guard
     /// comes off, keeping the sweep inside the slice.
     pub fn hash_counting_number(&self, pll: PllDivider, chip_count: usize) -> HashCountingNumber {
-        const GUARD_TICKS: u64 = 200;
+        const GUARD_UNITS: u64 = 200;
         let cores_up = u64::from(self.cores.next_power_of_two());
         let chips_up = (chip_count.max(1) as u64).next_power_of_two();
         let slice = (1u64 << 32) / cores_up / chips_up;
         let slice = slice.min(1u64 << self.sweep_counter_bits);
         let post_div1 = u64::from((pll.post_div >> 4) + 1);
         let post_div2 = u64::from((pll.post_div & 0x0f) + 1);
-        let ticks =
+        let units =
             slice * u64::from(pll.ref_div) * post_div1 * post_div2 / (2 * u64::from(pll.fb_div));
-        let ticks = ticks.saturating_sub(GUARD_TICKS).max(1);
-        HashCountingNumber::from(ticks as u32)
+        let units = units.saturating_sub(GUARD_UNITS).max(1);
+        HashCountingNumber::from(units as u32)
     }
 
     /// Returns the share of full power the chip draws at `freq`.
