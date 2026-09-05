@@ -236,8 +236,19 @@ pub fn bm1370() -> ChipConfig {
         hash_counting_number: HashCountingNumber::from(0x1EB5),
         // S21 Pro: 234 TH/s over 195 chips
         nameplate: HashRate::from_terahashes(1.2),
-        // The Bitaxe holds its rail at one target across the ramp
-        core_voltage: None,
+        // esp-miner runs a Bitaxe Gamma at 1.15 V and 525 MHz and
+        // offers 1.0 V as its lowest core voltage; the lower point
+        // is that option at the reset frequency
+        core_voltage: Some(VoltageCurve {
+            low: OperatingPoint {
+                frequency: Frequency::from_mhz(56.25),
+                voltage: Voltage::from_volts(1.0),
+            },
+            high: OperatingPoint {
+                frequency: Frequency::from_mhz(525.0),
+                voltage: Voltage::from_volts(1.15),
+            },
+        }),
         soft_reset_defaults: SoftResetControl::defaults(ChipModel::BM1370),
         core_reset: SoftResetControl::core_reset(ChipModel::BM1370),
         misc_control: MiscControl::reporting_enabled(ChipModel::BM1370),
@@ -385,8 +396,10 @@ mod tests {
 
     #[test]
     fn power_fraction_is_linear_in_the_clock_without_a_curve() {
-        let config = bm1370();
-        assert!(config.core_voltage.is_none());
+        let config = ChipConfig {
+            core_voltage: None,
+            ..bm1370()
+        };
         let half = config.power_fraction_at(Frequency::from_mhz(262.5));
         assert!((half - 0.5).abs() < 1e-6, "{half}");
     }
