@@ -55,7 +55,7 @@ use crate::{
         UsbDeviceInfo,
         serial::{SerialStream, TracingReader},
     },
-    types::{HashRate, Ratio, Temperature, Voltage},
+    types::{HashRate, Ratio, RunningMean, Temperature, Voltage},
 };
 
 /// The model this board reports.
@@ -94,6 +94,13 @@ const RAIL_POWERED: Voltage = Voltage::from_volts(2.5);
 
 /// Consecutive bad thermal passes before the chain stops.
 const BAD_READING_LIMIT: u32 = 3;
+
+/// Monitor passes behind the published chip temperature, 16 s at
+/// the 2 s interval. Single conversions of the die diode scatter by
+/// a few degrees under load with outliers past 10 C, while the
+/// board sensors over the same bus hold steady; the mean of the
+/// window holds to about 1 C and trails the die by 8 s.
+const CHIP_TEMP_WINDOW: usize = 8;
 
 // Register this board type with the inventory system
 inventory::submit! {
@@ -241,6 +248,7 @@ async fn create_from_usb(device: UsbDeviceInfo, boards: Cursor) -> Result<Backpl
         attrs,
         thread_shutdown: thread_shutdown_tx,
         bad_thermal_count: 0,
+        chip_0_mean: RunningMean::new(CHIP_TEMP_WINDOW),
     }
     .spawn(cancel.clone());
 
@@ -361,9 +369,12 @@ struct EmberOne00Monitor {
     /// shutdown; the thread's exit drops its receiver.
     thread_shutdown: watch::Sender<()>,
 
-    /// Consecutive passes with a missing, implausible, or
-    /// emergency temperature while the rail was up.
+    /// Consecutive passes with a missing chip reading or a board
+    /// sensor at its emergency temperature while the rail was up.
     bad_thermal_count: u32,
+
+    /// The last [`CHIP_TEMP_WINDOW`] conversions of the chip diode.
+    chip_0_mean: RunningMean,
 }
 
 impl EmberOne00Monitor {
@@ -445,12 +456,14 @@ impl EmberOne00Monitor {
     /// Reads every sensor once and publishes the pass. Returns
     /// `Err` on a thermal emergency.
     ///
-    /// While the rail is up, a pass counts as bad when the chip
-    /// diode does not read, or when it or either board sensor is
-    /// at its emergency temperature. [`BAD_READING_LIMIT`] bad
-    /// passes in a row are the emergency. With the rail down the
-    /// chips are cold and their diode reads open, so nothing
-    /// counts.
+    /// The chip temperature is the mean of the last
+    /// [`CHIP_TEMP_WINDOW`] conversions, so one pass with it at the
+    /// emergency temperature is the emergency. While the rail is
+    /// up, a pass counts as bad when the chip diode does not read
+    /// or a board sensor is at its emergency temperature, and
+    /// [`BAD_READING_LIMIT`] bad passes in a row are the emergency.
+    /// With the rail down the chips sit at the plate's temperature
+    /// and nothing counts.
     async fn monitor_tick(&mut self) -> Result<()> {
         let t_left = match self.temp_left.read().await {
             Ok(reading) => Some(reading.into()),
@@ -468,9 +481,15 @@ impl EmberOne00Monitor {
             }
         };
 
+        // A failed read publishes nothing this pass and leaves the
+        // window alone, so the mean picks up where it was on the
+        // next good conversion.
         // TODO: attribute to the chip's hash thread once implemented
-        let t_chip0 = match self.temp_right.read_remote().await {
-            Ok(reading) => Some(reading.into()),
+        let t_chip0: Option<Temperature> = match self.temp_right.read_remote().await {
+            Ok(reading) => {
+                self.chip_0_mean.push(reading.as_degrees_c());
+                self.chip_0_mean.mean().map(Temperature::from_celsius)
+            }
             Err(e) => {
                 if !matches!(e, crate::peripheral::tmp451::Error::RemoteDiodeOpen) {
                     warn!("TMP451 remote read failed: {}", e);
@@ -532,12 +551,20 @@ impl EmberOne00Monitor {
         drop(published);
 
         let rail_up = vout.is_some_and(|v| v >= RAIL_POWERED);
+        if rail_up && t_chip0.is_some_and(|t| t >= CHIP_EMERGENCY) {
+            bail!(
+                "thermal emergency: chip 0 mean over the last {} passes is {:?}",
+                self.chip_0_mean.len(),
+                t_chip0
+            );
+        }
+
         let pcb_hot = [t_left, t_right]
             .into_iter()
             .flatten()
             .any(|t| t >= PCB_EMERGENCY);
-        let chip_hot = t_chip0.is_none_or(|t| t >= CHIP_EMERGENCY);
-        if rail_up && (pcb_hot || chip_hot) {
+        let chip_missing = t_chip0.is_none();
+        if rail_up && (pcb_hot || chip_missing) {
             self.bad_thermal_count += 1;
             warn!(
                 ?t_chip0,
