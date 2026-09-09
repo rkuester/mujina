@@ -50,7 +50,7 @@ use crate::{
         tmp1075::Tmp1075,
         tps546::{PowerStageTuning, Tps546, Tps546Config, Tps546Regulator},
     },
-    systree::{Cursor, MemberStatus, Report, WriteGuard},
+    systree::{Cursor, MemberStatus, Report, Setting, WriteGuard},
     transport::{
         UsbDeviceInfo,
         serial::{SerialStream, TracingReader},
@@ -87,6 +87,27 @@ const CHIP_EMERGENCY: Temperature = Temperature::from_celsius(85.0);
 
 /// The board temperature at which the board stops its chain.
 const PCB_EMERGENCY: Temperature = Temperature::from_celsius(70.0);
+
+/// The chip temperature the board holds its chain at by capping
+/// the thread's power, by default. It sits well under
+/// [`CHIP_EMERGENCY`] so the cap settles instead of bouncing off
+/// the trip. On the sous vide rig the die runs about 40 C above
+/// the water at 150 W.
+const CHIP_TARGET: Temperature = Temperature::from_celsius(68.0);
+
+/// How far the ceiling moves in one monitor pass per degree the
+/// chip sits from its target: half a percent a second per degree.
+/// The die answers a power change within seconds while the
+/// published mean trails it by eight, so a ceiling mapped straight
+/// from the mean hunted with a period of ten to twenty seconds and
+/// a swing of thirty percent, re-planning the chain's frequency
+/// every pass. A ceiling that only creeps settles where the chip
+/// holds its target, and the die's noise averages out on the way.
+const CEILING_GAIN_PER_C: f32 = 0.005;
+
+/// A ceiling within this much of the last sent is not sent; each
+/// change makes the thread re-plan its frequency.
+const CEILING_DEADBAND: f32 = 0.05;
 
 /// The rail voltage above which the chips are powered and their
 /// diode is expected to read.
@@ -243,6 +264,7 @@ async fn create_from_usb(device: UsbDeviceInfo, boards: Cursor) -> Result<Backpl
 
     let cancel = CancellationToken::new();
     let (thread_shutdown_tx, thread_shutdown_rx) = watch::channel(());
+    let (power_ceiling_tx, power_ceiling_rx) = watch::channel(1.0);
     let monitor_task = EmberOne00Monitor {
         temp_left,
         temp_right,
@@ -250,6 +272,8 @@ async fn create_from_usb(device: UsbDeviceInfo, boards: Cursor) -> Result<Backpl
         reset_line: reset_line.clone(),
         attrs,
         thread_shutdown: thread_shutdown_tx,
+        ceiling: 1.0,
+        power_ceiling: power_ceiling_tx,
         bad_thermal_count: 0,
         chip_0_mean: RunningMean::new(CHIP_TEMP_WINDOW),
     }
@@ -263,6 +287,7 @@ async fn create_from_usb(device: UsbDeviceInfo, boards: Cursor) -> Result<Backpl
     let peripherals = BoardPeripherals {
         reset_line: Box::new(reset_line.clone()),
         voltage_regulator: Box::new(Tps546Regulator::new(regulator.clone())),
+        power_ceiling: power_ceiling_rx,
     };
 
     let chip = chip_config::bm1362();
@@ -328,6 +353,10 @@ struct EmberOne00Attributes {
     /// sensor on the right side of the board.
     chip_0_temperature: Report<Option<Temperature>>,
 
+    /// The chip temperature the board holds its chain at by
+    /// capping the thread's power.
+    chip_target: Setting<Temperature>,
+
     /// The rail that feeds the chain.
     core: RegulatorAttributes,
 }
@@ -341,6 +370,14 @@ impl EmberOne00Attributes {
             pcb_left_temperature: sys.report("pcb_left_temperature", None),
             pcb_right_temperature: sys.report("pcb_right_temperature", None),
             chip_0_temperature: sys.report("chip_0_temperature", None),
+            chip_target: sys.setting_checked("chip_target", CHIP_TARGET, |t: &Temperature| {
+                let c = t.as_degrees_c();
+                if (40.0..=CHIP_EMERGENCY.as_degrees_c()).contains(&c) {
+                    Ok(())
+                } else {
+                    Err(format!("{t} lies outside 40..={CHIP_EMERGENCY}"))
+                }
+            }),
             core: RegulatorAttributes::attach(
                 &sys.child("regulators").child("core"),
                 CORE_VOLTAGE_LIMITS,
@@ -371,6 +408,13 @@ struct EmberOne00Monitor {
     /// Shutdown signal to the hash thread. A send requests
     /// shutdown; the thread's exit drops its receiver.
     thread_shutdown: watch::Sender<()>,
+
+    /// The most of its full power the thread may run at, from the
+    /// chip temperature: the ceiling as it stands after this pass,
+    /// and the channel the thread hears it on, which carries the
+    /// last value sent.
+    ceiling: f32,
+    power_ceiling: watch::Sender<f32>,
 
     /// Consecutive passes with a missing chip reading or a board
     /// sensor at its emergency temperature while the rail was up.
@@ -554,6 +598,7 @@ impl EmberOne00Monitor {
         drop(published);
 
         let rail_up = vout.is_some_and(|v| v >= RAIL_POWERED);
+        self.cap_power(t_chip0);
         if rail_up && t_chip0.is_some_and(|t| t >= CHIP_EMERGENCY) {
             bail!(
                 "thermal emergency: chip 0 mean over the last {} passes is {:?}",
@@ -588,6 +633,44 @@ impl EmberOne00Monitor {
         }
 
         Ok(())
+    }
+}
+
+/// Where the ceiling stands after one pass with the chip at `chip`
+/// and the board holding it at `target`: down by the gain per
+/// degree over, up by the gain per degree under, within the range.
+fn next_ceiling(current: f32, chip: Temperature, target: Temperature) -> f32 {
+    let over = chip.as_degrees_c() - target.as_degrees_c();
+    (current - CEILING_GAIN_PER_C * over).clamp(0.0, 1.0)
+}
+
+impl EmberOne00Monitor {
+    /// Moves the ceiling a step toward holding the chip at its
+    /// target and tells the thread when it has moved by more than
+    /// the deadband or reached an end of the range. No reading
+    /// holds the ceiling still; the trip handles a chip that stops
+    /// reading.
+    fn cap_power(&mut self, t_chip0: Option<Temperature>) {
+        if let Some(t) = t_chip0 {
+            self.ceiling = next_ceiling(self.ceiling, t, self.attrs.chip_target.get());
+        }
+        let ceiling = self.ceiling;
+        let last = *self.power_ceiling.borrow();
+        let moved = (ceiling - last).abs() >= CEILING_DEADBAND
+            || (ceiling == 0.0 && last != 0.0)
+            || (ceiling == 1.0 && last != 1.0);
+        if moved {
+            if ceiling < 1.0 {
+                warn!(
+                    ?t_chip0,
+                    ceiling, "Chip near its limit; capping the thread's power"
+                );
+            } else {
+                info!("Chip cap lifted");
+            }
+            // The thread's exit drops its receiver; nothing to tell.
+            let _ = self.power_ceiling.send(ceiling);
+        }
     }
 }
 
@@ -746,7 +829,22 @@ impl EmberOne00 {
 }
 
 #[cfg(test)]
-mod tests {}
+mod tests {
+    #[test]
+    fn the_ceiling_steps_by_the_chip_temperature_error_within_the_range() {
+        use super::{CEILING_GAIN_PER_C, CHIP_TARGET, next_ceiling};
+        use crate::types::Temperature;
+        let step = |current: f32, chip: f32| {
+            next_ceiling(current, Temperature::from_celsius(chip), CHIP_TARGET)
+        };
+        let over_by_ten = step(1.0, 78.0);
+        assert!((over_by_ten - (1.0 - 10.0 * CEILING_GAIN_PER_C)).abs() < 1e-6);
+        assert_eq!(step(0.5, 68.0), 0.5, "at the target it holds");
+        assert!(step(0.5, 60.0) > 0.5, "under the target it climbs");
+        assert_eq!(step(1.0, 40.0), 1.0, "and never past full");
+        assert_eq!(step(0.01, 90.0), 0.0, "nor below nothing");
+    }
+}
 
 #[cfg(all(test, target_os = "linux"))]
 mod integration_tests;

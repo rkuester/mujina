@@ -279,6 +279,11 @@ struct Actor<W> {
     /// The share of full power the scheduler allocated.
     scheduled_fraction: f32,
 
+    /// The most the board lets the thread run at, and where the
+    /// board announces changes.
+    power_ceiling: f32,
+    power_ceiling_rx: watch::Receiver<f32>,
+
     /// What each chip has done, by chain index.
     chips: Vec<ChipTelemetry>,
 
@@ -325,6 +330,8 @@ where
         );
 
         let chain = Chain::from_topology(&topology);
+        let power_ceiling_rx = peripherals.power_ceiling.clone();
+        let power_ceiling = *power_ceiling_rx.borrow();
         let sys = thread_attrs.cursor().clone();
         let sys_chips = sys.child("chips");
         let chips = (0..chain.chip_count())
@@ -346,6 +353,8 @@ where
                 within(0.0..=1.0),
             ),
             scheduled_fraction: 1.0,
+            power_ceiling,
+            power_ceiling_rx,
             thread_attrs,
             sys,
             chips,
@@ -394,6 +403,8 @@ where
         // wakes the loop rather than passing unseen.
         let mut client_fraction = self.target_power_fraction.subscribe();
         client_fraction.borrow_and_update();
+        let mut board_ceiling = self.power_ceiling_rx.clone();
+        board_ceiling.borrow_and_update();
 
         loop {
             tokio::select! {
@@ -458,6 +469,19 @@ where
                 // A client's own power fraction for this thread
                 Ok(()) = client_fraction.changed() => {
                     client_fraction.borrow_and_update();
+                    if self
+                        .apply_power_fraction(&mut shutdown_rx, &mut register_responses)
+                        .await
+                        .is_break()
+                    {
+                        break;
+                    }
+                }
+
+                // The board's ceiling on this thread's power
+                Ok(()) = board_ceiling.changed() => {
+                    self.power_ceiling = *board_ceiling.borrow_and_update();
+                    info!(ceiling = self.power_ceiling, "Board changed the power ceiling");
                     if self
                         .apply_power_fraction(&mut shutdown_rx, &mut register_responses)
                         .await
@@ -542,11 +566,13 @@ where
     }
 
     /// The share of full power the thread runs at: the client's
-    /// own setting when it stands, else the scheduler's allocation.
+    /// own setting when it stands, else the scheduler's allocation,
+    /// and never more than the board's ceiling.
     fn effective_power_fraction(&self) -> f32 {
         self.target_power_fraction
             .get()
             .unwrap_or(self.scheduled_fraction)
+            .min(self.power_ceiling)
     }
 
     /// The frequency the chain should run at, or `None` for off.
@@ -569,12 +595,17 @@ where
     }
 
     /// Tells the scheduler and the tree the rate to expect at the
-    /// current operating point.
+    /// current operating point, and the tree the share held and
+    /// the ceiling on it.
     async fn declare_expected_hashrate(&mut self) {
         let expected = self.expected_hashrate();
-        self.thread_attrs
-            .write()
-            .set(&self.thread_attrs.hashrate, expected);
+        {
+            let attrs = &self.thread_attrs;
+            let mut published = attrs.write();
+            published.set(&attrs.hashrate, expected);
+            published.set(&attrs.power_fraction, self.effective_power_fraction());
+            published.set(&attrs.power_ceiling, self.power_ceiling);
+        }
         if self
             .event_tx
             .send(HashThreadEvent::ExpectedHashRate(expected))
@@ -618,27 +649,28 @@ where
                     }
                 }
             }
+            // Without work the chain stays off until a task arrives;
+            // the operating point still gets declared below.
             Some(target) => {
-                let Some(task) = self.current_task.clone() else {
-                    return ControlFlow::Continue(());
-                };
-                info!(fraction, target_mhz = target.mhz(), "Bringing the chain up");
-                tokio::select! {
-                    result = self.initialize_chain(target, register_responses) => {
-                        match result {
-                            Ok(()) => {
-                                self.chain_initialized = true;
-                                match self.send_job(&task).await {
-                                    Ok(()) => self.set_active(true),
-                                    Err(e) => error!(error = %e, "Failed to send the waiting job"),
+                if let Some(task) = self.current_task.clone() {
+                    info!(fraction, target_mhz = target.mhz(), "Bringing the chain up");
+                    tokio::select! {
+                        result = self.initialize_chain(target, register_responses) => {
+                            match result {
+                                Ok(()) => {
+                                    self.chain_initialized = true;
+                                    match self.send_job(&task).await {
+                                        Ok(()) => self.set_active(true),
+                                        Err(e) => error!(error = %e, "Failed to send the waiting job"),
+                                    }
                                 }
+                                Err(e) => error!(error = %format!("{e:#}"), "Chain initialization failed"),
                             }
-                            Err(e) => error!(error = %format!("{e:#}"), "Chain initialization failed"),
                         }
-                    }
-                    _ = shutdown_rx.changed() => {
-                        debug!("Shutdown requested during bring-up");
-                        return ControlFlow::Break(());
+                        _ = shutdown_rx.changed() => {
+                            debug!("Shutdown requested during bring-up");
+                            return ControlFlow::Break(());
+                        }
                     }
                 }
             }
@@ -1762,10 +1794,22 @@ mod tests {
     }
 
     /// Peripheral states observed by the tests.
-    #[derive(Clone, Default)]
+    #[derive(Clone)]
     struct PeripheralFlags {
         reset_asserted: Arc<AtomicBool>,
         rail_disabled: Arc<AtomicBool>,
+        /// The board's end of the power ceiling.
+        power_ceiling: Arc<watch::Sender<f32>>,
+    }
+
+    impl Default for PeripheralFlags {
+        fn default() -> Self {
+            Self {
+                reset_asserted: Arc::default(),
+                rail_disabled: Arc::default(),
+                power_ceiling: Arc::new(watch::channel(1.0).0),
+            }
+        }
     }
 
     struct MockResetLine(PeripheralFlags);
@@ -1841,6 +1885,7 @@ mod tests {
         let peripherals = BoardPeripherals {
             reset_line: Box::new(MockResetLine(flags.clone())),
             voltage_regulator: Box::new(MockRegulator(flags.clone())),
+            power_ceiling: flags.power_ceiling.subscribe(),
         };
         let (shutdown_tx, shutdown_rx) = watch::channel(());
 
@@ -1958,6 +2003,8 @@ mod tests {
                     "status": "present",
                     "hashes_per_s": 0,
                     "target_power_fraction": null,
+                    "power_fraction": 1.0,
+                    "power_ceiling": 1.0,
                     "chips": {"0": {
                         "address": 0,
                         "nonces": 0,
@@ -1968,6 +2015,50 @@ mod tests {
                 }}
             }))
         );
+    }
+
+    #[tokio::test]
+    async fn the_board_ceiling_caps_the_share_and_can_hold_the_chain_off() {
+        let root = Tree::new(Arc::new(Unconfigured)).root();
+        let (mut thread, _shutdown_tx, flags) = spawn_thread_in(
+            &root.child("threads").child("0"),
+            stream::pending::<Result<Response, std::io::Error>>(),
+            StallSink,
+        );
+        let sys = root.child("threads").child("0");
+        let held = |sys: &Cursor| sys.child("power_fraction").render_json();
+
+        thread.configure().await.unwrap();
+        time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(held(&sys), Some(serde_json::json!(1.0)));
+
+        flags.power_ceiling.send(0.5).unwrap();
+        time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(held(&sys), Some(serde_json::json!(0.5)));
+        assert_eq!(
+            sys.child("power_ceiling").render_json(),
+            Some(serde_json::json!(0.5))
+        );
+
+        // A client asking for less than the ceiling gets what it
+        // asked; asking for more gets the ceiling.
+        thread.set_power_fraction(0.25).await.unwrap();
+        time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(held(&sys), Some(serde_json::json!(0.25)));
+        thread.set_power_fraction(1.0).await.unwrap();
+        time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(held(&sys), Some(serde_json::json!(0.5)));
+
+        // A ceiling of zero is off: the task is taken and no
+        // bring-up runs, since the stalling sink would park it.
+        flags.power_ceiling.send(0.0).unwrap();
+        time::sleep(Duration::from_millis(50)).await;
+        let result = time::timeout(Duration::from_secs(5), thread.update_task(test_task()))
+            .await
+            .expect("a chain held off takes the task at once");
+        assert!(result.unwrap().is_none());
+        assert!(!thread.status().is_active);
+        assert_eq!(held(&sys), Some(serde_json::json!(0.0)));
     }
 
     #[tokio::test]

@@ -55,6 +55,15 @@ pub struct ThreadAttributes {
     /// The rate the thread computes from its clock and its chain,
     /// not an estimate from the shares it found.
     pub hashrate: Report<HashRate>,
+
+    /// The share of full power the thread holds, 0.0 to 1.0: what
+    /// it was asked, or less when the board's ceiling is lower.
+    pub power_fraction: Report<f32>,
+
+    /// The most of its full power the board lets the thread run
+    /// at, 0.0 to 1.0. Under 1.0 the board's chips are near their
+    /// limit and the thread is throttled by heat.
+    pub power_ceiling: Report<f32>,
 }
 
 impl ThreadAttributes {
@@ -63,6 +72,8 @@ impl ThreadAttributes {
         Self {
             status: sys.report("status", MemberStatus::Present),
             hashrate: sys.report("hashes", HashRate::default()),
+            power_fraction: sys.report("power_fraction", 1.0),
+            power_ceiling: sys.report("power_ceiling", 1.0),
             sys: sys.clone(),
         }
     }

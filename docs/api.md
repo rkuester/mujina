@@ -104,6 +104,18 @@ the share comes back. A CPU thread scales its default duty. Each
 thread reports the rate it expects at its operating point in
 `hashes_per_s`.
 
+A board may cap what its thread holds. Each thread reports
+`power_ceiling`, the most of its full power the board allows,
+and `power_fraction`, the share it holds, which is the smaller
+of what it was asked and the ceiling. An EmberOne holds its chip
+diode at `chip_target_c`, a setting on the board defaulting to
+68 C, by moving the ceiling half a percent a second for every
+degree the chip sits from the target, down when over and up when
+under. The ceiling creeps rather than jumps, so it settles where
+the chip holds its target instead of hunting with the die. A
+thread reporting a ceiling under 1.0 is throttled by heat; the
+ask stands and is honored again as the chip cools.
+
 ```bash
 # Run the whole miner at half power
 curl -X PUT -H 'content-type: application/json' -d '0.5' \
