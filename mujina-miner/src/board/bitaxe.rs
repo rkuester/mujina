@@ -21,7 +21,7 @@ use crate::{
     asic::{
         bm13xx::{
             self, chip_config,
-            peripherals::{BoardPeripherals, ResetLine},
+            peripherals::{self, BoardPeripherals, ResetLine},
             register::ChipModel,
             thread::BM13xxThread,
             topology::TopologySpec,
@@ -183,6 +183,7 @@ async fn create_from_usb(
     let peripherals = BoardPeripherals {
         reset_line: Box::new(reset_line),
         voltage_regulator: Box::new(voltage_regulator),
+        power_ceiling: peripherals::unlimited_power(),
     };
 
     let chip = chip_config::bm1370();

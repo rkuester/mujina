@@ -6,6 +6,7 @@
 
 use anyhow::Result;
 use async_trait::async_trait;
+use tokio::sync::watch;
 
 use crate::peripheral::regulator::VoltageRegulator;
 
@@ -35,4 +36,18 @@ pub struct BoardPeripherals {
 
     /// Voltage regulator control
     pub voltage_regulator: Box<dyn VoltageRegulator>,
+
+    /// The most of its full power the board lets the thread run at,
+    /// 0.0 to 1.0. The board lowers it as its chips approach their
+    /// limit; the thread holds the smaller of this and what it was
+    /// asked. A board with no die sensor supplies
+    /// [`unlimited_power`].
+    pub power_ceiling: watch::Receiver<f32>,
+}
+
+/// A power ceiling that stays at full. The sender is dropped, so
+/// the receiver never changes and the thread never waits on it.
+pub fn unlimited_power() -> watch::Receiver<f32> {
+    let (_, rx) = watch::channel(1.0);
+    rx
 }
