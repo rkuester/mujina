@@ -208,11 +208,14 @@ async fn create_from_usb(device: UsbDeviceInfo, boards: Cursor) -> Result<Backpl
         .init()
         .await
         .context("TMP451 (right) init failed")?;
-    // The remote diode reads high compared to the board sensors
-    // at ambient. This offset brings the reading in line at room
-    // temperature. Revisit once the ASICs are running to
-    // distinguish constant offset from ideality (n-factor) error.
-    const REMOTE_OFFSET_C: i8 = -7;
+    // The remote diode reads high. With the rail off and the die at
+    // the water's temperature, three boards read +13.5 to +14.7 C at
+    // 22.6 C and +11.2 to +12.1 C at 43.1 C, agreeing within 1.2 C.
+    // Two points do not fix the slope, so this sits between them,
+    // nearer the value at the hot end where the thermal trip lives:
+    // a reading 2 C high at ambient costs nothing, a reading low at
+    // 85 C moves the trip.
+    const REMOTE_OFFSET_C: i8 = -12;
     temp_right
         .set_remote_offset(REMOTE_OFFSET_C)
         .await
