@@ -16,7 +16,7 @@ external clients.
      USB & hotplug                         HTTP clients
            |                                     |
            v                                     v
-     +-----------+  telemetry & commands   +-----------+
+     +-----------+   reports & settings    +-----------+
      |  Boards   |<----------------------->|    API    |
      +-----------+                         +-----------+
             \                                   /
@@ -34,15 +34,22 @@ external clients.
 
 The **backplane** glues Boards to everything else. It watches
 transport events (USB hotplug today), spawns and tears down boards as
-they come and go, hands their HashThreads to the scheduler, and
-registers their telemetry streams with the API.
+they come and go, and hands their HashThreads to the scheduler.
 
-The subsystems don't call each other directly; they talk through
-channels. When a board connects, the backplane registers its telemetry
-stream with the API. The scheduler publishes a miner-level stream
-covering every registered job source. The API reads both streams to
-serve HTTP clients. Commands flow the other way, through a channel
-into the scheduler. Neither the backplane nor the scheduler knows the
+The **systree** is one tree of named values for the whole miner. Each
+value is an attribute with a path, like a file in a filesystem. A
+board attaches its attributes under its own path as it starts. A
+report is an attribute the board writes and a client reads, such as a
+temperature. A setting is an attribute a client writes and the board
+obeys, such as a target voltage. A setting takes its value from the
+configuration layers, which are the configuration files, the
+environment, and what clients have written through the API.
+
+The subsystems don't call each other directly. Boards and the
+scheduler write their attributes into the systree, and the API serves
+the tree to HTTP clients. The scheduler also publishes a miner-level
+stream covering every registered job source, and takes commands
+through a channel. Neither the backplane nor the scheduler knows the
 API exists.
 
 The remaining sections cover each subsystem. **Boards** covers how the
@@ -158,25 +165,26 @@ Shares are filtered in three stages on the way back:
              v  (HTTP REST)
          API server
              |
-             +<--> scheduler
-             +<--> board 1
-             +<--> board 2
-             +<--> ...
-  (each channel: telemetry out, commands in)
+             +<--> systree    (reports out, settings in)
+             +<--> scheduler  (telemetry out, commands in)
 ```
 
 The daemon exposes its state and a growing command surface over a REST
 API. Talking to the daemon from outside goes through this API;
 `mujina-cli` uses it today, but anything speaking HTTP can.
 
-The API reads from the telemetry channels described in the overview
-and dispatches commands to internal targets. There's no single command
-channel; each addressable component gets its own. The scheduler has
-one for pause/resume today, with richer work-distribution commands to
-come. Each board has one for actions like voltage or fan control.
-Managing job sources at runtime (adding, removing, reconfiguring them)
-will flow through its own channel too. New capabilities get added as
-new channels, not as variants on a monolithic command enum.
+A URL below `/api/v0` is a path into the systree, so one mechanism
+serves a single attribute, a whole board, or the entire miner. A read
+returns the subtree at the path. A write sets a setting, and the
+component that attached the setting acts on the new value. A board
+applies a new core voltage target this way, and the scheduler applies
+the miner's share of full power. See [REST API](api.md) for the paths
+and the configuration layers behind a setting.
+
+Two documents are not in the tree yet. The scheduler publishes the
+miner's totals and its job sources on a telemetry channel, which the
+API serves at `/miner` and `/sources`. Pause and resume reach the
+scheduler through a command channel.
 
 The API publishes an OpenAPI schema and serves a Swagger UI, so the
 surface is discoverable at runtime. The `/api/v0` prefix signals that
@@ -203,7 +211,8 @@ differently.
 **EmberOne00**, a multi-chip chain:
 - ASICs: 12 BM1362 (BM13xx family)
 - HashThreads exposed: 1 (one thread drives the chain)
-- Peripherals: TMP1075 / TMP451 temperature sensors, RGB status LED
+- Peripherals: TPS546 power regulator, TMP1075 / TMP451 temperature
+  sensors, RGB status LED
 - Management channel: RHAP over USB serial
 
 **CPU backend**, a virtual board:
